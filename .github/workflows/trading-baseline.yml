@@ -9,13 +9,13 @@ jobs:
       - name: Install build and test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libjansson-dev libpq-dev libssl-dev libreadline-dev libargon2-1 postgresql python3-psycopg2
+          sudo apt-get install -y libjansson-dev libpq-dev libssl-dev libreadline-dev libargon2-1 uuid-dev postgresql python3-psycopg2
       - name: Build
         run: |
           autoreconf -fi
           ./configure --enable-postgres
           make clean
-          make -j2
+          make -j4 SANITIZE_FLAGS=
       - name: Run disposable economy test
         env:
           ECON_QA_DATABASE: twclone_econ_qa_ci
