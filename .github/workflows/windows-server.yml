@@ -36,6 +36,6 @@ jobs:
           export ECON_QA_DATABASE=twclone_econ_qa_windows
           export ECON_QA_ADMIN_DSN="host=127.0.0.1 port=55432 user=twclone_qa dbname=postgres"
           export ECON_QA_APP_TEMPLATE="host=127.0.0.1 port=55432 user=twclone_qa dbname=%DB%"
-          python3.12 -m venv "$qa_dir/venv"
-          "$qa_dir/venv/bin/python" -m pip install psycopg2
-          "$qa_dir/venv/bin/python" tests.v2/test_pg_bigbang_economy_profit.py
+          python3.12 -m pip install --target "$qa_dir/pydeps" psycopg2
+          export PYTHONPATH="$qa_dir/pydeps"
+          python3.12 tests.v2/test_pg_bigbang_economy_profit.py
