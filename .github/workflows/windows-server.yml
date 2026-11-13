@@ -22,6 +22,12 @@ jobs:
           ./configure --enable-postgres
           make clean
           make -j2 SANITIZE_FLAGS=
+          staging="$PWD/twclone-windows-x64"
+          bash tools/windows/package.sh "$staging"
+          powershell.exe -NoProfile -Command 'Compress-Archive -Path twclone-windows-x64 -DestinationPath twclone-windows-x64.zip; Expand-Archive -Path twclone-windows-x64.zip -DestinationPath "package check"'
+          package="$PWD/package check/twclone-windows-x64"
+          export BIGBANG_BIN="$package/bin/bigbang.exe"
+          export SERVER_BIN="$package/bin/server.exe"
           pg_bin=$(dirname "$(find /usr -name initdb.exe -print -quit)")
           test -x "$pg_bin/initdb.exe"
           export PATH="$pg_bin:$PATH"
@@ -39,3 +45,8 @@ jobs:
           python3.12 -m pip install --target "$qa_dir/pydeps" psycopg2
           export PYTHONPATH="$qa_dir/pydeps"
           python3.12 tests.v2/test_pg_bigbang_economy_profit.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: twclone-windows-x64
+          path: twclone-windows-x64.zip
+          if-no-files-found: error

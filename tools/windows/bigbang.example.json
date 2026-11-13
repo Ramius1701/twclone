@@ -1,0 +1,9 @@
+{
+  "admin": "host=127.0.0.1 port=5432 user=twclone dbname=postgres",
+  "db": "twclone",
+  "app": "host=127.0.0.1 port=5432 user=twclone dbname=%DB%",
+  "sql_dir": "sql/pg",
+  "sectors": 2500,
+  "server_port": 1234,
+  "s2s_port": 1235
+}
