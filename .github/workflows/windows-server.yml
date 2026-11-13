@@ -9,12 +9,13 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
+      - run: git config --global core.autocrlf false
       - uses: actions/checkout@v4
       - uses: cygwin/cygwin-install-action@v7
         with:
           packages: gcc-core make autoconf automake libpq-devel libssl-devel libreadline-devel libjansson-devel libargon2_1 postgresql postgresql-client python312 python312-devel python312-pip
       - name: Build and test on Windows
-        shell: C:\cygwin\bin\bash.exe --noprofile --norc -eo pipefail {0}
+        shell: C:\cygwin\bin\bash.exe --noprofile --norc -o igncr -eo pipefail {0}
         run: |
           export PATH="/usr/bin:$PATH"
           autoreconf -fi
