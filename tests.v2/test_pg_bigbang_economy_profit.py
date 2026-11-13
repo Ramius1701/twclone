@@ -630,7 +630,7 @@ def main() -> None:
     reports = {}
     temporary_directory = tempfile.TemporaryDirectory(prefix="twclone-econ-qa-")
     try:
-        temp = Path(tmp)
+        temp = Path(temporary_directory.name)
         base_config = ROOT / "bin/bigbang.json"
         config = json.loads(base_config.read_text(encoding="utf-8")) if base_config.is_file() else {}
         config.update({
