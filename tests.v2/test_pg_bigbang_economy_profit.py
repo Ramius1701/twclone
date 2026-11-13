@@ -682,6 +682,11 @@ def main() -> None:
             hardware_ports, hardware_rows = verify_fresh_black_market_hardware(
                 conn, time.monotonic() - generation_started
             )
+            # The quote assertions use the unshocked price formulas. Check the
+            # generated state before the engine starts, then keep it stable.
+            market_rows(conn)
+            with conn.cursor() as cur:
+                cur.execute("UPDATE cron_tasks SET enabled=false WHERE name='market_shock_tick'")
             conn.commit()
 
             server_dir = temp / "server-run"
