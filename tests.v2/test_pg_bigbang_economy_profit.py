@@ -710,7 +710,11 @@ def main() -> None:
             registration.send_json({"command": "auth.register", "data": {"username": account, "passwd": password}})
             reply = registration.recv_next_non_notice()
             if not status_ok(reply):
-                print((server_dir / "server.log").read_text()[-12000:])
+                print((server_dir / "twclone.log").read_text()[-12000:])
+                with conn.cursor() as cur:
+                    cur.execute("SELECT register_player(%s, (SELECT passwd FROM players LIMIT 1), %s, false, 1)",
+                                (account, "Test Ship"))
+                conn.rollback()
                 raise AssertionError(f"registration failed: {reply}")
             registration.close()
 
