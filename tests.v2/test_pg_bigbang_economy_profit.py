@@ -691,7 +691,7 @@ def main() -> None:
             server_log = (server_dir / "server.log").open("w", encoding="utf-8")
             server = subprocess.Popen(
                 [str(server_bin)], cwd=server_dir, stdout=server_log,
-                stderr=subprocess.STDOUT, start_new_session=True,
+                stderr=subprocess.STDOUT, start_new_session=os.name != "nt",
             )
             deadline = time.monotonic() + 45
             while time.monotonic() < deadline:
@@ -944,11 +944,18 @@ def main() -> None:
                 )
     finally:
         if server is not None and server.poll() is None:
-            os.killpg(server.pid, signal.SIGTERM)
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/PID", str(server.pid), "/T", "/F"],
+                               capture_output=True, check=False)
+            else:
+                os.killpg(server.pid, signal.SIGTERM)
             try:
                 server.wait(timeout=12)
             except subprocess.TimeoutExpired:
-                os.killpg(server.pid, signal.SIGKILL)
+                if os.name == "nt":
+                    server.kill()
+                else:
+                    os.killpg(server.pid, signal.SIGKILL)
                 server.wait(timeout=5)
         if server_log is not None:
             server_log.close()
