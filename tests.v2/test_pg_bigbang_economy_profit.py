@@ -657,7 +657,10 @@ def main() -> None:
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=900,
             )
             if generated.returncode:
-                raise RuntimeError("BigBang failed on the new disposable database:\n" + generated.stdout[-5000:])
+                raise RuntimeError(
+                    f"BigBang exited with status {generated.returncode} on the new disposable database:\n"
+                    + generated.stdout[-5000:]
+                )
             applied = [line.split("Applying ", 1)[1].split("...", 1)[0]
                        for line in generated.stdout.splitlines()
                        if "Applying " in line]

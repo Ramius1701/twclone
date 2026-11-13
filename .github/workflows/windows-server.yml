@@ -26,6 +26,8 @@ jobs:
           bash tools/windows/package.sh "$staging"
           powershell.exe -NoProfile -Command 'Compress-Archive -Path twclone-windows-x64 -DestinationPath twclone-windows-x64.zip; Expand-Archive -Path twclone-windows-x64.zip -DestinationPath "package check"'
           package="$PWD/package check/twclone-windows-x64"
+          ls -l "$package/bin"
+          cygcheck "$package/bin/bigbang.exe"
           export BIGBANG_BIN="$package/bin/bigbang.exe"
           export SERVER_BIN="$package/bin/server.exe"
           export ECON_QA_SQL_DIR="$package/sql/pg"
@@ -47,6 +49,7 @@ jobs:
           export PYTHONPATH="$qa_dir/pydeps"
           python3.12 tests.v2/test_pg_bigbang_economy_profit.py
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: twclone-windows-x64
           path: twclone-windows-x64.zip
