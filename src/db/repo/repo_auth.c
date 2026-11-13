@@ -196,6 +196,7 @@ int repo_auth_upsert_system_sub(db_t *db, int player_id) {
 }
 
 int repo_auth_register_player(db_t *db, const char *name, const char *pass, const char *ship_name, int spawn_sid, int64_t *player_id_out, db_error_t *err_out) {
+    db_error_clear(err_out);
     db_res_t *res = NULL;
     char password_hash[TW_PASSWORD_HASH_MAX];
     if (!pass || tw_password_hash(pass, password_hash, sizeof password_hash) != 0) {
