@@ -1,4 +1,5 @@
 #include "repo_shiptypes.h"
+#include "db/sql_driver.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>

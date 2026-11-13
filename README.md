@@ -91,6 +91,28 @@ python3 client/python_client/client.py --help
 ## Build from source
 
 **Prereqs:** GCC/Clang, GNU make, PostgreSQL dev libraries (or MySQL), POSIX (Linux/WSL/macOS).
+
+### Windows without WSL or Docker
+
+The Windows build uses the 64-bit Cygwin runtime for the server's POSIX
+process and socket APIs. Use a Cygwin terminal for the build and install
+`gcc-core`, `make`, `autoconf`, `automake`, `libpq-devel`,
+`libssl-devel`, `libreadline-devel`, `libjansson-devel`, and
+`libargon2_1`. Check out the source with LF line endings
+(`git -c core.autocrlf=false clone <repository-url>`).
+
+```sh
+autoreconf -fi
+./configure --enable-postgres
+make clean
+make -j2 SANITIZE_FLAGS=
+```
+
+`bin/bigbang.exe` initializes the PostgreSQL database and `bin/server.exe`
+hosts the game. Use the same database configuration for both programs.
+PostgreSQL can run as a Windows service or on another host. To launch from
+PowerShell, put the Cygwin `bin` directory on the process's `PATH` so
+Windows can find the runtime DLLs.
 **Build:**
 
 ```bash
