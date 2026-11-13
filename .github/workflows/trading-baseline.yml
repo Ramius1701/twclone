@@ -1,0 +1,27 @@
+name: Trading baseline
+on: push
+jobs:
+  trade:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build and test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libjansson-dev libpq-dev libssl-dev libreadline-dev libargon2-1 postgresql python3-psycopg2
+      - name: Build
+        run: |
+          autoreconf -fi
+          ./configure --enable-postgres
+          make clean
+          make -j2
+      - name: Run disposable economy test
+        env:
+          ECON_QA_DATABASE: twclone_econ_qa_ci
+          ECON_QA_ADMIN_DSN: dbname=postgres
+          ECON_QA_APP_TEMPLATE: dbname=%DB%
+        run: |
+          sudo systemctl start postgresql
+          sudo -u postgres createuser --superuser "$USER"
+          /usr/bin/python3 tests.v2/test_pg_bigbang_economy_profit.py
