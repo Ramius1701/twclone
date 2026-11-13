@@ -107,7 +107,7 @@ def market_rows(conn):
     return rows
 
 
-def verify_fresh_black_market_hardware(conn):
+def verify_fresh_black_market_hardware(conn, generation_seconds):
     """Check BigBang initialized every mapped item with the approved policy."""
     with conn.cursor() as cur:
         cur.execute(
@@ -157,8 +157,10 @@ def verify_fresh_black_market_hardware(conn):
             "AND (phs.port_id IS NULL OR phs.stock_quantity <> 2 "
             "OR phs.max_stock <> 5 OR phs.restock_quantity <> 1 "
             "OR phs.restock_interval_seconds <> 86400 "
-            "OR phs.next_restock_at < CURRENT_TIMESTAMP + INTERVAL '23 hours 59 minutes' "
-            "OR phs.next_restock_at > CURRENT_TIMESTAMP + INTERVAL '24 hours 1 minute')"
+            "OR phs.next_restock_at < CURRENT_TIMESTAMP + INTERVAL '24 hours' "
+            "   - make_interval(secs => %s) "
+            "OR phs.next_restock_at > CURRENT_TIMESTAMP + INTERVAL '24 hours 1 minute')",
+            (generation_seconds + 60,),
         )
         invalid_rows = cur.fetchone()[0]
         if invalid_rows:
@@ -649,6 +651,7 @@ def main() -> None:
             # The name was verified absent above; ensure a partial BigBang
             # failure is still cleaned up in the finally block.
             created = True
+            generation_started = time.monotonic()
             generated = subprocess.run(
                 [str(bigbang)], cwd=bb_dir, input="y\n", text=True,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=900,
@@ -673,7 +676,9 @@ def main() -> None:
                 cur.execute("SELECT value FROM config WHERE key='server_port'")
                 if int(cur.fetchone()[0]) != client_port:
                     raise AssertionError("BigBang did not persist the isolated server port")
-            hardware_ports, hardware_rows = verify_fresh_black_market_hardware(conn)
+            hardware_ports, hardware_rows = verify_fresh_black_market_hardware(
+                conn, time.monotonic() - generation_started
+            )
             conn.commit()
 
             server_dir = temp / "server-run"
