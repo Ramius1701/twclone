@@ -15,6 +15,8 @@ from __future__ import annotations
 import json
 import math
 import os
+from collections import defaultdict, deque
+from decimal import Decimal
 from pathlib import Path
 import secrets
 import signal
@@ -497,6 +499,103 @@ def trade_state(conn, account: str, port_id: int, commodity: str, action: str):
     return {"credits": credits, "cargo": cargo, "stock": stock, "trades": trades}
 
 
+def player_rpc(client, command, data):
+    client.send_json({"command": command, "data": data})
+    response = client.recv_next_non_notice()
+    if not status_ok(response):
+        raise AssertionError(f"{command} failed: {response}")
+    return response["data"]
+
+
+def player_snapshot(client):
+    player = player_rpc(client, "player.my_info", {})["player"]
+    ship = player_rpc(client, "ship.status", {})["ship"]
+    if ship["id"] != player["ship_id"]:
+        raise AssertionError("player and ship status disagree on the active ship")
+    cargo = {item["commodity"]: item["quantity"] for item in ship["cargo"]}
+    return player["sector"], Decimal(player["credits"]), player["turns_remaining"], ship["id"], cargo
+
+
+def warp_paths(warps, start):
+    paths = {start: ()}
+    pending = deque([start])
+    while pending:
+        sector = pending.popleft()
+        for neighbor in warps[sector]:
+            if neighbor not in paths:
+                paths[neighbor] = (*paths[sector], neighbor)
+                pending.append(neighbor)
+    return paths
+
+
+def exercise_trading_journey(conn, host, port, account, password):
+    # Read fixture topology to select a short route. All player state changes
+    # below go through the same JSON commands as a connected client.
+    markets = [row for row in market_rows(conn) if row["commodity"] == "ORE"]
+    warps = defaultdict(list)
+    with conn.cursor() as cur:
+        cur.execute("SELECT from_sector,to_sector FROM sector_warps ORDER BY 1,2")
+        for source, destination in cur:
+            warps[source].append(destination)
+    conn.rollback()
+
+    client = login_client(host, port, account, password)
+    try:
+        start, credits, turns, ship, cargo = player_snapshot(client)
+        from_start = warp_paths(warps, start)
+        sellers = sorted(
+            (row for row in markets if row["mode"] == "sell" and row["quantity"] > 0
+             and row["sector_id"] in from_start and quote(row, "ask") <= credits),
+            key=lambda row: len(from_start[row["sector_id"]]),
+        )
+        buyers = [row for row in markets if row["mode"] == "buy" and row["quantity"] < row["capacity"]]
+        for source in sellers:
+            outbound = from_start[source["sector_id"]]
+            from_source = warp_paths(warps, source["sector_id"])
+            candidates = [row for row in buyers if row["sector_id"] != source["sector_id"]
+                          and row["sector_id"] in from_source
+                          and len(outbound) + len(from_source[row["sector_id"]]) + 2 <= turns]
+            if candidates:
+                destination = min(candidates, key=lambda row: len(from_source[row["sector_id"]]))
+                onward = from_source[destination["sector_id"]]
+                break
+        else:
+            raise AssertionError("fresh player has no affordable two-port ORE route within their turns")
+
+        for sector in outbound:
+            player_rpc(client, "move.warp", {"to_sector_id": sector})
+        execute_trade(client, "trade.buy", source["sector_id"], source["port_id"],
+                      "ORE", secrets.token_hex(12))
+        bought = player_snapshot(client)
+        loaded = {**cargo, "ore": cargo.get("ore", 0) + 1}
+        if bought[0] != source["sector_id"] or bought[1] >= credits or bought[2:] != (
+            turns - len(outbound) - 1, ship, loaded
+        ):
+            raise AssertionError(f"unexpected player state after buying ORE: {bought}")
+
+        for sector in onward:
+            player_rpc(client, "move.warp", {"to_sector_id": sector})
+        execute_trade(client, "trade.sell", destination["sector_id"], destination["port_id"],
+                      "ORE", secrets.token_hex(12))
+        sold = player_snapshot(client)
+        if sold[0] != destination["sector_id"] or sold[1] <= bought[1] or sold[2:] != (
+            bought[2] - len(onward) - 1, ship, cargo
+        ):
+            raise AssertionError(f"unexpected player state after selling ORE: {sold}")
+        player_rpc(client, "auth.logout", {})
+    finally:
+        client.close()
+
+    client = login_client(host, port, account, password)
+    try:
+        reconnected = player_snapshot(client)
+        if reconnected != sold:
+            raise AssertionError(f"reconnected state {reconnected} differs from state at logout {sold}")
+    finally:
+        client.close()
+    print("PASS player registration, warp, two-port ORE trade, and reconnect")
+
+
 def main() -> None:
     db_name = os.environ.get("ECON_QA_DATABASE", "")
     admin_dsn = os.environ.get("ECON_QA_ADMIN_DSN")
@@ -529,8 +628,8 @@ def main() -> None:
     try:
         with tempfile.TemporaryDirectory(prefix="twclone-econ-qa-") as tmp:
             temp = Path(tmp)
-            base_config = json.loads((ROOT / "bin/bigbang.json").read_text(encoding="utf-8"))
-            config = dict(base_config)
+            base_config = ROOT / "bin/bigbang.json"
+            config = json.loads(base_config.read_text(encoding="utf-8")) if base_config.is_file() else {}
             config.update({
                 "admin": admin_dsn,
                 "db": db_name,
@@ -611,6 +710,8 @@ def main() -> None:
             if not registration.register(account, password, fail_if_exists=True):
                 raise AssertionError("trade-test player registration failed")
             registration.close()
+
+            exercise_trading_journey(conn, "127.0.0.1", client_port, account, password)
 
             # Optional credential is supplied by the isolated QA runner, never
             # embedded in the repository or emitted in test output.
