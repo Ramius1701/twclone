@@ -628,325 +628,325 @@ def main() -> None:
     account = "econ_qa_" + secrets.token_hex(5)
     password = secrets.token_urlsafe(28)
     reports = {}
+    temporary_directory = tempfile.TemporaryDirectory(prefix="twclone-econ-qa-")
     try:
-        with tempfile.TemporaryDirectory(prefix="twclone-econ-qa-") as tmp:
-            temp = Path(tmp)
-            base_config = ROOT / "bin/bigbang.json"
-            config = json.loads(base_config.read_text(encoding="utf-8")) if base_config.is_file() else {}
-            config.update({
-                "admin": admin_dsn,
-                "db": db_name,
-                "app": app_dsn,
-                "sql_dir": str(Path(os.environ.get("ECON_QA_SQL_DIR", ROOT / "sql/pg")).resolve()),
-                "sectors": int(os.environ.get("ECON_QA_SECTORS", "2500")),
-                "server_port": client_port,
-                "s2s_port": s2s_port,
-                "tech_level": 3,
-                "port_size": 5,
-            })
-            bb_dir = temp / "bigbang-run"
-            bb_dir.mkdir()
-            (bb_dir / "bigbang.json").write_text(json.dumps(config), encoding="utf-8")
-            os.chmod(bb_dir / "bigbang.json", 0o600)
-            # The name was verified absent above; ensure a partial BigBang
-            # failure is still cleaned up in the finally block.
-            created = True
-            generation_started = time.monotonic()
-            generated = subprocess.run(
-                [str(bigbang)], cwd=bb_dir, input="y\n", text=True,
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=900,
+        temp = Path(tmp)
+        base_config = ROOT / "bin/bigbang.json"
+        config = json.loads(base_config.read_text(encoding="utf-8")) if base_config.is_file() else {}
+        config.update({
+            "admin": admin_dsn,
+            "db": db_name,
+            "app": app_dsn,
+            "sql_dir": str(Path(os.environ.get("ECON_QA_SQL_DIR", ROOT / "sql/pg")).resolve()),
+            "sectors": int(os.environ.get("ECON_QA_SECTORS", "2500")),
+            "server_port": client_port,
+            "s2s_port": s2s_port,
+            "tech_level": 3,
+            "port_size": 5,
+        })
+        bb_dir = temp / "bigbang-run"
+        bb_dir.mkdir()
+        (bb_dir / "bigbang.json").write_text(json.dumps(config), encoding="utf-8")
+        os.chmod(bb_dir / "bigbang.json", 0o600)
+        # The name was verified absent above; ensure a partial BigBang
+        # failure is still cleaned up in the finally block.
+        created = True
+        generation_started = time.monotonic()
+        generated = subprocess.run(
+            [str(bigbang)], cwd=bb_dir, input="y\n", text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=900,
+        )
+        if generated.returncode:
+            raise RuntimeError(
+                f"BigBang exited with status {generated.returncode} on the new disposable database:\n"
+                + generated.stdout[-5000:]
             )
-            if generated.returncode:
-                raise RuntimeError(
-                    f"BigBang exited with status {generated.returncode} on the new disposable database:\n"
-                    + generated.stdout[-5000:]
-                )
-            applied = [line.split("Applying ", 1)[1].split("...", 1)[0]
-                       for line in generated.stdout.splitlines()
-                       if "Applying " in line]
-            if not applied or "119_password_hash_enforcement.sql" not in applied:
-                raise AssertionError("canonical V2 BigBang did not apply migration 119")
-            if any(name.startswith(("115_", "116_")) for name in applied):
-                raise AssertionError("default V2 BigBang applied V3 migrations")
-            if applied.index("114_planet_fighter_production.sql") > applied.index("119_password_hash_enforcement.sql"):
-                raise AssertionError("migration 119 ran before the V2 migration set completed")
+        applied = [line.split("Applying ", 1)[1].split("...", 1)[0]
+                   for line in generated.stdout.splitlines()
+                   if "Applying " in line]
+        if not applied or "119_password_hash_enforcement.sql" not in applied:
+            raise AssertionError("canonical V2 BigBang did not apply migration 119")
+        if any(name.startswith(("115_", "116_")) for name in applied):
+            raise AssertionError("default V2 BigBang applied V3 migrations")
+        if applied.index("114_planet_fighter_production.sql") > applied.index("119_password_hash_enforcement.sql"):
+            raise AssertionError("migration 119 ran before the V2 migration set completed")
 
-            conn = psycopg2.connect(app_dsn)
-            with conn.cursor() as cur:
-                cur.execute("SELECT count(*) FROM pg_constraint WHERE conname='players_passwd_argon2id_check' AND convalidated")
-                if cur.fetchone()[0] != 1:
-                    raise AssertionError("V2 BigBang did not apply migration 119")
-                cur.execute("SELECT value FROM config WHERE key='server_port'")
-                if int(cur.fetchone()[0]) != client_port:
-                    raise AssertionError("BigBang did not persist the isolated server port")
-            hardware_ports, hardware_rows = verify_fresh_black_market_hardware(
-                conn, time.monotonic() - generation_started
+        conn = psycopg2.connect(app_dsn)
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM pg_constraint WHERE conname='players_passwd_argon2id_check' AND convalidated")
+            if cur.fetchone()[0] != 1:
+                raise AssertionError("V2 BigBang did not apply migration 119")
+            cur.execute("SELECT value FROM config WHERE key='server_port'")
+            if int(cur.fetchone()[0]) != client_port:
+                raise AssertionError("BigBang did not persist the isolated server port")
+        hardware_ports, hardware_rows = verify_fresh_black_market_hardware(
+            conn, time.monotonic() - generation_started
+        )
+        # The quote assertions use the unshocked price formulas. Check the
+        # generated state before the engine starts, then keep it stable.
+        market_rows(conn)
+        with conn.cursor() as cur:
+            cur.execute("UPDATE cron_tasks SET enabled=false WHERE name='market_shock_tick'")
+        conn.commit()
+
+        server_dir = temp / "server-run"
+        server_dir.mkdir()
+        (server_dir / "bigbang.json").write_text(json.dumps(config), encoding="utf-8")
+        os.chmod(server_dir / "bigbang.json", 0o600)
+        server_log = (server_dir / "server.log").open("w", encoding="utf-8")
+        server = subprocess.Popen(
+            [str(server_bin)], cwd=server_dir, stdout=server_log,
+            stderr=subprocess.STDOUT, start_new_session=os.name != "nt",
+        )
+        deadline = time.monotonic() + 45
+        while time.monotonic() < deadline:
+            if server.poll() is not None:
+                raise RuntimeError("isolated game server exited before opening its client port")
+            try:
+                with socket.create_connection(("127.0.0.1", client_port), timeout=0.2):
+                    break
+            except OSError:
+                time.sleep(0.2)
+        else:
+            raise TimeoutError("isolated game server did not start")
+
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) FROM players WHERE name=%s", (account,)
             )
-            # The quote assertions use the unshocked price formulas. Check the
-            # generated state before the engine starts, then keep it stable.
-            market_rows(conn)
-            with conn.cursor() as cur:
-                cur.execute("UPDATE cron_tasks SET enabled=false WHERE name='market_shock_tick'")
-            conn.commit()
+            if cur.fetchone()[0]:
+                raise AssertionError("unexpected collision for random QA account")
+        conn.commit()
+        sys.path.insert(0, str(ROOT / "tests.v2"))
+        from twclient import TWClient
+        registration = TWClient("127.0.0.1", client_port, timeout=10)
+        registration.connect()
+        if not registration.register(account, password, fail_if_exists=True):
+            raise AssertionError("trade-test player registration failed")
+        registration.close()
 
-            server_dir = temp / "server-run"
-            server_dir.mkdir()
-            (server_dir / "bigbang.json").write_text(json.dumps(config), encoding="utf-8")
-            os.chmod(server_dir / "bigbang.json", 0o600)
-            server_log = (server_dir / "server.log").open("w", encoding="utf-8")
-            server = subprocess.Popen(
-                [str(server_bin)], cwd=server_dir, stdout=server_log,
-                stderr=subprocess.STDOUT, start_new_session=os.name != "nt",
+        exercise_trading_journey(conn, "127.0.0.1", client_port, account, password)
+
+        # Optional credential is supplied by the isolated QA runner, never
+        # embedded in the repository or emitted in test output.
+        qa_bot_password = os.environ.get("AI_QA_BOT_PASSWORD")
+        if qa_bot_password:
+            qa_bot = login_client(
+                "127.0.0.1", client_port, "ai_qa_bot", qa_bot_password
             )
-            deadline = time.monotonic() + 45
-            while time.monotonic() < deadline:
-                if server.poll() is not None:
-                    raise RuntimeError("isolated game server exited before opening its client port")
-                try:
-                    with socket.create_connection(("127.0.0.1", client_port), timeout=0.2):
-                        break
-                except OSError:
-                    time.sleep(0.2)
-            else:
-                raise TimeoutError("isolated game server did not start")
-
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT count(*) FROM players WHERE name=%s", (account,)
-                )
-                if cur.fetchone()[0]:
-                    raise AssertionError("unexpected collision for random QA account")
-            conn.commit()
-            sys.path.insert(0, str(ROOT / "tests.v2"))
-            from twclient import TWClient
-            registration = TWClient("127.0.0.1", client_port, timeout=10)
-            registration.connect()
-            if not registration.register(account, password, fail_if_exists=True):
-                raise AssertionError("trade-test player registration failed")
-            registration.close()
-
-            exercise_trading_journey(conn, "127.0.0.1", client_port, account, password)
-
-            # Optional credential is supplied by the isolated QA runner, never
-            # embedded in the repository or emitted in test output.
-            qa_bot_password = os.environ.get("AI_QA_BOT_PASSWORD")
-            if qa_bot_password:
-                qa_bot = login_client(
-                    "127.0.0.1", client_port, "ai_qa_bot", qa_bot_password
-                )
-                try:
-                    qa_bot.send_json({"command": "player.my_info", "data": {}})
-                    bot_info = qa_bot.recv_next_non_notice()
-                    if not status_ok(bot_info):
-                        raise AssertionError(
-                            "ordinary-player ai_qa_bot login could not read player state"
-                        )
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            "SELECT to_sector FROM sector_warps "
-                            "WHERE from_sector=1 ORDER BY to_sector LIMIT 1"
-                        )
-                        adjacent_sector = cur.fetchone()[0]
-                    qa_bot.send_json({
-                        "command": "move.warp",
-                        "data": {"to_sector_id": adjacent_sector},
-                    })
-                    if not status_ok(qa_bot.recv_next_non_notice()):
-                        raise AssertionError(
-                            "ordinary-player ai_qa_bot could not use move.warp"
-                        )
-                finally:
-                    qa_bot.close()
-                print(
-                    "PASS ai_qa_bot public authentication, player.my_info, and move.warp"
-                )
-
-            hardware_port_id = exercise_fresh_hardware_stock(
-                conn, "127.0.0.1", client_port, account, password
-            )
-
-            rows = market_rows(conn)
-            routes = profitable_routes(rows)
-            for commodity, item in routes.items():
-                margin, ask, bid, source, destination = item["best"]
-                if margin <= 0 or source["quantity"] < 1 or destination["quantity"] >= destination["capacity"]:
-                    raise AssertionError(f"{commodity}: route is not quantity-feasible and profitable")
-                reports[commodity] = {
-                    "sellers": item["seller_ports"],
-                    "buyers": item["buyer_ports"],
-                    "possible_pairs": item["possible_pairs"],
-                    "profitable_pairs": item["profitable_pairs"],
-                    "unprofitable_pairs": item["unprofitable_pairs"],
-                    "best_margin": margin,
-                    "best_ask": ask,
-                    "best_bid": bid,
-                }
-
-            qa_bot_hardware_port = None
-            if qa_bot_password:
-                # Prove the seeded identity uses ordinary market and hardware
-                # permissions as well as ordinary-player authentication.
-                margin, ask, bid, source, destination = routes["ORE"]["best"]
-                move_test_player(conn, "ai_qa_bot", source)
-                buyer = login_client(
-                    "127.0.0.1", client_port, "ai_qa_bot", qa_bot_password
-                )
-                bot_before = trade_state(
-                    conn, "ai_qa_bot", source["port_id"], "ORE", "buy"
-                )
-                buy_response = execute_trade(
-                    buyer, "trade.buy", source["sector_id"], source["port_id"],
-                    "ORE", "qa-bot-buy-" + secrets.token_hex(8),
-                )
-                buyer.close()
-                bot_after_buy = trade_state(
-                    conn, "ai_qa_bot", source["port_id"], "ORE", "buy"
-                )
-                if (bot_after_buy["cargo"] != bot_before["cargo"] + 1
-                        or bot_after_buy["stock"] != bot_before["stock"] - 1
-                        or int(nested_value(buy_response, "unit_price")) != ask):
-                    raise AssertionError("ai_qa_bot trade.buy did not persist correctly")
-
-                move_test_player(conn, "ai_qa_bot", destination)
-                seller = login_client(
-                    "127.0.0.1", client_port, "ai_qa_bot", qa_bot_password
-                )
-                bot_sell_before = trade_state(
-                    conn, "ai_qa_bot", destination["port_id"], "ORE", "sell"
-                )
-                sell_response = execute_trade(
-                    seller, "trade.sell", destination["sector_id"],
-                    destination["port_id"], "ORE",
-                    "qa-bot-sell-" + secrets.token_hex(8),
-                )
-                seller.close()
-                bot_after_sell = trade_state(
-                    conn, "ai_qa_bot", destination["port_id"], "ORE", "sell"
-                )
-                if (bot_after_sell["cargo"] != bot_after_buy["cargo"] - 1
-                        or bot_after_sell["stock"] != bot_sell_before["stock"] + 1
-                        or int(nested_value(sell_response, "unit_price")) != bid
-                        or bot_after_sell["credits"] - bot_before["credits"] != margin):
-                    raise AssertionError("ai_qa_bot trade.sell did not persist correctly")
-
-                qa_bot_hardware_port = exercise_fresh_hardware_stock(
-                    conn, "127.0.0.1", client_port,
-                    "ai_qa_bot", qa_bot_password,
-                )
-                print(
-                    "PASS ai_qa_bot public ORE trading and black-market hardware purchase"
-                )
-
-            # Execute the same public buy/sell commands for one unit of each
-            # commodity. Position changes are isolated test fixture SQL.
-            for commodity, item in routes.items():
-                margin, ask, bid, source, destination = item["best"]
+            try:
+                qa_bot.send_json({"command": "player.my_info", "data": {}})
+                bot_info = qa_bot.recv_next_non_notice()
+                if not status_ok(bot_info):
+                    raise AssertionError(
+                        "ordinary-player ai_qa_bot login could not read player state"
+                    )
                 with conn.cursor() as cur:
-                    cur.execute("SELECT credits FROM players WHERE name=%s", (account,))
-                    credits_before = cur.fetchone()[0]
-                move_test_player(conn, account, source)
-                buyer = login_client("127.0.0.1", client_port, account, password)
-                buy_state_before = trade_state(
-                    conn, account, source["port_id"], commodity, "buy"
-                )
-                buyer.send_json({
-                    "command": "trade.buy",
-                    "data": {
-                        "sector_id": source["sector_id"],
-                        "port_id": source["port_id"],
-                        "account": 0,
-                        "items": [{"commodity": commodity, "quantity": 1}],
-                    },
+                    cur.execute(
+                        "SELECT to_sector FROM sector_warps "
+                        "WHERE from_sector=1 ORDER BY to_sector LIMIT 1"
+                    )
+                    adjacent_sector = cur.fetchone()[0]
+                qa_bot.send_json({
+                    "command": "move.warp",
+                    "data": {"to_sector_id": adjacent_sector},
                 })
-                missing_key = buyer.recv_next_non_notice()
-                if missing_key.get("status") != "error":
-                    raise AssertionError("trade.buy without data.idempotency_key was not rejected")
-                if trade_state(conn, account, source["port_id"], commodity, "buy") != buy_state_before:
-                    raise AssertionError("missing-key trade.buy changed authoritative state")
-                buy_response = execute_trade(
-                    buyer, "trade.buy", source["sector_id"], source["port_id"],
-                    commodity, "econ-qa-buy-" + secrets.token_hex(8),
-                )
-                buyer.close()
-                buy_state_after = trade_state(
-                    conn, account, source["port_id"], commodity, "buy"
-                )
-                if (buy_state_after["cargo"] != buy_state_before["cargo"] + 1
-                        or buy_state_after["stock"] != buy_state_before["stock"] - 1
-                        or buy_state_after["trades"] != buy_state_before["trades"] + 1
-                        or buy_state_after["credits"] >= buy_state_before["credits"]):
-                    raise AssertionError("duplicate trade.buy executed more or less than once")
-                actual_ask = nested_value(buy_response, "unit_price")
-                if actual_ask is None or int(actual_ask) != ask:
-                    raise AssertionError(f"{commodity}: actual buy quote differs from the calculated public ask")
-
-                move_test_player(conn, account, destination)
-                seller = login_client("127.0.0.1", client_port, account, password)
-                sell_state_before = trade_state(
-                    conn, account, destination["port_id"], commodity, "sell"
-                )
-                seller.send_json({
-                    "command": "trade.sell",
-                    "data": {
-                        "sector_id": destination["sector_id"],
-                        "port_id": destination["port_id"],
-                        "account": 0,
-                        "items": [{"commodity": commodity, "quantity": 1}],
-                    },
-                })
-                missing_key = seller.recv_next_non_notice()
-                if missing_key.get("status") != "error":
-                    raise AssertionError("trade.sell without data.idempotency_key was not rejected")
-                if trade_state(conn, account, destination["port_id"], commodity, "sell") != sell_state_before:
-                    raise AssertionError("missing-key trade.sell changed authoritative state")
-                sell_response = execute_trade(
-                    seller, "trade.sell", destination["sector_id"], destination["port_id"],
-                    commodity, "econ-qa-sell-" + secrets.token_hex(8),
-                )
-                seller.close()
-                sell_state_after = trade_state(
-                    conn, account, destination["port_id"], commodity, "sell"
-                )
-                if (sell_state_after["cargo"] != sell_state_before["cargo"] - 1
-                        or sell_state_after["stock"] != sell_state_before["stock"] + 1
-                        or sell_state_after["trades"] != sell_state_before["trades"] + 1
-                        or sell_state_after["credits"] <= sell_state_before["credits"]):
-                    raise AssertionError("duplicate trade.sell executed more or less than once")
-                actual_bid = nested_value(sell_response, "unit_price")
-                if actual_bid is None or int(actual_bid) != bid:
-                    raise AssertionError(f"{commodity}: actual sell quote differs from the calculated public bid")
-                with conn.cursor() as cur:
-                    cur.execute("SELECT credits FROM players WHERE name=%s", (account,))
-                    credits_after = cur.fetchone()[0]
-                    actual_profit = credits_after - credits_before
-                    if actual_profit <= 0 or actual_profit != margin:
-                        raise AssertionError(
-                            f"{commodity}: actual credits did not preserve the public quote margin "
-                            "after transaction costs"
-                        )
-                    reports[commodity]["actual_profit"] = actual_profit
-                    cur.execute("SELECT COALESCE(quantity,0) FROM entity_stock WHERE entity_type='port' AND entity_id=%s AND commodity_code=%s", (source["port_id"], commodity))
-                    reports[commodity]["source_stock_after_trade"] = cur.fetchone()[0]
-                conn.commit()
-
+                if not status_ok(qa_bot.recv_next_non_notice()):
+                    raise AssertionError(
+                        "ordinary-player ai_qa_bot could not use move.warp"
+                    )
+            finally:
+                qa_bot.close()
             print(
-                f"PASS database={db_name} sectors={config['sectors']} "
-                f"tech_level=3 port_size=5 black_market_ports={hardware_ports} "
-                f"initialized_hardware_rows={hardware_rows} "
-                f"hardware_purchase_restock_port={hardware_port_id}"
-                + (f" ai_qa_bot_hardware_port={qa_bot_hardware_port}"
-                   if qa_bot_hardware_port is not None else "")
+                "PASS ai_qa_bot public authentication, player.my_info, and move.warp"
             )
-            for commodity in COMMODITIES:
-                r = reports[commodity]
-                print(
-                    f"{commodity}: buy_ports={r['buyers']} sell_ports={r['sellers']} "
-                    f"profitable_quantity_feasible_routes={r['profitable_pairs']} "
-                    f"unprofitable_quantity_feasible_pairs={r['unprofitable_pairs']} "
-                    f"best_buy_price={r['best_ask']} best_sell_price={r['best_bid']} "
-                    f"best_unit_margin={r['best_margin']} "
-                    f"actual_trade_profit_after_fees={r['actual_profit']}"
-                )
+
+        hardware_port_id = exercise_fresh_hardware_stock(
+            conn, "127.0.0.1", client_port, account, password
+        )
+
+        rows = market_rows(conn)
+        routes = profitable_routes(rows)
+        for commodity, item in routes.items():
+            margin, ask, bid, source, destination = item["best"]
+            if margin <= 0 or source["quantity"] < 1 or destination["quantity"] >= destination["capacity"]:
+                raise AssertionError(f"{commodity}: route is not quantity-feasible and profitable")
+            reports[commodity] = {
+                "sellers": item["seller_ports"],
+                "buyers": item["buyer_ports"],
+                "possible_pairs": item["possible_pairs"],
+                "profitable_pairs": item["profitable_pairs"],
+                "unprofitable_pairs": item["unprofitable_pairs"],
+                "best_margin": margin,
+                "best_ask": ask,
+                "best_bid": bid,
+            }
+
+        qa_bot_hardware_port = None
+        if qa_bot_password:
+            # Prove the seeded identity uses ordinary market and hardware
+            # permissions as well as ordinary-player authentication.
+            margin, ask, bid, source, destination = routes["ORE"]["best"]
+            move_test_player(conn, "ai_qa_bot", source)
+            buyer = login_client(
+                "127.0.0.1", client_port, "ai_qa_bot", qa_bot_password
+            )
+            bot_before = trade_state(
+                conn, "ai_qa_bot", source["port_id"], "ORE", "buy"
+            )
+            buy_response = execute_trade(
+                buyer, "trade.buy", source["sector_id"], source["port_id"],
+                "ORE", "qa-bot-buy-" + secrets.token_hex(8),
+            )
+            buyer.close()
+            bot_after_buy = trade_state(
+                conn, "ai_qa_bot", source["port_id"], "ORE", "buy"
+            )
+            if (bot_after_buy["cargo"] != bot_before["cargo"] + 1
+                    or bot_after_buy["stock"] != bot_before["stock"] - 1
+                    or int(nested_value(buy_response, "unit_price")) != ask):
+                raise AssertionError("ai_qa_bot trade.buy did not persist correctly")
+
+            move_test_player(conn, "ai_qa_bot", destination)
+            seller = login_client(
+                "127.0.0.1", client_port, "ai_qa_bot", qa_bot_password
+            )
+            bot_sell_before = trade_state(
+                conn, "ai_qa_bot", destination["port_id"], "ORE", "sell"
+            )
+            sell_response = execute_trade(
+                seller, "trade.sell", destination["sector_id"],
+                destination["port_id"], "ORE",
+                "qa-bot-sell-" + secrets.token_hex(8),
+            )
+            seller.close()
+            bot_after_sell = trade_state(
+                conn, "ai_qa_bot", destination["port_id"], "ORE", "sell"
+            )
+            if (bot_after_sell["cargo"] != bot_after_buy["cargo"] - 1
+                    or bot_after_sell["stock"] != bot_sell_before["stock"] + 1
+                    or int(nested_value(sell_response, "unit_price")) != bid
+                    or bot_after_sell["credits"] - bot_before["credits"] != margin):
+                raise AssertionError("ai_qa_bot trade.sell did not persist correctly")
+
+            qa_bot_hardware_port = exercise_fresh_hardware_stock(
+                conn, "127.0.0.1", client_port,
+                "ai_qa_bot", qa_bot_password,
+            )
+            print(
+                "PASS ai_qa_bot public ORE trading and black-market hardware purchase"
+            )
+
+        # Execute the same public buy/sell commands for one unit of each
+        # commodity. Position changes are isolated test fixture SQL.
+        for commodity, item in routes.items():
+            margin, ask, bid, source, destination = item["best"]
+            with conn.cursor() as cur:
+                cur.execute("SELECT credits FROM players WHERE name=%s", (account,))
+                credits_before = cur.fetchone()[0]
+            move_test_player(conn, account, source)
+            buyer = login_client("127.0.0.1", client_port, account, password)
+            buy_state_before = trade_state(
+                conn, account, source["port_id"], commodity, "buy"
+            )
+            buyer.send_json({
+                "command": "trade.buy",
+                "data": {
+                    "sector_id": source["sector_id"],
+                    "port_id": source["port_id"],
+                    "account": 0,
+                    "items": [{"commodity": commodity, "quantity": 1}],
+                },
+            })
+            missing_key = buyer.recv_next_non_notice()
+            if missing_key.get("status") != "error":
+                raise AssertionError("trade.buy without data.idempotency_key was not rejected")
+            if trade_state(conn, account, source["port_id"], commodity, "buy") != buy_state_before:
+                raise AssertionError("missing-key trade.buy changed authoritative state")
+            buy_response = execute_trade(
+                buyer, "trade.buy", source["sector_id"], source["port_id"],
+                commodity, "econ-qa-buy-" + secrets.token_hex(8),
+            )
+            buyer.close()
+            buy_state_after = trade_state(
+                conn, account, source["port_id"], commodity, "buy"
+            )
+            if (buy_state_after["cargo"] != buy_state_before["cargo"] + 1
+                    or buy_state_after["stock"] != buy_state_before["stock"] - 1
+                    or buy_state_after["trades"] != buy_state_before["trades"] + 1
+                    or buy_state_after["credits"] >= buy_state_before["credits"]):
+                raise AssertionError("duplicate trade.buy executed more or less than once")
+            actual_ask = nested_value(buy_response, "unit_price")
+            if actual_ask is None or int(actual_ask) != ask:
+                raise AssertionError(f"{commodity}: actual buy quote differs from the calculated public ask")
+
+            move_test_player(conn, account, destination)
+            seller = login_client("127.0.0.1", client_port, account, password)
+            sell_state_before = trade_state(
+                conn, account, destination["port_id"], commodity, "sell"
+            )
+            seller.send_json({
+                "command": "trade.sell",
+                "data": {
+                    "sector_id": destination["sector_id"],
+                    "port_id": destination["port_id"],
+                    "account": 0,
+                    "items": [{"commodity": commodity, "quantity": 1}],
+                },
+            })
+            missing_key = seller.recv_next_non_notice()
+            if missing_key.get("status") != "error":
+                raise AssertionError("trade.sell without data.idempotency_key was not rejected")
+            if trade_state(conn, account, destination["port_id"], commodity, "sell") != sell_state_before:
+                raise AssertionError("missing-key trade.sell changed authoritative state")
+            sell_response = execute_trade(
+                seller, "trade.sell", destination["sector_id"], destination["port_id"],
+                commodity, "econ-qa-sell-" + secrets.token_hex(8),
+            )
+            seller.close()
+            sell_state_after = trade_state(
+                conn, account, destination["port_id"], commodity, "sell"
+            )
+            if (sell_state_after["cargo"] != sell_state_before["cargo"] - 1
+                    or sell_state_after["stock"] != sell_state_before["stock"] + 1
+                    or sell_state_after["trades"] != sell_state_before["trades"] + 1
+                    or sell_state_after["credits"] <= sell_state_before["credits"]):
+                raise AssertionError("duplicate trade.sell executed more or less than once")
+            actual_bid = nested_value(sell_response, "unit_price")
+            if actual_bid is None or int(actual_bid) != bid:
+                raise AssertionError(f"{commodity}: actual sell quote differs from the calculated public bid")
+            with conn.cursor() as cur:
+                cur.execute("SELECT credits FROM players WHERE name=%s", (account,))
+                credits_after = cur.fetchone()[0]
+                actual_profit = credits_after - credits_before
+                if actual_profit <= 0 or actual_profit != margin:
+                    raise AssertionError(
+                        f"{commodity}: actual credits did not preserve the public quote margin "
+                        "after transaction costs"
+                    )
+                reports[commodity]["actual_profit"] = actual_profit
+                cur.execute("SELECT COALESCE(quantity,0) FROM entity_stock WHERE entity_type='port' AND entity_id=%s AND commodity_code=%s", (source["port_id"], commodity))
+                reports[commodity]["source_stock_after_trade"] = cur.fetchone()[0]
+            conn.commit()
+
+        print(
+            f"PASS database={db_name} sectors={config['sectors']} "
+            f"tech_level=3 port_size=5 black_market_ports={hardware_ports} "
+            f"initialized_hardware_rows={hardware_rows} "
+            f"hardware_purchase_restock_port={hardware_port_id}"
+            + (f" ai_qa_bot_hardware_port={qa_bot_hardware_port}"
+               if qa_bot_hardware_port is not None else "")
+        )
+        for commodity in COMMODITIES:
+            r = reports[commodity]
+            print(
+                f"{commodity}: buy_ports={r['buyers']} sell_ports={r['sellers']} "
+                f"profitable_quantity_feasible_routes={r['profitable_pairs']} "
+                f"unprofitable_quantity_feasible_pairs={r['unprofitable_pairs']} "
+                f"best_buy_price={r['best_ask']} best_sell_price={r['best_bid']} "
+                f"best_unit_margin={r['best_margin']} "
+                f"actual_trade_profit_after_fees={r['actual_profit']}"
+            )
     finally:
         if server is not None and server.poll() is None:
             if os.name == "nt":
@@ -976,6 +976,7 @@ def main() -> None:
                         cur.execute(sql.SQL("DROP DATABASE {}").format(sql.Identifier(db_name)))
             finally:
                 admin.close()
+        temporary_directory.cleanup()
 
 
 if __name__ == "__main__":
