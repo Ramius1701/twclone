@@ -707,8 +707,11 @@ def main() -> None:
             from twclient import TWClient
             registration = TWClient("127.0.0.1", client_port, timeout=10)
             registration.connect()
-            if not registration.register(account, password, fail_if_exists=True):
-                raise AssertionError("trade-test player registration failed")
+            registration.send_json({"command": "auth.register", "data": {"username": account, "passwd": password}})
+            reply = registration.recv_next_non_notice()
+            if not status_ok(reply):
+                print((server_dir / "server.log").read_text()[-12000:])
+                raise AssertionError(f"registration failed: {reply}")
             registration.close()
 
             exercise_trading_journey(conn, "127.0.0.1", client_port, account, password)
