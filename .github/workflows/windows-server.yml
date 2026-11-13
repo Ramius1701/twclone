@@ -10,9 +10,9 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: cygwin/cygwin-install-action@v6
+      - uses: cygwin/cygwin-install-action@v7
         with:
-          packages: gcc-core make autoconf automake libpq-devel libssl-devel libreadline-devel libjansson-devel libargon2_1 postgresql postgresql-client python39-psycopg2
+          packages: gcc-core make autoconf automake libpq-devel libssl-devel libreadline-devel libjansson-devel libargon2_1 postgresql postgresql-client python312 python312-devel python312-pip
       - name: Build and test on Windows
         shell: C:\cygwin\bin\bash.exe --noprofile --norc -eo pipefail {0}
         run: |
@@ -28,4 +28,6 @@ jobs:
           export ECON_QA_DATABASE=twclone_econ_qa_windows
           export ECON_QA_ADMIN_DSN="host=127.0.0.1 port=55432 user=twclone_qa dbname=postgres"
           export ECON_QA_APP_TEMPLATE="host=127.0.0.1 port=55432 user=twclone_qa dbname=%DB%"
-          python3.9 tests.v2/test_pg_bigbang_economy_profit.py
+          python3.12 -m venv "$qa_dir/venv"
+          "$qa_dir/venv/bin/python" -m pip install psycopg2
+          "$qa_dir/venv/bin/python" tests.v2/test_pg_bigbang_economy_profit.py
