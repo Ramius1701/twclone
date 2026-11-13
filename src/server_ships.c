@@ -19,7 +19,6 @@
 #include <arpa/inet.h>
 #include <jansson.h>		/* -ljansson */
 #include <stdbool.h>
-#include <uuid/uuid.h>		// For UUID generation
 /* local includes */
 #include "schemas.h"
 #include "server_cmds.h"

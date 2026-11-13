@@ -29,9 +29,13 @@ static int argon2_loaded;
 static void
 load_argon2_once (void)
 {
+#if defined(__CYGWIN__)
+  argon2_handle = dlopen ("cygargon2-1.dll", RTLD_NOW | RTLD_LOCAL);
+#else
   argon2_handle = dlopen ("libargon2.so.1", RTLD_NOW | RTLD_LOCAL);
   if (!argon2_handle)
     argon2_handle = dlopen ("libargon2.so", RTLD_NOW | RTLD_LOCAL);
+#endif
   if (!argon2_handle)
     return;
 

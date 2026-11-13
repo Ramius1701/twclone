@@ -605,8 +605,9 @@ def main() -> None:
     if not admin_dsn or not app_template or "%DB%" not in app_template:
         raise SystemExit("Set ECON_QA_ADMIN_DSN and ECON_QA_APP_TEMPLATE (with %DB%).")
 
-    bigbang = Path(os.environ.get("BIGBANG_BIN", ROOT / "bin/bigbang")).resolve()
-    server_bin = Path(os.environ.get("SERVER_BIN", ROOT / "bin/server")).resolve()
+    executable_suffix = ".exe" if sys.platform in ("cygwin", "win32") else ""
+    bigbang = Path(os.environ.get("BIGBANG_BIN", ROOT / f"bin/bigbang{executable_suffix}")).resolve()
+    server_bin = Path(os.environ.get("SERVER_BIN", ROOT / f"bin/server{executable_suffix}")).resolve()
     if not bigbang.is_file() or not server_bin.is_file():
         raise SystemExit("Built bin/bigbang and bin/server are required")
 
