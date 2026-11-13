@@ -22,6 +22,9 @@ jobs:
           ./configure --enable-postgres
           make clean
           make -j2 SANITIZE_FLAGS=
+          pg_bin=$(dirname "$(find /usr -name initdb.exe -print -quit)")
+          test -x "$pg_bin/initdb.exe"
+          export PATH="$pg_bin:$PATH"
           qa_dir=$(mktemp -d)
           trap 'pg_ctl -D "$qa_dir/data" -m fast stop || true; rm -rf -- "$qa_dir"' EXIT
           initdb -D "$qa_dir/data" -U twclone_qa -A trust
