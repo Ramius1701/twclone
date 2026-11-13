@@ -25,9 +25,13 @@ jobs:
           pg_bin=$(dirname "$(find /usr -name initdb.exe -print -quit)")
           test -x "$pg_bin/initdb.exe"
           export PATH="$pg_bin:$PATH"
+          /usr/sbin/cygserver.exe &
+          cygserver_pid=$!
+          sleep 2
+          kill -0 "$cygserver_pid"
           qa_dir=$(mktemp -d)
-          trap 'pg_ctl -D "$qa_dir/data" -m fast stop || true; rm -rf -- "$qa_dir"' EXIT
-          initdb -D "$qa_dir/data" -U twclone_qa -A trust
+          trap 'pg_ctl -D "$qa_dir/data" -m fast stop || true; kill "$cygserver_pid" || true; rm -rf -- "$qa_dir"' EXIT
+          initdb -D "$qa_dir/data" -U twclone_qa -A trust --encoding=UTF8
           pg_ctl -D "$qa_dir/data" -l "$qa_dir/postgres.log" -o "-h 127.0.0.1 -p 55432" -w start
           export ECON_QA_DATABASE=twclone_econ_qa_windows
           export ECON_QA_ADMIN_DSN="host=127.0.0.1 port=55432 user=twclone_qa dbname=postgres"
