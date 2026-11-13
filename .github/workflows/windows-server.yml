@@ -28,6 +28,7 @@ jobs:
           package="$PWD/package check/twclone-windows-x64"
           export BIGBANG_BIN="$package/bin/bigbang.exe"
           export SERVER_BIN="$package/bin/server.exe"
+          export ECON_QA_SQL_DIR="$package/sql/pg"
           pg_bin=$(dirname "$(find /usr -name initdb.exe -print -quit)")
           test -x "$pg_bin/initdb.exe"
           export PATH="$pg_bin:$PATH"

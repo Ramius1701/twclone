@@ -637,7 +637,7 @@ def main() -> None:
                 "admin": admin_dsn,
                 "db": db_name,
                 "app": app_dsn,
-                "sql_dir": str(ROOT / "sql/pg"),
+                "sql_dir": str(Path(os.environ.get("ECON_QA_SQL_DIR", ROOT / "sql/pg")).resolve()),
                 "sectors": int(os.environ.get("ECON_QA_SECTORS", "2500")),
                 "server_port": client_port,
                 "s2s_port": s2s_port,
