@@ -1,4 +1,4 @@
-"""RedialBBS door wrapper for the TWClone Python client.
+"""BBS door wrapper for the twclone Python client.
 
 Runs the stock client.py unchanged, but signs the caller in with the name and
 password the rlogin bridge (twdoor.py) passes in the environment, and creates

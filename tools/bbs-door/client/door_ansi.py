@@ -1,4 +1,4 @@
-"""ANSI colour and BBS-style screens for the TWClone text client (RedialBBS door).
+"""ANSI colour and BBS-style screens for the twclone text client (BBS door).
 
 Loaded by door_client.py. It leaves client.py untouched and instead:
   * redraws the sector display, the status bar, menus and prompts in colour,
