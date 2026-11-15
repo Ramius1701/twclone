@@ -30,7 +30,7 @@ environment settings:
 | --- | ---: | ---: |
 | `server_max_connections` / `TWCLONE_MAX_CONNECTIONS` | 128 | 1–10,000 |
 | `server_max_request_bytes` / `TWCLONE_MAX_REQUEST_BYTES` | 65,536 | 256–1,048,576 |
-| `server_request_timeout_ms` / `TWCLONE_REQUEST_TIMEOUT_MS` | 10,000 | 100–300,000 |
+| `server_request_timeout_ms` / `TWCLONE_REQUEST_TIMEOUT_MS` | 10,000 | 100–3,600,000 |
 | `server_requests_per_minute` / `TWCLONE_REQUESTS_PER_MINUTE` | 200 | 1–100,000 |
 
 Frames are newline-delimited and rejected when oversized or incomplete at the

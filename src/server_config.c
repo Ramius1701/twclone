@@ -286,7 +286,7 @@ validate_cfg (void)
       || g_cfg.server_max_request_bytes < 256
       || g_cfg.server_max_request_bytes > 1048576
       || g_cfg.server_request_timeout_ms < 100
-      || g_cfg.server_request_timeout_ms > 300000
+      || g_cfg.server_request_timeout_ms > 3600000
       || g_cfg.server_requests_per_minute < 1
       || g_cfg.server_requests_per_minute > 100000)
     {
