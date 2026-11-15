@@ -3161,6 +3161,18 @@ db_adjacent_sectors_json (db_t *db, int sid, json_t **out)
                 &err))
     {
       rc = stmt_to_json_array (res, out, &err);
+      /* Clients expect neighbours as plain sector IDs, not {"to_sector": n} rows. */
+      if (rc == 0 && *out)
+        {
+          size_t i;
+          json_t *row;
+          json_array_foreach (*out, i, row)
+          {
+            json_t *to = json_is_object (row) ? json_object_get (row, "to_sector") : NULL;
+            if (to && json_is_integer (to))
+              json_array_set_new (*out, i, json_integer (json_integer_value (to)));
+          }
+        }
       goto cleanup;
     }
 
