@@ -32,3 +32,9 @@ cp -- tools/windows/README.md "$destination/README.md"
 cp -- COPYING LICENSE "$destination/licenses/"
 cp -R -- /usr/share/doc/Cygwin "$destination/licenses/"
 git rev-parse HEAD > "$destination/source-commit.txt"
+
+# The BBS door (rlogin bridge and colour layer). twdoor.json is made on the
+# door's first run, with its own secret, so it isn't shipped.
+cp -- tools/bbs-door/{twdoor.py,start-twdoor.cmd,door-theme.json} "$destination/"
+cp -- tools/bbs-door/client/{door_client.py,door_ansi.py} "$destination/client/"
+cp -- tools/bbs-door/README.md "$destination/DOOR-README.md"

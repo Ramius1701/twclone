@@ -25,3 +25,5 @@ The game source is in the [twclone fork](https://github.com/Ramius1701/twclone)
 at the revision in `source-commit.txt`. The bundled runtime libraries are
 from [Cygwin packages](https://cygwin.com/packages/), where package source is
 available. Package notices are under `licenses`.
+
+To run it as a BBS rlogin door, see `DOOR-README.md`.
