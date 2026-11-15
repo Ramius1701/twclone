@@ -346,6 +346,9 @@ def install(client) -> None:
         print()
         print(T.c("status_bar", T.rule_char * T.width))
         print(" " + (" " + bar + " ").join(line1))
+        if h.ship_name:
+            ship_name = "".join(char for char in h.ship_name if char.isprintable())
+            print(" " + item("Ship", ship_name))
         if extra:
             print(" " + (" " + bar + " ").join(extra))
         print(T.c("status_bar", T.rule_char * T.width))
