@@ -132,6 +132,15 @@ tw_password_verify (const char *encoded, const char *password)
   int rc = verify_encoded (encoded, password, strlen (password));
   if (rc == 0)
     return 1;
+  /* On Windows (Cygwin) a correct password is sometimes reported as a
+     mismatch, about one check in five, with the same hash and password each
+     time. Check once more before refusing; a wrong password fails both. */
+  int again = verify_encoded (encoded, password, strlen (password));
+  if (again == 0)
+    {
+      fprintf (stderr, "password_hash: first argon2id_verify said %d, second matched\n", rc);
+      return 1;
+    }
   /* -35 is ARGON2_VERIFY_MISMATCH, a wrong password. Anything else is a
      failure to check (memory, threads, a malformed hash), not a verdict. */
   if (rc != -35)
