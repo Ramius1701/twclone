@@ -2732,6 +2732,12 @@ def print_last_rpc(ctx):
     if resp is None:
         print("[no response captured]")
         return
+    if (ctx.current_menu != "TESTING" and isinstance(resp, dict)
+            and resp.get("status") in ("error", "refused")):
+        error = resp.get("error")
+        message = error.get("message") if isinstance(error, dict) else None
+        print(message or "The server could not complete the request.")
+        return
     print(json.dumps(resp, ensure_ascii=False, indent=2))
 
 @register("pretty_print_trade_quote")
@@ -2956,15 +2962,15 @@ def pretty_print_hardware_list(ctx):
         print("[no response captured]")
         return
 
-    if resp.get("status") != "ok":
-        print(f"[Error] Failed to get hardware list: {resp.get('error', {}).get('message', 'Unknown error')}")
-        _pp(resp)
+    if not isinstance(resp, dict) or resp.get("status") != "ok":
+        error = resp.get("error") if isinstance(resp, dict) else None
+        message = error.get("message") if isinstance(error, dict) else None
+        print(message or "The hardware list is unavailable.")
         return
 
     data = resp.get("data")
     if not isinstance(data, dict) or not ("items" in data or "hardware" in data):
         print("[Error] Invalid hardware list data.")
-        _pp(resp)
         return
 
     hardware_items = data.get("items", data.get("hardware", []))

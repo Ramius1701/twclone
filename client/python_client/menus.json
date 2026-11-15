@@ -1481,8 +1481,8 @@
           }
         },
         {
-          "key": "l",
-          "label": "(L) Logout",
+          "key": "x",
+          "label": "(X) Logout",
           "action": {
             "rpc": {
               "command": "auth.logout",
