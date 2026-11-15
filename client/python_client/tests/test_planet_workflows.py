@@ -85,7 +85,7 @@ def test_landing_success_applies_canonical_hud_refresh_before_surface(
     })
     fake_conn.queue("player.my_info", {
         "status": "ok", "type": "player.info",
-        "data": {"player": {"id": 3, "turns_remaining": 39}},
+        "data": {"player": {"id": 3, "ship_id": 9, "turns_remaining": 39}},
     })
     fake_conn.queue("ship.status", {
         "status": "ok", "type": "ship.status",

@@ -171,11 +171,13 @@ def _refresh_sector_after_shipyard(ctx: "Context") -> bool:
     return True
 
 
-def _safe_landing_refresh(ctx: "Context", command: str, data: dict) -> Optional[dict]:
+def _safe_landing_refresh(
+    ctx: "Context", command: str, data: dict, *, expected_ship_id: Optional[int] = None
+) -> Optional[dict]:
     """Refresh landing HUD state without turning a reconnect into a traceback."""
     try:
         if command == "ship.status":
-            return _refresh_ship_after_move(ctx)
+            return _refresh_ship_after_move(ctx, expected_ship_id=expected_ship_id)
         if command == "player.my_info":
             # Landing reconciliation is an authorization boundary: a player
             # record without the session's authoritative ID may not update
@@ -7350,25 +7352,21 @@ def land_flow(ctx: Context):
         if player_refreshed:
             ctx.player_info = get_data(player_resp)
             _update_corp_context(ctx)
-        # Landing changes the active ship's location/state.  Reconcile through
-        # the same identity-checked refresh used after movement so a valid
-        # looking response for another ship cannot make stale surface actions
-        # actionable.
-        ship_resp = _safe_landing_refresh(ctx, "ship.status", {})
+        # Use the current player's active ship from the same reconciliation.
+        # A cached ship may have been replaced before this command completed.
+        expected_ship_id = (
+            _authoritative_positive_integer_id(player_data.get("ship_id"))
+            if player_refreshed and player_data is not None
+            else None
+        )
+        ship_resp = _safe_landing_refresh(
+            ctx, "ship.status", {}, expected_ship_id=expected_ship_id
+        )
         ship_record = (
             _authoritative_hud_record(ship_resp, "ship")
             if _refresh_response_type_matches(ship_resp, "ship.status")
             else None
         )
-        expected_ship_id = ctx.hud.ship_id
-        # When the pre-landing HUD had no active-ship identity, the refreshed
-        # player record is the authoritative relationship for this session.
-        # Do not let an otherwise valid ship.status for another ship make the
-        # newly landed surface actionable.
-        if expected_ship_id is None and isinstance(player_data, dict):
-            player_ship_id = _authoritative_positive_integer_id(player_data.get("ship_id"))
-            if player_ship_id is not None:
-                expected_ship_id = player_ship_id
         actual_ship_id = (ship_record.get("id", ship_record.get("ship_id"))
                           if ship_record else None)
         ship_refreshed = (
@@ -7377,7 +7375,7 @@ def land_flow(ctx: Context):
             # the server-owned active ship.  Do not accept a partial ship
             # object merely because it contains display fields such as hull.
             and type(actual_ship_id) is int and actual_ship_id > 0
-            and (expected_ship_id is None or actual_ship_id == expected_ship_id)
+            and actual_ship_id == expected_ship_id
         )
         if ship_refreshed:
             # ship.status exposes the server-owned landed planet ID. It is the
