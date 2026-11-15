@@ -672,25 +672,25 @@ def test_jettison_requires_confirmation_and_refreshes_authoritative_cargo(
 ):
     ctx = ctx_factory()
     fake_conn.queue("ship.info", {"status": "ok", "data": {"ship": {
-        "cargo": [{"commodity": "ore", "quantity": 5}],
+        "cargo": [{"commodity": "weapons", "quantity": 5}],
     }}})
-    fake_conn.queue("ship.jettison", {"status": "ok", "data": {"remaining_cargo": [
-        {"commodity": "ore", "quantity": 2},
+    fake_conn.queue("trade.jettison", {"status": "ok", "data": {"remaining_cargo": [
+        {"commodity": "weapons", "quantity": 2},
     ]}})
     fake_conn.queue("player.my_info", {"status": "ok", "data": {"player": {"credits": 100}}})
     fake_conn.queue("ship.status", {"status": "ok", "data": {"ship": {
-            "id": 7, "holds": 20, "cargo": [{"commodity": "ore", "qty": 2}],
+            "id": 7, "holds": 20, "cargo": [{"commodity": "weapons", "quantity": 2}],
     }}})
-    answers = iter(["ORE", "3", "y"])
+    answers = iter(["WPN", "3", "y"])
     prompts = []
     monkeypatch.setattr("builtins.input", lambda prompt: (prompts.append(prompt), next(answers))[1])
 
     client.jettison_cargo_flow(ctx)
 
     assert [call["command"] for call in fake_conn.calls] == [
-        "ship.info", "ship.jettison", "player.my_info", "ship.status",
+        "ship.info", "trade.jettison", "player.my_info", "ship.status",
     ]
-    assert fake_conn.calls[1]["data"] == {"commodity": "ORE", "quantity": 3}
+    assert fake_conn.calls[1]["data"] == {"commodity": "WPN", "quantity": 3}
     assert any("spend 1 turn" in prompt for prompt in prompts)
     assert "Successfully jettisoned" in capsys.readouterr().out
     assert ctx.hud.cargo_used == 2

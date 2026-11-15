@@ -8372,7 +8372,7 @@ def jettison_cargo_flow(ctx: Context):
         print(f"  {item.get('commodity').capitalize()}: {item.get('quantity')}")
     print("---------------------")
 
-    commodity_input = input("Enter commodity code to jettison (ORE, ORG, EQU, COL): ").strip().upper()
+    commodity_input = input("Enter commodity code to jettison (ORE, ORG, EQU, COL, SLV, WPN, DRG): ").strip().upper()
     if not commodity_input:
         print("Cancelled.")
         return
@@ -8383,8 +8383,14 @@ def jettison_cargo_flow(ctx: Context):
         "EQU": "EQU",
         "ORGANICS": "ORG",
         "EQUIPMENT": "EQU",
-        "COLONISTS": "COLONISTS",
-        "COL": "COLONISTS"
+        "COLONISTS": "COL",
+        "COL": "COL",
+        "SLAVES": "SLV",
+        "SLV": "SLV",
+        "WEAPONS": "WPN",
+        "WPN": "WPN",
+        "DRUGS": "DRG",
+        "DRG": "DRG",
     }
     commodity = code_map.get(commodity_input)
 
@@ -8428,7 +8434,7 @@ def jettison_cargo_flow(ctx: Context):
         "quantity": quantity_to_jettison
     }
 
-    resp = ctx.conn.rpc("ship.jettison", payload)
+    resp = ctx.conn.rpc("trade.jettison", payload)
     ctx.state["last_rpc"] = resp
     if resp.get("status") == "ok":
         print(f"Successfully jettisoned {quantity_to_jettison} units of {commodity}.")

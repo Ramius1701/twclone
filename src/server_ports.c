@@ -2286,34 +2286,43 @@ cmd_trade_jettison (client_ctx_t *ctx, json_t *root)
       || strcasecmp (commodity, "ORE") == 0)
     {
       have = cur_ore;
+      commodity = "ORE";
     }
   else if (strcasecmp (commodity, "organics") == 0
 	   || strcasecmp (commodity, "ORG") == 0)
     {
       have = cur_org;
+      commodity = "ORG";
     }
   else if (strcasecmp (commodity, "equipment") == 0
 	   || strcasecmp (commodity, "EQU") == 0)
     {
       have = cur_eq;
+      commodity = "EQU";
     }
   else if (strcasecmp (commodity, "colonists") == 0
            || strcasecmp (commodity, "COL") == 0)
     {
       have = cur_colonists;
+      commodity = "COL";
     }
   else if (strcasecmp (commodity, "slaves") == 0
            || strcasecmp (commodity, "SLV") == 0)
     {
       have = cur_slaves;
+      commodity = "SLV";
     }
-  else if (strcasecmp (commodity, "weapons") == 0)
+  else if (strcasecmp (commodity, "weapons") == 0
+           || strcasecmp (commodity, "WPN") == 0)
     {
       have = cur_weapons;
+      commodity = "WPN";
     }
-  else if (strcasecmp (commodity, "drugs") == 0)
+  else if (strcasecmp (commodity, "drugs") == 0
+           || strcasecmp (commodity, "DRG") == 0)
     {
       have = cur_drugs;
+      commodity = "DRG";
     }
   else
     {
