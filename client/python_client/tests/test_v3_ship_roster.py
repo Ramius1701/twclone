@@ -1,6 +1,7 @@
 """V3-SHIP-02 client acceptance for the authoritative ship roster."""
 
 import client
+import pytest
 
 
 def test_owned_ship_roster_inspection_uses_authoritative_ids(
@@ -363,3 +364,39 @@ def test_ship_roster_refresh_rejects_wrong_typed_ship_status(ctx_factory, fake_c
         {"command": "ship.status", "data": {}},
     ]
 
+
+
+@pytest.mark.parametrize("status_id", [60, 61])
+def test_inspect_active_ship_only_uses_matching_full_status(
+    ctx_factory, fake_conn, monkeypatch, capsys, status_id
+):
+    ctx = ctx_factory()
+    fake_conn.queue("ship.list", {
+        "status": "ok", "type": "ship.list.response",
+        "data": {"ships": [{"ship_id": 60, "name": "USS Explorer", "sector_id": 1, "active": True}]},
+    })
+    fake_conn.queue("ship.inspect", {
+        "status": "ok", "type": "ship.inspect",
+        "data": {"ship": {"ship_id": 60, "name": "USS Explorer", "is_derelict": False}},
+    })
+    fake_conn.queue("ship.status", {
+        "status": "ok", "type": "ship.status",
+        "data": {"ship": {"id": status_id, "type_id": 2, "fighters": 8, "shields": 4,
+                          "hull": 97, "holds": 10, "cargo": [{"commodity": "ore", "quantity": 3}]}},
+    })
+    monkeypatch.setattr("builtins.input", lambda _: "1")
+
+    client.ship_roster_inspect_flow(ctx)
+
+    assert [call["command"] for call in fake_conn.calls] == ["ship.list", "ship.inspect", "ship.status"]
+    result = capsys.readouterr().out
+    assert "Sector: 1    Owner: You" in result
+    if status_id == 60:
+        assert "Shields 4, Fighters 8" in result
+        assert "97/100" in result
+        assert "3 used / 10 total" in result
+    else:
+        assert "Full active-ship status could not be confirmed." in result
+        assert "Shields —, Fighters —" in result
+        assert "Cargo:   not reported" in result
+        assert "97/100" not in result

@@ -5006,11 +5006,11 @@ def render_ship_card(ship: dict) -> str:
     defence = ship.get("defence") or {}
     shields = defence.get("shields") if isinstance(defence, dict) else None
     if shields is None:
-        shields = ship.get("shields") or 0
+        shields = ship.get("shields", "—")
         
     fighters = defence.get("fighters") if isinstance(defence, dict) else None
     if fighters is None:
-        fighters = ship.get("fighters") or 0
+        fighters = ship.get("fighters", "—")
     hull = ship.get("hull")
     hull_text = _fmt_int(hull) if type(hull) is int and 0 <= hull <= 100 else "—"
 
@@ -5027,14 +5027,17 @@ def render_ship_card(ship: dict) -> str:
         holds_used = sum(cargo_data.values())
     
     if isinstance(holds_val, dict):
-        holds_total = holds_val.get("total") or 0
+        holds_total = holds_val.get("total", "—")
     elif isinstance(holds_val, int):
         holds_total = holds_val # This is max_holds
     else:
-        holds_total = 0
+        holds_total = "—"
     
-    holds_line  = f"{_fmt_int(holds_used)} used / {_fmt_int(holds_total)} total"
-    cargo_str = _render_cargo(cargo_data)
+    if not isinstance(cargo_data, (list, dict)):
+        holds_used = "—"
+
+    holds_line = f"{_fmt_int(holds_used)} used / {_fmt_int(holds_total)} total"
+    cargo_str = _render_cargo(cargo_data) if cargo_data is not None else "not reported"
 
     lines = []
     lines.append(f"\n┌─ Ship: {name}  (ID {sid})")
@@ -5363,7 +5366,8 @@ def ship_roster_inspect_flow(ctx: Context):
         print("Ship inspection cancelled: that roster number is unavailable.")
         return
 
-    ship_id = valid_ships[index - 1]["ship_id"]
+    selected = valid_ships[index - 1]
+    ship_id = selected["ship_id"]
     try:
         response = ctx.conn.rpc("ship.inspect", {"ship_id": ship_id})
     except (ConnectionError, OSError) as exc:
@@ -5398,8 +5402,24 @@ def ship_roster_inspect_flow(ctx: Context):
         print("Ship inspection unavailable: the server returned a different ship ID.")
         _refresh_ship_roster_state(ctx)
         return
+    card = dict(inspected)
+    sector_id = _authoritative_positive_integer_id(selected.get("sector_id"))
+    if sector_id is not None:
+        card.setdefault("sector_id", sector_id)
+    card.setdefault("owner", "You")
+    if selected["active"]:
+        try:
+            status = ctx.conn.rpc("ship.status", {})
+        except (ConnectionError, OSError):
+            status = None
+        active = (_authoritative_hud_record(status, "ship")
+                  if _refresh_response_type_matches(status, "ship.status") else None)
+        if active is not None and _authoritative_positive_integer_id(active.get("id")) == ship_id:
+            card.update(active)
+        else:
+            print("Full active-ship status could not be confirmed.")
     print("Server-authoritative ship inspection:")
-    print(render_ship_card(inspected))
+    print(render_ship_card(card))
 
 
 @register("ship_transfer_flow")
