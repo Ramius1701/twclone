@@ -382,10 +382,10 @@
           "label": "(S) Ship Info",
           "action": {
             "rpc": {
-              "command": "ship.info",
+              "command": "ship.status",
               "data": {}
             },
-            "post": "print_inspect_response_pretty"
+            "post": "print_active_ship_info"
           }
         },
         {

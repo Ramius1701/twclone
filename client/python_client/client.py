@@ -5051,36 +5051,28 @@ def render_ship_card(ship: dict) -> str:
     lines.append("└────────────────────────────────────────────")
     return "\n".join(lines)
 
-@register("print_inspect_response_pretty")
-def print_inspect_response_pretty(ctx):
-    resp = ctx.state.get("last_rpc")
-    if resp is None:
-        print("[no response captured]")
-        return
-    
-    # Directly access data to see where it fails
-    data = resp.get("data")
-    if data is None:
-        print("[no data in response]")
+@register("print_active_ship_info")
+def print_active_ship_info(ctx: Context):
+    response = ctx.state.get("last_rpc")
+    ship = (_authoritative_hud_record(response, "ship")
+            if _refresh_response_type_matches(response, "ship.status") else None)
+    ship_id = _authoritative_positive_integer_id(ship.get("id")) if ship else None
+    if ship_id is None:
+        print("Active ship information is unavailable.")
         return
 
-    ships = data.get("ships") or []
-    if not isinstance(ships, list) or not ships:
-        # Some servers return a single 'ship' object (e.g. ship.status)
-        ship = data.get("ship")
-        if isinstance(ship, dict):
-            # Inject context if missing
-            if "location" not in ship and "location" in data:
-                ship["location"] = data["location"]
-            if "owner" not in ship and "name" in data:
-                ship["owner"] = data["name"]
-            print(render_ship_card(ship))
-            return
-        raise ValueError("No ships found in response.")
-    for ship in ships:
-        print(render_ship_card(ship))
-    return
-
+    card = {**ship, "owner": "You"}
+    try:
+        player_response = ctx.conn.rpc("player.my_info", {})
+    except (ConnectionError, OSError):
+        player_response = None
+    if _landing_player_refresh_is_current(ctx, player_response, require_identity=True):
+        player = _authoritative_hud_record(player_response, "player")
+        if _authoritative_positive_integer_id(player.get("ship_id")) == ship_id:
+            sector = _authoritative_positive_integer_id(player.get("sector"))
+            if sector is not None:
+                card["sector_id"] = sector
+    print(render_ship_card(card))
 
 
 @register("transfer_cargo_flow")

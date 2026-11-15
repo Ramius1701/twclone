@@ -400,3 +400,30 @@ def test_inspect_active_ship_only_uses_matching_full_status(
         assert "Shields —, Fighters —" in result
         assert "Cargo:   not reported" in result
         assert "97/100" not in result
+
+
+@pytest.mark.parametrize("player_ship_id, sector_text", [(60, "1"), (61, "?")])
+def test_computer_ship_info_displays_confirmed_sector_and_owner(
+    ctx_factory, fake_conn, capsys, player_ship_id, sector_text
+):
+    ctx = ctx_factory(sector={"id": 99})
+    ctx.push("COMPUTER")
+    ctx.state["player_id"] = 5
+    ctx.player_info = {"player": {"id": 5, "ship_id": 60, "sector": 99}}
+    fake_conn.queue("ship.status", {
+        "status": "ok", "type": "ship.status",
+        "data": {"ship": {"id": 60, "name": "USS Explorer", "hull": 100,
+                          "holds": 10, "cargo": []}},
+    })
+    fake_conn.queue("player.my_info", {
+        "status": "ok", "type": "player.info",
+        "data": {"player": {"id": 5, "ship_id": player_ship_id, "sector": 1}},
+    })
+
+    client.handle_choice(ctx, "s")
+
+    assert [call["command"] for call in fake_conn.calls] == ["ship.status", "player.my_info"]
+    result = capsys.readouterr().out
+    assert "USS Explorer" in result
+    assert f"Sector: {sector_text}    Owner: You" in result
+    assert "0 used / 10 total" in result
