@@ -24,7 +24,7 @@ endif
 AM_LDFLAGS = $(SANITIZE_FLAGS)
 
 
-server_LDADD   	= -ljansson -lssl -lcrypto -lpthread -lm -lpq -lreadline -lhistory -ldl -lbsd
+server_LDADD   	= -ljansson -lssl -lcrypto -lpthread -lm -lpq -lreadline -lhistory -ldl
 AUTOMAKE_OPTIONS = subdir-objects
 
 bin_PROGRAMS = \
