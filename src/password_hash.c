@@ -135,7 +135,6 @@ tw_password_verify (const char *encoded, const char *password)
   /* -35 is ARGON2_VERIFY_MISMATCH, a wrong password. Anything else is a
      failure to check (memory, threads, a malformed hash), not a verdict. */
   if (rc != -35)
-    fprintf (stderr, "password_hash: argon2id_verify failed with code %d
-", rc);
+    fprintf (stderr, "password_hash: argon2id_verify failed with code %d\n", rc);
   return 0;
 }
