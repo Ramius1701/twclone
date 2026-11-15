@@ -13,6 +13,8 @@ typedef struct
   int id;
   char actor_type[16];          // e.g., "port"
   int actor_id;
+  char location_type[16];       // inventory location, distinct from account actor
+  int location_id;
   int commodity_id;
   char side[8];                 // "buy" or "sell"
   int quantity;
@@ -40,6 +42,21 @@ int db_insert_commodity_order (db_t *db,
 int db_update_commodity_order (db_t *db, int order_id, int new_quantity,     // Total quantity of the order (can be less than original if partially filled)
                                int new_filled_quantity,
                                const char *new_status);
+int db_update_commodity_order_state(db_t *db, int order_id,
+                                    int new_quantity,
+                                    int new_filled_quantity,
+                                    const char *new_status,
+                                    const char *cancellation_reason);
+int db_market_lock_planet_buy_order(db_t *db, int order_id,
+                                    int *player_id, int *planet_id,
+                                    int *quantity, int *filled_quantity,
+                                    char status_out[16]);
+int db_market_cancel_open_order(db_t *db, int order_id,
+                                const char *cancellation_reason);
+/* Lock and read the current order row inside the caller's transaction.
+ * Returns 0 when found, ERR_DB_NOT_FOUND when absent, or a database error. */
+int db_market_lock_order_for_update(db_t *db, int order_id,
+                                    commodity_order_t *out_order);
 
 // Helper to cancel open commodity orders for a given port and commodity on a specific side.
 // Returns 0 on success.
@@ -64,6 +81,7 @@ int db_cancel_commodity_orders_for_actor_and_commodity (db_t *db,
 commodity_order_t *db_load_open_orders_for_commodity (db_t *db,
                                                       int commodity_id,
                                                       const char *side,
+                                                      int64_t now_s,
                                                       int *count);
 
 // Helper to get a specific open order for a port.
@@ -92,10 +110,14 @@ int db_insert_commodity_trade (db_t *db,
                                int price,
                                const char *buyer_actor_type,
                                int buyer_actor_id,
+                               const char *buyer_location_type,
+                               int buyer_location_id,
                                const char *seller_actor_type,
                                int seller_actor_id,
-                               int settlement_tx_buy,
-                               int settlement_tx_sell);
+                               const char *seller_location_type,
+                               int seller_location_id,
+                               int64_t settlement_tx_buy,
+                               int64_t settlement_tx_sell);
 
 // Helper to list open orders for a specific port (read-only, for diagnostics)
 // Returns 0 on success, populating out_orders.

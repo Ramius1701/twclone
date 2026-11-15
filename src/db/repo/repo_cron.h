@@ -20,6 +20,9 @@ int db_cron_unlock (db_t *db, const char *name);
 int db_cron_uncloak_fedspace_ships (db_t *db);
 int db_cron_get_illegal_assets_json (db_t *db, json_t **out_array);
 int db_cron_cleanse_msl_assets (db_t *db, json_t **out_removed_array);
+int db_cron_claim_fedspace_sweep (db_t *db, int64_t now_s);
+int db_cron_complete_fedspace_sweep (db_t *db, int64_t now_s,
+                                     int fighters, int mines, int beacons);
 int db_cron_delete_sector_asset (db_t *db, int player_id, int asset_type, int sector_id, int quantity);
 int db_cron_logout_inactive_players (db_t *db, int64_t cutoff_s);
 int db_cron_init_eligible_tows (db_t *db, int start_sec, int end_sec, int64_t stale_cutoff);
@@ -33,7 +36,13 @@ int db_cron_terra_replenish (db_t *db);
 int db_cron_planet_pop_growth_tick (db_t *db, double growth_rate);
 int db_cron_citadel_treasury_tick (db_t *db, int rate_bps);
 int db_cron_planet_update_production_stock (db_t *db, int64_t now_s);
+int db_cron_apply_slave_unrest (db_t *db, int64_t now_s,
+                                int64_t interval_days,
+                                int64_t stoppage_cycles,
+                                int64_t population_loss);
 int db_cron_planet_get_market_data_json (db_t *db, json_t **out_array);
+int db_cron_planet_get_production_overview_json (db_t *db, int planet_id,
+                                                 json_t **out_array);
 int db_cron_broadcast_cleanup (db_t *db, int64_t now_s);
 int db_cron_expire_trade_offers (db_t *db, int64_t now_s);
 int db_cron_traps_process (db_t *db, int64_t now_s);

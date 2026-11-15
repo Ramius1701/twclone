@@ -22,6 +22,12 @@
  * --- Helper Functions ---
  * =============================================================================
  */
+static void schema_nav_add_field (json_t *properties, const char *name,
+                                  const char *type, long long minimum);
+static void schema_nav_require (json_t *required, const char *field);
+static json_t *schema_nav_request (const char *id, json_t *properties,
+                                   json_t *required);
+
 static char *
 why_dup (const char *m)
 {
@@ -312,6 +318,9 @@ extern json_t *schema_ship_tow (void);
 extern json_t *schema_ship_tow_engaged (void);
 extern json_t *schema_ship_tow_disengaged (void);
 extern json_t *schema_ship_info (void);
+extern json_t *schema_ship_sell (void);
+extern json_t *schema_ship_sold_response (void);
+extern json_t *schema_ship_transfer (void);
 extern json_t *schema_ship_transfer_cargo (void);
 extern json_t *schema_ship_jettison (void);
 extern json_t *schema_ship_upgrade (void);
@@ -359,11 +368,17 @@ extern json_t *schema_sector_scan_density (void);
 extern json_t *schema_sector_scan (void);
 extern json_t *schema_planet_genesis (void);
 extern json_t *schema_planet_info (void);
+extern json_t *schema_planet_emancipate (void);
+extern json_t *schema_planet_view_response (void);
+extern json_t *schema_planet_emancipated_response (void);
+extern json_t *schema_planet_harvest_response (void);
+extern json_t *schema_planet_fighters_transfer (void);
 extern json_t *schema_planet_rename (void);
 extern json_t *schema_planet_land (void);
 extern json_t *schema_planet_launch (void);
 extern json_t *schema_planet_transfer_ownership (void);
 extern json_t *schema_planet_harvest (void);
+extern json_t *schema_planet_trade_port (void);
 extern json_t *schema_planet_deposit (void);
 extern json_t *schema_planet_colonists_allocate (void);
 extern json_t *schema_planet_withdraw (void);
@@ -400,10 +415,14 @@ extern json_t *schema_move_transwarp (void);
 extern json_t *schema_dock_status (void);
 extern json_t *schema_news_no_args (void);
 extern json_t *schema_shipyard_upgrade (void);
+extern json_t *schema_shipyard_sell (void);
 extern json_t *schema_shipyard_list_response (void);
 extern json_t *schema_shipyard_upgraded_response (void);
 extern json_t *schema_bank_history (void);
 extern json_t *schema_bank_leaderboard (void);
+extern json_t *schema_bank_orders_created_response (void);
+extern json_t *schema_bank_orders_list_response (void);
+extern json_t *schema_bank_orders_cancelled_response (void);
 extern json_t *schema_player_list_online_request (void);
 extern json_t *schema_player_list_online_response (void);
 extern json_t *schema_port_update (void);
@@ -428,6 +447,8 @@ extern json_t *schema_mail_read (void);
 extern json_t *schema_mail_delete (void);
 extern json_t *schema_sys_notice_create (void);
 extern json_t *schema_notice_list (void);
+extern json_t *schema_events_resume (void);
+extern json_t *schema_events_resume_response (void);
 extern json_t *schema_notice_ack (void);
 extern json_t *schema_insurance_policies_list (void);
 extern json_t *schema_insurance_policies_buy (void);
@@ -468,6 +489,9 @@ static schema_entry_t g_schema_table[] = {
   {"ship.tow.engaged", NULL, schema_ship_tow_engaged},
   {"ship.tow.disengaged", NULL, schema_ship_tow_disengaged},
   {"ship.info", NULL, schema_ship_info},
+  {"ship.sell", NULL, schema_ship_sell},
+  {"ship.sold_v1", NULL, schema_ship_sold_response},
+  {"ship.transfer", NULL, schema_ship_transfer},
   {"ship.transfer_cargo", NULL, schema_ship_transfer_cargo},
   {"ship.jettison", NULL, schema_ship_jettison},
   {"ship.upgrade", NULL, schema_ship_upgrade},
@@ -485,6 +509,7 @@ static schema_entry_t g_schema_table[] = {
   {"trade.quote", NULL, schema_trade_quote},
   {"trade.jettison", NULL, schema_trade_jettison},
   {"trade.offer", NULL, schema_trade_offer},
+  {"trade.offers", NULL, schema_trade_offers},
   {"trade.accept", NULL, schema_trade_accept},
   {"trade.cancel", NULL, schema_trade_cancel},
   {"trade.history", NULL, schema_trade_history},
@@ -517,11 +542,17 @@ static schema_entry_t g_schema_table[] = {
   {"sector.scan", NULL, schema_sector_scan},
   {"planet.genesis", NULL, schema_planet_genesis},
   {"planet.info", NULL, schema_planet_info},
+  {"planet.emancipate", NULL, schema_planet_emancipate},
+  {"planet.view_v1", NULL, schema_planet_view_response},
+  {"planet.emancipated_v1", NULL, schema_planet_emancipated_response},
+  {"planet.fighters.transfer", NULL, schema_planet_fighters_transfer},
   {"planet.rename", NULL, schema_planet_rename},
   {"planet.land", NULL, schema_planet_land},
   {"planet.launch", NULL, schema_planet_launch},
   {"planet.transfer_ownership", NULL, schema_planet_transfer_ownership},
   {"planet.harvest", NULL, schema_planet_harvest},
+  {"planet.trade.port", NULL, schema_planet_trade_port},
+  {"planet.harvest_v1", NULL, schema_planet_harvest_response},
   {"planet.deposit", NULL, schema_planet_deposit},
   {"planet.colonists.allocate", NULL, schema_planet_colonists_allocate},
   {"planet.withdraw", NULL, schema_planet_withdraw},
@@ -548,6 +579,7 @@ static schema_entry_t g_schema_table[] = {
   {"corp.statement", NULL, schema_corp_statement},
   {"corp.status", NULL, schema_corp_no_args},
   {"corp.transfer_ceo", NULL, schema_corp_target_player},
+  {"corp.member.transfer", NULL, schema_corp_member_transfer},
   {"corp.withdraw", NULL, schema_corp_amount},
   {"nav.avoid.add", NULL, schema_nav_avoid_sector},
   {"nav.avoid.list", NULL, schema_nav_no_args},
@@ -576,6 +608,7 @@ static schema_entry_t g_schema_table[] = {
   {"shipyard.upgraded_v1", NULL, schema_shipyard_upgraded_response},
   {"shipyard.list", NULL, schema_nav_no_args},
   {"shipyard.upgrade", NULL, schema_shipyard_upgrade},
+  {"shipyard.sell", NULL, schema_shipyard_sell},
   {"player.get_avoids", NULL, schema_nav_no_args},
   {"player.get_bookmarks", NULL, schema_nav_no_args},
   {"player.get_notes", NULL, schema_note_list},
@@ -586,6 +619,9 @@ static schema_entry_t g_schema_table[] = {
   {"bank.withdraw", NULL, schema_bank_withdraw},
   {"bank.history", NULL, schema_bank_history},
   {"bank.leaderboard", NULL, schema_bank_leaderboard},
+  {"bank.orders.created", NULL, schema_bank_orders_created_response},
+  {"bank.orders.list_v1", NULL, schema_bank_orders_list_response},
+  {"bank.orders.cancelled", NULL, schema_bank_orders_cancelled_response},
   {"player.list_online_request", NULL, schema_player_list_online_request},
   {"player.list_online_response", NULL, schema_player_list_online_response},
   {"port.update", NULL, schema_port_update},
@@ -613,6 +649,8 @@ static schema_entry_t g_schema_table[] = {
   {"sys.cron.planet_tick_once", NULL, schema_placeholder},
   {"sys.cron.citadel_reap_once", NULL, schema_placeholder},
   {"notice.list", NULL, schema_notice_list},
+  {"events.resume", NULL, schema_events_resume},
+  {"events.resume.response", NULL, schema_events_resume_response},
   {"notice.ack", NULL, schema_notice_ack},
   {"insurance.policies_list", NULL, schema_insurance_policies_list},
   {"insurance.policies_buy", NULL, schema_insurance_policies_buy},
@@ -1089,7 +1127,6 @@ schema_trade_buy (void)
   json_array_append_new (required, json_string ("port_id"));
   json_array_append_new (required, json_string ("items"));
   json_array_append_new (required, json_string ("idempotency_key"));
-  json_array_append_new (required, json_string ("account"));
   json_array_append_new (required, json_string ("sector_id"));
   json_object_set_new (root, "required", required);
 
@@ -1889,7 +1926,6 @@ schema_ship_transfer_cargo (void)
   return root;
 }
 
-
 json_t *
 schema_ship_jettison (void)
 {
@@ -1992,7 +2028,14 @@ schema_port_info (void)
 		       json_string
 		       ("https://json-schema.org/draft/2020-12/schema"));
   json_object_set_new (root, "type", json_string ("object"));
-  json_object_set_new (root, "properties", json_object ());
+  json_t *properties = json_object ();
+  json_t *port_id = json_object ();
+  json_t *sector_id = json_object ();
+  json_object_set_new (port_id, "type", json_string ("integer"));
+  json_object_set_new (sector_id, "type", json_string ("integer"));
+  json_object_set_new (properties, "port_id", port_id);
+  json_object_set_new (properties, "sector_id", sector_id);
+  json_object_set_new (root, "properties", properties);
   json_object_set_new (root, "additionalProperties", json_boolean (0));
   return root;
 }
@@ -2228,7 +2271,6 @@ schema_trade_sell (void)
   json_array_append_new (required, json_string ("port_id"));
   json_array_append_new (required, json_string ("items"));
   json_array_append_new (required, json_string ("idempotency_key"));
-  json_array_append_new (required, json_string ("account"));
   json_object_set_new (root, "required", required);
 
 
@@ -2407,6 +2449,26 @@ schema_trade_jettison (void)
 static json_t *schema_trade_offer_action_request (const char *id,
                                                    json_t *properties,
                                                    json_t *any_required);
+
+json_t *
+schema_trade_offers (void)
+{
+  json_t *offer = json_object ();
+  json_object_set_new (offer, "type", json_string ("object"));
+  json_object_set_new (offer, "additionalProperties", json_boolean (1));
+  json_t *offers = json_object ();
+  json_object_set_new (offers, "type", json_string ("array"));
+  json_object_set_new (offers, "items", offer);
+  json_t *props = json_object ();
+  json_object_set_new (props, "offers", offers);
+  json_t *root = json_object ();
+  json_object_set_new (root, "$id", json_string ("ge://schema/trade.offers.json"));
+  json_object_set_new (root, "type", json_string ("object"));
+  json_object_set_new (root, "properties", props);
+  json_object_set_new (root, "required", json_pack ("[s]", "offers"));
+  json_object_set_new (root, "additionalProperties", json_boolean (0));
+  return root;
+}
 
 json_t *
 schema_trade_offer (void)
@@ -2853,10 +2915,8 @@ schema_move_describe_sector (void)
 		       ("https://json-schema.org/draft/2020-12/schema"));
   json_object_set_new (root, "type", json_string ("object"));
   json_object_set_new (root, "properties", props);
-
-  json_t *required = json_array ();
-  json_array_append_new (required, json_string ("sector_id"));
-  json_object_set_new (root, "required", required);
+  /* sector_id is optional (PROTOCOL.v3 21): without it the handler describes
+     the caller's current sector, which the client reads after every move. */
   json_object_set_new (root, "additionalProperties", json_boolean (0));
   return root;
 }
@@ -3123,7 +3183,7 @@ schema_sector_search (void)
 
   json_t *query_prop = json_object ();
   json_object_set_new (query_prop, "type", json_string ("string"));
-  json_object_set_new (props, "query", query_prop);
+  json_object_set_new (props, "q", query_prop);
 
   json_t *root = json_object ();
   json_object_set_new (root, "$id",
@@ -3134,9 +3194,6 @@ schema_sector_search (void)
   json_object_set_new (root, "type", json_string ("object"));
   json_object_set_new (root, "properties", props);
 
-  json_t *required = json_array ();
-  json_array_append_new (required, json_string ("query"));
-  json_object_set_new (root, "required", required);
   json_object_set_new (root, "additionalProperties", json_boolean (0));
   return root;
 }
@@ -3145,6 +3202,13 @@ schema_sector_search (void)
 json_t *
 schema_sector_scan_density (void)
 {
+  json_t *props = json_object ();
+  json_t *sector_id = json_object ();
+
+  json_object_set_new (sector_id, "type", json_string ("integer"));
+  json_object_set_new (sector_id, "minimum", json_integer (1));
+  json_object_set_new (props, "sector_id", sector_id);
+
   json_t *root = json_object ();
   json_object_set_new (root, "$id",
 		       json_string ("ge://schema/sector.scan.density.json"));
@@ -3152,7 +3216,7 @@ schema_sector_scan_density (void)
 		       json_string
 		       ("https://json-schema.org/draft/2020-12/schema"));
   json_object_set_new (root, "type", json_string ("object"));
-  json_object_set_new (root, "properties", json_object ());
+  json_object_set_new (root, "properties", props);
   json_object_set_new (root, "additionalProperties", json_boolean (0));
   return root;
 }
@@ -3161,6 +3225,10 @@ schema_sector_scan_density (void)
 json_t *
 schema_sector_scan (void)
 {
+  json_t *props = json_object ();
+  json_t *mode = json_object ();
+  json_object_set_new (mode, "type", json_string ("string"));
+  json_object_set_new (props, "mode", mode);
   json_t *root = json_object ();
   json_object_set_new (root, "$id",
 		       json_string ("ge://schema/sector.scan.json"));
@@ -3168,7 +3236,7 @@ schema_sector_scan (void)
 		       json_string
 		       ("https://json-schema.org/draft/2020-12/schema"));
   json_object_set_new (root, "type", json_string ("object"));
-  json_object_set_new (root, "properties", json_object ());
+  json_object_set_new (root, "properties", props);
   json_object_set_new (root, "additionalProperties", json_boolean (0));
   return root;
 }
@@ -3226,6 +3294,152 @@ schema_planet_info (void)
   json_array_append_new (required, json_string ("planet_id"));
   json_object_set_new (root, "required", required);
   json_object_set_new (root, "additionalProperties", json_boolean (0));
+  return root;
+}
+
+json_t *
+schema_planet_emancipate (void)
+{
+  json_t *schema = schema_planet_info ();
+  if (schema)
+    json_object_set_new (schema, "$id",
+                         json_string ("ge://schema/planet.emancipate.json"));
+  return schema;
+}
+
+json_t *
+schema_planet_view_response (void)
+{
+  json_t *properties = json_object ();
+  json_t *required = json_array ();
+  json_t *root = json_object ();
+  if (!properties || !required || !root)
+    {
+      json_decref (properties);
+      json_decref (required);
+      json_decref (root);
+      return NULL;
+    }
+  schema_nav_add_field (properties, "planet_id", "integer", 1);
+  schema_nav_add_field (properties, "name", "string", 0);
+  schema_nav_add_field (properties, "class", "string", 0);
+  schema_nav_add_field (properties, "population", "integer", 0);
+  schema_nav_add_field (properties, "population_type", "string", 0);
+  schema_nav_add_field (properties, "morale_status", "string", 0);
+  schema_nav_add_field (properties, "goods", "array", 0);
+  json_t *production = json_object ();
+  json_t *production_item = json_object ();
+  json_t *production_item_props = json_object ();
+  json_t *production_item_required = json_array ();
+  if (!production || !production_item || !production_item_props
+      || !production_item_required)
+    {
+      json_decref (production);
+      json_decref (production_item);
+      json_decref (production_item_props);
+      json_decref (production_item_required);
+      json_decref (properties);
+      json_decref (required);
+      json_decref (root);
+      return NULL;
+    }
+  schema_nav_add_field (production_item_props, "commodity", "string", 0);
+  schema_nav_add_field (production_item_props, "gross_per_cycle", "integer", 0);
+  schema_nav_add_field (production_item_props, "consumption_per_cycle", "integer", 0);
+  schema_nav_add_field (production_item_props, "net_per_cycle", "integer", 0);
+  const char *production_fields[] = {"commodity", "gross_per_cycle",
+                                     "consumption_per_cycle", "net_per_cycle"};
+  for (size_t i = 0; i < sizeof production_fields / sizeof production_fields[0]; ++i)
+    schema_nav_require (production_item_required, production_fields[i]);
+  json_object_set_new (production_item, "type", json_string ("object"));
+  json_object_set_new (production_item, "properties", production_item_props);
+  json_object_set_new (production_item, "required", production_item_required);
+  json_object_set_new (production_item, "additionalProperties", json_boolean (0));
+  json_object_set_new (production, "type", json_string ("array"));
+  json_object_set_new (production, "items", production_item);
+  json_object_set_new (properties, "production", production);
+  schema_nav_add_field (properties, "citadel", "object", 0);
+  schema_nav_add_field (properties, "treasury", "integer", 0);
+  schema_nav_require (required, "planet_id");
+  json_object_set_new (root, "$id",
+                       json_string ("ge://schema/planet.view_v1.json"));
+  json_object_set_new (root, "$schema",
+                       json_string ("https://json-schema.org/draft/2020-12/schema"));
+  json_object_set_new (root, "type", json_string ("object"));
+  json_object_set_new (root, "properties", properties);
+  json_object_set_new (root, "required", required);
+  json_object_set_new (root, "additionalProperties", json_boolean (0));
+  return root;
+}
+
+json_t *
+schema_planet_emancipated_response (void)
+{
+  json_t *properties = json_object ();
+  json_t *required = json_array ();
+  if (!properties || !required)
+    {
+      json_decref (properties);
+      json_decref (required);
+      return NULL;
+    }
+  schema_nav_add_field (properties, "planet_id", "integer", 1);
+  schema_nav_add_field (properties, "population_type", "string", 0);
+  schema_nav_add_field (properties, "population", "integer", 0);
+  schema_nav_add_field (properties, "turns_charged", "integer", 0);
+  schema_nav_add_field (properties, "credits_charged", "integer", 0);
+  const char *fields[] = {"planet_id", "population_type", "population",
+                          "turns_charged", "credits_charged"};
+  for (size_t i = 0; i < sizeof fields / sizeof fields[0]; ++i)
+    schema_nav_require (required, fields[i]);
+  return schema_nav_request ("ge://schema/planet.emancipated_v1.json",
+                             properties, required);
+}
+
+json_t *
+schema_planet_fighters_transfer (void)
+{
+  json_t *properties = json_object ();
+  json_t *planet_id = json_object ();
+  json_t *direction = json_object ();
+  json_t *quantity = json_object ();
+  json_t *directions = json_array ();
+  json_t *required = json_array ();
+  json_t *root = json_object ();
+  if (!properties || !planet_id || !direction || !quantity || !directions
+      || !required || !root)
+    {
+      json_decref (properties);
+      json_decref (planet_id);
+      json_decref (direction);
+      json_decref (quantity);
+      json_decref (directions);
+      json_decref (required);
+      json_decref (root);
+      return NULL;
+    }
+  json_object_set_new (planet_id, "type", json_string ("integer"));
+  json_object_set_new (planet_id, "minimum", json_integer (1));
+  json_array_append_new (directions, json_string ("ship_to_planet"));
+  json_array_append_new (directions, json_string ("planet_to_ship"));
+  json_object_set_new (direction, "type", json_string ("string"));
+  json_object_set_new (direction, "enum", directions);
+  json_object_set_new (quantity, "type", json_string ("integer"));
+  json_object_set_new (quantity, "minimum", json_integer (1));
+  json_object_set_new (properties, "planet_id", planet_id);
+  json_object_set_new (properties, "direction", direction);
+  json_object_set_new (properties, "quantity", quantity);
+  json_object_set_new (root, "$id",
+                       json_string ("ge://schema/planet.fighters.transfer.json"));
+  json_object_set_new (root, "$schema",
+                       json_string ("https://json-schema.org/draft/2020-12/schema"));
+  json_object_set_new (root, "type", json_string ("object"));
+  json_object_set_new (root, "properties", properties);
+  json_array_append_new (required, json_string ("planet_id"));
+  json_array_append_new (required, json_string ("direction"));
+  json_array_append_new (required, json_string ("quantity"));
+  json_object_set_new (root, "required", required);
+  json_object_set_new (root, "additionalProperties", json_false ());
   return root;
 }
 
@@ -3375,6 +3589,91 @@ schema_planet_harvest (void)
   json_object_set_new (root, "required", required);
   json_object_set_new (root, "additionalProperties", json_boolean (0));
   return root;
+}
+
+json_t *
+schema_planet_trade_port (void)
+{
+  json_t *properties = json_object ();
+  json_t *planet_id = json_object ();
+  json_object_set_new (planet_id, "type", json_string ("integer"));
+  json_object_set_new (planet_id, "minimum", json_integer (1));
+  json_object_set_new (properties, "planet_id", planet_id);
+  json_t *port_id = json_object ();
+  json_object_set_new (port_id, "type", json_string ("integer"));
+  json_object_set_new (port_id, "minimum", json_integer (1));
+  json_object_set_new (properties, "port_id", port_id);
+  json_t *item_properties = json_object ();
+  json_t *commodity = json_object ();
+  json_object_set_new (commodity, "type", json_string ("string"));
+  json_object_set_new (commodity, "minLength", json_integer (3));
+  json_object_set_new (commodity, "maxLength", json_integer (3));
+  json_object_set_new (item_properties, "commodity", commodity);
+  json_t *quantity = json_object ();
+  json_object_set_new (quantity, "type", json_string ("integer"));
+  json_object_set_new (quantity, "minimum", json_integer (1));
+  json_object_set_new (item_properties, "quantity", quantity);
+  json_t *item_required = json_array ();
+  json_array_append_new (item_required, json_string ("commodity"));
+  json_array_append_new (item_required, json_string ("quantity"));
+  json_t *item_schema = json_object ();
+  json_object_set_new (item_schema, "type", json_string ("object"));
+  json_object_set_new (item_schema, "properties", item_properties);
+  json_object_set_new (item_schema, "required", item_required);
+  json_object_set_new (item_schema, "additionalProperties", json_false ());
+  json_t *items = json_object ();
+  json_object_set_new (items, "type", json_string ("array"));
+  json_object_set_new (items, "minItems", json_integer (1));
+  json_object_set_new (items, "maxItems", json_integer (3));
+  json_object_set_new (items, "items", item_schema);
+  json_object_set_new (properties, "items", items);
+  json_t *idem = json_object ();
+  json_object_set_new (idem, "type", json_string ("string"));
+  json_object_set_new (idem, "minLength", json_integer (1));
+  json_object_set_new (idem, "maxLength", json_integer (128));
+  json_object_set_new (properties, "idempotency_key", idem);
+  json_t *required = json_array ();
+  json_array_append_new (required, json_string ("planet_id"));
+  json_array_append_new (required, json_string ("port_id"));
+  json_array_append_new (required, json_string ("items"));
+  json_array_append_new (required, json_string ("idempotency_key"));
+  json_t *schema = json_object ();
+  json_object_set_new (schema, "$id",
+                       json_string ("ge://schema/planet.trade.port.json"));
+  json_object_set_new (schema, "$schema", json_string
+                       ("https://json-schema.org/draft/2020-12/schema"));
+  json_object_set_new (schema, "type", json_string ("object"));
+  json_object_set_new (schema, "properties", properties);
+  json_object_set_new (schema, "required", required);
+  json_object_set_new (schema, "additionalProperties", json_false ());
+  return schema;
+}
+
+json_t *
+schema_planet_harvest_response (void)
+{
+  json_t *properties = json_object ();
+  json_t *required = json_array ();
+  if (!properties || !required)
+    {
+      json_decref (properties);
+      json_decref (required);
+      return NULL;
+    }
+  schema_nav_add_field (properties, "planet_id", "integer", 1);
+  schema_nav_add_field (properties, "ship_id", "integer", 1);
+  schema_nav_add_field (properties, "ore_harvested", "integer", 0);
+  schema_nav_add_field (properties, "organics_harvested", "integer", 0);
+  schema_nav_add_field (properties, "equipment_harvested", "integer", 0);
+  schema_nav_add_field (properties, "holds_remaining", "integer", 0);
+  schema_nav_add_field (properties, "turns_charged", "integer", 0);
+  const char *fields[] = {"planet_id", "ship_id", "ore_harvested",
+                          "organics_harvested", "equipment_harvested",
+                          "holds_remaining", "turns_charged"};
+  for (size_t i = 0; i < sizeof fields / sizeof fields[0]; ++i)
+    schema_nav_require (required, fields[i]);
+  return schema_nav_request ("ge://schema/planet.harvest_v1.json",
+                             properties, required);
 }
 
 
@@ -3718,7 +4017,15 @@ schema_combat_sweep_mines (void)
 		       json_string
 		       ("https://json-schema.org/draft/2020-12/schema"));
   json_object_set_new (root, "type", json_string ("object"));
-  json_object_set_new (root, "properties", json_object ());
+  json_t *properties = json_object ();
+  json_t *target_sector_id = json_object ();
+  json_object_set_new (target_sector_id, "type", json_string ("integer"));
+  json_object_set_new (target_sector_id, "minimum", json_integer (1));
+  json_object_set_new (properties, "target_sector_id", target_sector_id);
+  json_object_set_new (root, "properties", properties);
+  json_t *required = json_array ();
+  json_array_append_new (required, json_string ("target_sector_id"));
+  json_object_set_new (root, "required", required);
   json_object_set_new (root, "additionalProperties", json_boolean (0));
   return root;
 }
@@ -3940,9 +4247,15 @@ schema_chat_send (void)
 {
   json_t *props = json_object ();
 
-  json_t *channel_prop = json_object ();
-  json_object_set_new (channel_prop, "type", json_string ("string"));
-  json_object_set_new (props, "channel", channel_prop);
+  json_t *to_player_prop = json_object ();
+  json_object_set_new (to_player_prop, "type", json_string ("string"));
+  json_object_set_new (to_player_prop, "minLength", json_integer (1));
+  json_object_set_new (props, "to_player", to_player_prop);
+
+  json_t *to_id_prop = json_object ();
+  json_object_set_new (to_id_prop, "type", json_string ("integer"));
+  json_object_set_new (to_id_prop, "minimum", json_integer (1));
+  json_object_set_new (props, "to_id", to_id_prop);
 
   json_t *message_prop = json_object ();
   json_object_set_new (message_prop, "type", json_string ("string"));
@@ -3959,7 +4272,6 @@ schema_chat_send (void)
   json_object_set_new (root, "properties", props);
 
   json_t *required = json_array ();
-  json_array_append_new (required, json_string ("channel"));
   json_array_append_new (required, json_string ("message"));
   json_object_set_new (root, "required", required);
   json_object_set_new (root, "additionalProperties", json_boolean (0));
@@ -4290,6 +4602,120 @@ schema_notice_list (void)
   return root;
 }
 
+json_t *
+schema_events_resume (void)
+{
+  json_t *root = json_object ();
+  json_t *properties = json_object ();
+  if (!root || !properties)
+    {
+      if (root) json_decref (root);
+      if (properties) json_decref (properties);
+      return NULL;
+    }
+  json_object_set_new (root, "$id",
+                       json_string ("ge://schema/events.resume.json"));
+  json_object_set_new (root, "$schema",
+                       json_string ("https://json-schema.org/draft/2020-12/schema"));
+  json_object_set_new (root, "type", json_string ("object"));
+
+  const char *cursor_fields[] = {"after_cursor", "through_cursor"};
+  for (size_t i = 0; i < sizeof cursor_fields / sizeof cursor_fields[0]; ++i)
+    {
+      json_t *field = json_object ();
+      json_object_set_new (field, "type", json_string ("string"));
+      json_object_set_new (properties, cursor_fields[i], field);
+    }
+  json_t *limit = json_object ();
+  json_object_set_new (limit, "type", json_string ("integer"));
+  json_object_set_new (limit, "minimum", json_integer (1));
+  json_object_set_new (limit, "maximum", json_integer (500));
+  json_object_set_new (properties, "limit", limit);
+  json_object_set_new (root, "properties", properties);
+  json_object_set_new (root, "required", json_array ());
+  json_object_set_new (root, "additionalProperties", json_false ());
+  return root;
+}
+
+json_t *
+schema_events_resume_response (void)
+{
+  json_t *root = json_object ();
+  json_t *properties = json_object ();
+  json_t *events = json_object ();
+  json_t *item = json_object ();
+  json_t *item_properties = json_object ();
+  if (!root || !properties || !events || !item || !item_properties)
+    {
+      json_decref (root);
+      json_decref (properties);
+      json_decref (events);
+      json_decref (item);
+      json_decref (item_properties);
+      return NULL;
+    }
+  json_object_set_new (root, "$id",
+                       json_string ("ge://schema/events.resume.response.json"));
+  json_object_set_new (root, "$schema",
+                       json_string ("https://json-schema.org/draft/2020-12/schema"));
+  json_object_set_new (root, "type", json_string ("object"));
+
+  json_object_set_new (item, "type", json_string ("object"));
+  const char *item_string_fields[] = {"id", "ts", "type"};
+  for (size_t i = 0; i < sizeof item_string_fields / sizeof item_string_fields[0]; ++i)
+    {
+      json_t *field = json_object ();
+      json_object_set_new (field, "type", json_string ("string"));
+      json_object_set_new (item_properties, item_string_fields[i], field);
+    }
+  json_t *data = json_object ();
+  json_object_set_new (data, "type", json_string ("object"));
+  json_object_set_new (item_properties, "data", data);
+  json_t *meta = json_object ();
+  json_object_set_new (meta, "type", json_string ("object"));
+  json_t *meta_properties = json_object ();
+  const char *meta_string_fields[] = {"topic", "cursor"};
+  for (size_t i = 0; i < sizeof meta_string_fields / sizeof meta_string_fields[0]; ++i)
+    {
+      json_t *field = json_object ();
+      json_object_set_new (field, "type", json_string ("string"));
+      json_object_set_new (meta_properties, meta_string_fields[i], field);
+    }
+  json_t *replayable = json_object ();
+  json_object_set_new (replayable, "type", json_string ("boolean"));
+  json_object_set_new (meta_properties, "replayable", replayable);
+  json_object_set_new (meta, "properties", meta_properties);
+  json_object_set_new (meta, "required",
+                       json_pack ("[s]", "replayable"));
+  json_object_set_new (meta, "additionalProperties", json_true ());
+  json_object_set_new (item_properties, "meta", meta);
+  json_object_set_new (item, "properties", item_properties);
+  json_object_set_new (item, "required",
+                       json_pack ("[sssss]", "id", "ts", "type", "data",
+                                  "meta"));
+  json_object_set_new (item, "additionalProperties", json_true ());
+  json_object_set_new (events, "type", json_string ("array"));
+  json_object_set_new (events, "items", item);
+  json_object_set_new (properties, "events", events);
+
+  const char *cursor_fields[] = {"next_cursor", "high_watermark"};
+  for (size_t i = 0; i < sizeof cursor_fields / sizeof cursor_fields[0]; ++i)
+    {
+      json_t *field = json_object ();
+      json_object_set_new (field, "type", json_string ("string"));
+      json_object_set_new (properties, cursor_fields[i], field);
+    }
+  json_t *has_more = json_object ();
+  json_object_set_new (has_more, "type", json_string ("boolean"));
+  json_object_set_new (properties, "has_more", has_more);
+  json_object_set_new (root, "properties", properties);
+  json_object_set_new (root, "required",
+                       json_pack ("[ssss]", "events", "next_cursor",
+                                  "high_watermark", "has_more"));
+  json_object_set_new (root, "additionalProperties", json_false ());
+  return root;
+}
+
 
 json_t *
 schema_notice_ack (void)
@@ -4354,8 +4780,6 @@ schema_insurance_policies_buy (void)
 
 
   json_array_append_new (subject_type_enum, json_string ("ship"));
-  json_array_append_new (subject_type_enum, json_string ("cargo"));
-  json_array_append_new (subject_type_enum, json_string ("planet"));
   json_object_set_new (subject_type_prop, "enum", subject_type_enum);
   json_object_set_new (data_properties, "subject_type", subject_type_prop);
 
@@ -4380,6 +4804,11 @@ schema_insurance_policies_buy (void)
   json_object_set_new (premium_prop, "type", json_string ("integer"));
   json_object_set_new (data_properties, "premium", premium_prop);
 
+  json_t *payout_prop = json_object (); json_object_set_new (payout_prop, "type", json_string ("integer"));
+  json_object_set_new (data_properties, "payout", payout_prop);
+  json_t *fund_prop = json_object (); json_object_set_new (fund_prop, "type", json_string ("integer"));
+  json_object_set_new (data_properties, "fund_id", fund_prop);
+
 
   json_t *data_schema = json_object ();
 
@@ -4401,6 +4830,8 @@ schema_insurance_policies_buy (void)
   json_array_append_new (required, json_string ("subject_id"));
   json_array_append_new (required, json_string ("duration"));
   json_array_append_new (required, json_string ("premium"));
+  json_array_append_new (required, json_string ("payout"));
+  json_array_append_new (required, json_string ("fund_id"));
   json_object_set_new (data_schema, "required", required);
 
 
@@ -4418,6 +4849,13 @@ schema_insurance_claim_file (void)
   json_t *policy_id_prop = json_object ();
   json_object_set_new (policy_id_prop, "type", json_string ("integer"));
   json_object_set_new (data_properties, "policy_id", policy_id_prop);
+
+  json_t *claim_id_prop = json_object (); json_object_set_new (claim_id_prop, "type", json_string ("integer"));
+  json_object_set_new (data_properties, "claim_id", claim_id_prop);
+  json_t *event_id_prop = json_object (); json_object_set_new (event_id_prop, "type", json_string ("string"));
+  json_object_set_new (data_properties, "event_id", event_id_prop);
+  json_t *amount_prop = json_object (); json_object_set_new (amount_prop, "type", json_string ("integer"));
+  json_object_set_new (data_properties, "amount", amount_prop);
 
 
   json_t *incident_desc_prop = json_object ();
@@ -4443,8 +4881,9 @@ schema_insurance_claim_file (void)
   json_t *required = json_array ();
 
 
-  json_array_append_new (required, json_string ("policy_id"));
-  json_array_append_new (required, json_string ("incident_description"));
+  json_array_append_new (required, json_string ("claim_id"));
+  json_array_append_new (required, json_string ("event_id"));
+  json_array_append_new (required, json_string ("amount"));
   json_object_set_new (data_schema, "required", required);
 
 
@@ -4961,48 +5400,18 @@ json_t *
 schema_player_list_online_request (void)
 {
   json_t *properties = json_object ();
-  json_t *required = json_array ();	// No required fields for flexibility
-
-
-  // offset property
-  json_t *offset_prop = json_object ();
-  json_object_set_new (offset_prop, "type", json_string ("integer"));
-  json_object_set_new (offset_prop, "default", json_integer (0));
-  json_object_set_new (properties, "offset", offset_prop);
-
-
-  // limit property
-  json_t *limit_prop = json_object ();
-
-
-  json_object_set_new (limit_prop, "type", json_string ("integer"));
-  json_object_set_new (limit_prop, "minimum", json_integer (1));
-  json_object_set_new (limit_prop, "maximum", json_integer (1000));
-  json_object_set_new (properties, "limit", limit_prop);
-
-
-  // fields property (array of strings)
-  json_t *fields_items_schema = json_object ();
-
-
-  json_object_set_new (fields_items_schema, "type", json_string ("string"));
-
-
-  json_t *fields_schema = json_object ();
-
-
-  json_object_set_new (fields_schema, "type", json_string ("array"));
-  json_object_set (fields_schema, "items", fields_items_schema);
-  json_object_set_new (fields_schema, "uniqueItems", json_true ());
-  // Note: fields_items_schema refcount is 1 (owned by fields_schema items), so we need to decref our local ref if we used json_object_set (incref)
-  // But wait, json_object_set (not _new) increfs.
-  // Above: json_object_set (fields_schema, "items", fields_items_schema); -> increfs fields_items_schema.
-  // So fields_items_schema refcount is 2 (1 local + 1 array).
-  // We should decref local ref.
-  json_decref (fields_items_schema);
-
-
-  json_object_set_new (properties, "fields", fields_schema);
+  json_t *required = json_array ();
+  json_t *page = json_object ();
+  json_object_set_new (page, "type", json_string ("integer"));
+  json_object_set_new (page, "minimum", json_integer (1));
+  json_object_set_new (page, "default", json_integer (1));
+  json_object_set_new (properties, "page", page);
+  json_t *limit = json_object ();
+  json_object_set_new (limit, "type", json_string ("integer"));
+  json_object_set_new (limit, "minimum", json_integer (1));
+  json_object_set_new (limit, "maximum", json_integer (1000));
+  json_object_set_new (limit, "default", json_integer (50));
+  json_object_set_new (properties, "limit", limit);
 
 
   json_t *data_schema = json_object ();
@@ -5047,13 +5456,10 @@ schema_player_list_online_response (void)
   json_array_append_new (required, json_string ("returned_count"));
 
 
-  // offset property
-  json_t *offset_prop = json_object ();
-
-
-  json_object_set_new (offset_prop, "type", json_string ("integer"));
-  json_object_set_new (properties, "offset", offset_prop);
-  json_array_append_new (required, json_string ("offset"));
+  json_t *page_prop = json_object ();
+  json_object_set_new (page_prop, "type", json_string ("integer"));
+  json_object_set_new (properties, "page", page_prop);
+  json_array_append_new (required, json_string ("page"));
 
 
   // limit property
@@ -5065,8 +5471,31 @@ schema_player_list_online_response (void)
   json_array_append_new (required, json_string ("limit"));
 
 
-  // players property (array of player objects)
-  json_t *player_item_schema = schema_player_info ();	// Reuse existing player info schema
+  // Public allowlist only: no session, address, sector or connection data.
+  json_t *player_props = json_object ();
+  json_t *player_required = json_array ();
+  const char *field_names[] = {"player_id", "username", "corporation", "alignment"};
+  const char *field_types[] = {"integer", "string", NULL, "integer"};
+  for (size_t i = 0; i < 4; ++i)
+    {
+      json_t *field = json_object ();
+      if (i == 2)
+        {
+          json_t *types = json_array ();
+          json_array_append_new (types, json_string ("string"));
+          json_array_append_new (types, json_string ("null"));
+          json_object_set_new (field, "type", types);
+        }
+      else
+        json_object_set_new (field, "type", json_string (field_types[i]));
+      json_object_set_new (player_props, field_names[i], field);
+      json_array_append_new (player_required, json_string (field_names[i]));
+    }
+  json_t *player_item_schema = json_object ();
+  json_object_set_new (player_item_schema, "type", json_string ("object"));
+  json_object_set_new (player_item_schema, "properties", player_props);
+  json_object_set_new (player_item_schema, "required", player_required);
+  json_object_set_new (player_item_schema, "additionalProperties", json_false ());
 
 
   json_t *players_prop = json_object ();
@@ -5184,6 +5613,9 @@ schema_combat_attack_planet (void)
   json_object_set_new (planet_id, "minimum", json_integer (1));
   json_t *properties = json_object ();
   json_object_set_new (properties, "planet_id", planet_id);
+  json_t *enslave = json_object ();
+  json_object_set_new (enslave, "type", json_string ("boolean"));
+  json_object_set_new (properties, "enslave_colonists", enslave);
   json_t *required = json_array ();
   json_array_append_new (required, json_string ("planet_id"));
   json_t *root = json_object ();
@@ -5279,6 +5711,43 @@ schema_corp_amount (void)
 {
   return schema_corp_object ("ge://schema/corp.amount.json", "amount",
                              "integer", "amount", 1);
+}
+
+json_t *
+schema_corp_member_transfer (void)
+{
+  json_t *properties = json_object ();
+  json_t *target = json_object ();
+  json_object_set_new (target, "type", json_string ("integer"));
+  json_object_set_new (target, "minimum", json_integer (1));
+  json_object_set_new (properties, "target_player_id", target);
+  json_t *asset = json_object ();
+  json_object_set_new (asset, "type", json_string ("string"));
+  json_t *asset_enum = json_array ();
+  json_array_append_new (asset_enum, json_string ("credits"));
+  json_array_append_new (asset_enum, json_string ("fighters"));
+  json_array_append_new (asset_enum, json_string ("mines"));
+  json_array_append_new (asset_enum, json_string ("shields"));
+  json_object_set_new (asset, "enum", asset_enum);
+  json_object_set_new (properties, "asset", asset);
+  json_t *quantity = json_object ();
+  json_object_set_new (quantity, "type", json_string ("integer"));
+  json_object_set_new (quantity, "minimum", json_integer (1));
+  json_object_set_new (properties, "quantity", quantity);
+  json_t *required = json_array ();
+  json_array_append_new (required, json_string ("target_player_id"));
+  json_array_append_new (required, json_string ("asset"));
+  json_array_append_new (required, json_string ("quantity"));
+  json_t *root = json_object ();
+  json_object_set_new (root, "$id",
+                       json_string ("ge://schema/corp.member.transfer.json"));
+  json_object_set_new (root, "$schema",
+                       json_string ("https://json-schema.org/draft/2020-12/schema"));
+  json_object_set_new (root, "type", json_string ("object"));
+  json_object_set_new (root, "properties", properties);
+  json_object_set_new (root, "required", required);
+  json_object_set_new (root, "additionalProperties", json_false ());
+  return root;
 }
 
 json_t *
@@ -5443,6 +5912,43 @@ schema_player_simple (const char *id, json_t *properties, json_t *required,
   return root;
 }
 
+static json_t *
+schema_ship_sale_request (const char *id)
+{
+  json_t *properties = json_object ();
+  json_t *required = json_array ();
+  schema_nav_add_field (properties, "ship_id", "integer", 1);
+  schema_nav_add_field (properties, "replacement_ship_id", "integer", 1);
+  schema_nav_require (required, "ship_id");
+  schema_nav_require (required, "replacement_ship_id");
+  return schema_nav_request (id, properties, required);
+}
+
+json_t *
+schema_ship_sell (void)
+{
+  return schema_ship_sale_request ("ge://schema/ship.sell.json");
+}
+
+json_t *
+schema_shipyard_sell (void)
+{
+  return schema_ship_sale_request ("ge://schema/shipyard.sell.json");
+}
+
+json_t *
+schema_ship_transfer (void)
+{
+  json_t *properties = json_object ();
+  json_t *required = json_array ();
+  schema_nav_add_field (properties, "ship_id", "integer", 1);
+  schema_nav_add_field (properties, "target_player_id", "integer", 1);
+  schema_nav_require (required, "ship_id");
+  schema_nav_require (required, "target_player_id");
+  return schema_nav_request ("ge://schema/ship.transfer.json", properties,
+                             required);
+}
+
 json_t *
 schema_player_get_prefs (void)
 {
@@ -5547,10 +6053,28 @@ schema_shipyard_upgrade (void)
   json_t *required = json_array ();
   schema_nav_add_field (properties, "new_type_id", "integer", 1);
   schema_nav_add_field (properties, "new_ship_name", "string", 0);
-  schema_nav_require (required, "new_type_id");
-  schema_nav_require (required, "new_ship_name");
-  return schema_player_simple ("ge://schema/shipyard.upgrade.json",
-                               properties, required, 0);
+  schema_nav_add_field (properties, "used_inventory_id", "integer", 1);
+  json_t *root = schema_player_simple ("ge://schema/shipyard.upgrade.json",
+                                       properties, required, 0);
+
+  /* Exactly one acquisition mode is valid: a new hull needs its type/name,
+   * while used inventory is selected by its persistent listing identifier. */
+  json_t *new_hull = json_object ();
+  json_t *new_hull_required = json_array ();
+  json_array_append_new (new_hull_required, json_string ("new_type_id"));
+  json_array_append_new (new_hull_required, json_string ("new_ship_name"));
+  json_object_set_new (new_hull, "required", new_hull_required);
+
+  json_t *used_hull = json_object ();
+  json_t *used_hull_required = json_array ();
+  json_array_append_new (used_hull_required, json_string ("used_inventory_id"));
+  json_object_set_new (used_hull, "required", used_hull_required);
+
+  json_t *one_of = json_array ();
+  json_array_append_new (one_of, new_hull);
+  json_array_append_new (one_of, used_hull);
+  json_object_set_new (root, "oneOf", one_of);
+  return root;
 }
 
 static json_t *
@@ -5572,8 +6096,11 @@ schema_shipyard_list_response (void)
   json_t *available = json_object ();
   json_object_set_new (available, "type", json_string ("array"));
   json_object_set_new (properties, "available", available);
+  json_t *used_available = json_object ();
+  json_object_set_new (used_available, "type", json_string ("array"));
+  json_object_set_new (properties, "used_available", used_available);
   json_t *required = json_array ();
-  const char *fields[] = {"sector_id", "is_shipyard", "current_ship", "available"};
+  const char *fields[] = {"sector_id", "is_shipyard", "current_ship", "available", "used_available"};
   for (size_t i = 0; i < sizeof fields / sizeof fields[0]; ++i)
     schema_nav_require (required, fields[i]);
   return schema_shipyard_response ("ge://schema/shipyard.list_v1.json",
@@ -5588,12 +6115,42 @@ schema_shipyard_upgraded_response (void)
   schema_nav_add_field (properties, "new_type_id", "integer", 1);
   schema_nav_add_field (properties, "new_ship_name", "string", 0);
   schema_nav_add_field (properties, "credits_spent", "integer", 0);
+  schema_nav_add_field (properties, "used_inventory_id", "integer", 1);
   json_t *required = json_array ();
   const char *fields[] = {"ship_id", "new_type_id", "new_ship_name", "credits_spent"};
   for (size_t i = 0; i < sizeof fields / sizeof fields[0]; ++i)
     schema_nav_require (required, fields[i]);
   return schema_shipyard_response ("ge://schema/shipyard.upgraded_v1.json",
                                   properties, required);
+}
+
+json_t *
+schema_ship_sold_response (void)
+{
+  json_t *properties = json_object ();
+  json_t *required = json_array ();
+  schema_nav_add_field (properties, "ship_id", "integer", 1);
+  schema_nav_add_field (properties, "replacement_ship_id", "integer", 1);
+  schema_nav_add_field (properties, "shipyard_port_id", "integer", 1);
+  schema_nav_add_field (properties, "hull_valuation", "integer", 1);
+  schema_nav_add_field (properties, "installed_equipment_valuation", "integer", 1);
+  schema_nav_add_field (properties, "sale_factor_bp", "integer", 1);
+  schema_nav_add_field (properties, "sale_proceeds", "integer", 1);
+  schema_nav_add_field (properties, "updated_credits", "integer", 1);
+  schema_nav_add_field (properties, "cargo_forfeited", "boolean", 0);
+  schema_nav_add_field (properties, "insurance_terminated", "boolean", 0);
+  schema_nav_add_field (properties, "sale_id", "integer", 1);
+  schema_nav_add_field (properties, "used_inventory_id", "integer", 1);
+  const char *fields[] = {
+    "ship_id", "replacement_ship_id", "shipyard_port_id",
+    "hull_valuation", "installed_equipment_valuation", "sale_factor_bp",
+    "sale_proceeds", "updated_credits", "cargo_forfeited",
+    "insurance_terminated", "sale_id", "used_inventory_id"
+  };
+  for (size_t i = 0; i < sizeof fields / sizeof fields[0]; ++i)
+    schema_nav_require (required, fields[i]);
+  return schema_shipyard_response ("ge://schema/ship.sold_v1.json",
+                                   properties, required);
 }
 
 
@@ -5717,6 +6274,92 @@ schema_bank_leaderboard (void)
   json_object_set_new (data_schema, "required", json_array ());
   json_object_set_new (data_schema, "additionalProperties", json_boolean (0));
   return data_schema;
+}
+
+json_t *
+schema_bank_orders_create (void)
+{
+  return json_loads (
+    "{\"$id\":\"ge://schema/bank.orders.create.json\","
+    "\"$schema\":\"https://json-schema.org/draft/2020-12/schema\","
+    "\"type\":\"object\",\"properties\":{"
+    "\"recipient_player_id\":{\"type\":\"integer\",\"minimum\":1},"
+    "\"amount\":{\"type\":\"integer\",\"minimum\":1},"
+    "\"frequency\":{\"enum\":[\"daily\",\"weekly\",\"monthly\"]},"
+    "\"time_utc\":{\"type\":\"string\",\"pattern\":\"^(?:[01][0-9]|2[0-3]):[0-5][0-9]$\"},"
+    "\"weekday\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":7},"
+    "\"day_of_month\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":31}},"
+    "\"required\":[\"recipient_player_id\",\"amount\",\"frequency\",\"time_utc\"],"
+    "\"additionalProperties\":false}", 0, NULL);
+}
+
+json_t *
+schema_bank_orders_list (void)
+{
+  return json_loads (
+    "{\"$id\":\"ge://schema/bank.orders.list.json\","
+    "\"$schema\":\"https://json-schema.org/draft/2020-12/schema\","
+    "\"type\":\"object\",\"properties\":{"
+    "\"page\":{\"type\":\"integer\",\"minimum\":1},"
+    "\"limit\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":100}},"
+    "\"additionalProperties\":false}", 0, NULL);
+}
+
+json_t *
+schema_bank_orders_cancel (void)
+{
+  return json_loads (
+    "{\"$id\":\"ge://schema/bank.orders.cancel.json\","
+    "\"$schema\":\"https://json-schema.org/draft/2020-12/schema\","
+    "\"type\":\"object\",\"properties\":{"
+    "\"order_id\":{\"type\":\"integer\",\"minimum\":1}},"
+    "\"required\":[\"order_id\"],\"additionalProperties\":false}",
+    0, NULL);
+}
+
+json_t *
+schema_bank_orders_created_response (void)
+{
+  return json_loads (
+    "{\"$id\":\"ge://schema/bank.orders.created.json\","
+    "\"$schema\":\"https://json-schema.org/draft/2020-12/schema\","
+    "\"type\":\"object\",\"properties\":{"
+    "\"order_id\":{\"type\":\"integer\",\"minimum\":1},"
+    "\"recipient_player_id\":{\"type\":\"integer\",\"minimum\":1},"
+    "\"amount\":{\"type\":\"integer\",\"minimum\":1},"
+    "\"frequency\":{\"enum\":[\"daily\",\"weekly\",\"monthly\"]},"
+    "\"time_utc\":{\"type\":\"string\"},"
+    "\"next_run_at\":{\"type\":\"integer\"}},"
+    "\"required\":[\"order_id\",\"recipient_player_id\",\"amount\","
+    "\"frequency\",\"time_utc\",\"next_run_at\"],"
+    "\"additionalProperties\":false}", 0, NULL);
+}
+
+json_t *
+schema_bank_orders_list_response (void)
+{
+  return json_loads (
+    "{\"$id\":\"ge://schema/bank.orders.list_v1.json\","
+    "\"$schema\":\"https://json-schema.org/draft/2020-12/schema\","
+    "\"type\":\"object\",\"properties\":{"
+    "\"orders\":{\"type\":\"array\",\"items\":{\"type\":\"object\"}},"
+    "\"page\":{\"type\":\"integer\",\"minimum\":1},"
+    "\"limit\":{\"type\":\"integer\",\"minimum\":1}},"
+    "\"required\":[\"orders\",\"page\",\"limit\"],"
+    "\"additionalProperties\":false}", 0, NULL);
+}
+
+json_t *
+schema_bank_orders_cancelled_response (void)
+{
+  return json_loads (
+    "{\"$id\":\"ge://schema/bank.orders.cancelled.json\","
+    "\"$schema\":\"https://json-schema.org/draft/2020-12/schema\","
+    "\"type\":\"object\",\"properties\":{"
+    "\"order_id\":{\"type\":\"integer\",\"minimum\":1},"
+    "\"cancelled\":{\"type\":\"boolean\"}},"
+    "\"required\":[\"order_id\",\"cancelled\"],"
+    "\"additionalProperties\":false}", 0, NULL);
 }
 
 

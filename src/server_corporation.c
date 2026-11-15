@@ -5,11 +5,13 @@
 #include <stdbool.h>
 #include <time.h>
 #include <strings.h>
+#include <limits.h>
 #include <pthread.h>
 #include <ctype.h>		// Required for isalnum and isupper
 #include "server_corporation.h"
 #include "server_config.h"
 #include "db/repo/repo_database.h"
+#include "db/repo/repo_cmds.h"
 #include "game_db.h"
 #include "server_log.h"
 #include "server_envelope.h"
@@ -1335,6 +1337,69 @@ cmd_corp_withdraw (client_ctx_t *ctx, json_t *root)
   return 0;
 }
 
+int
+cmd_corp_member_transfer (client_ctx_t *ctx, json_t *root)
+{
+  if (!ctx || ctx->player_id <= 0)
+    {
+      send_response_refused_steal (ctx, root, ERR_NOT_AUTHENTICATED,
+                                   "Not authenticated", NULL);
+      return 0;
+    }
+  json_t *data = json_object_get (root, "data");
+  json_t *jtarget = json_is_object (data)
+    ? json_object_get (data, "target_player_id") : NULL;
+  json_t *jquantity = json_is_object (data)
+    ? json_object_get (data, "quantity") : NULL;
+  const char *asset = json_is_object (data)
+    ? json_string_value (json_object_get (data, "asset")) : NULL;
+  if (!json_is_integer (jtarget) || !json_is_integer (jquantity)
+      || !asset || json_integer_value (jtarget) <= 0
+      || json_integer_value (jtarget) > INT_MAX
+      || json_integer_value (jquantity) <= 0)
+    {
+      send_response_error (ctx, root, ERR_INVALID_ARG,
+                           "target_player_id, asset, and positive quantity are required.");
+      return 0;
+    }
+  int target_id = (int) json_integer_value (jtarget);
+  int64_t quantity = (int64_t) json_integer_value (jquantity);
+  int64_t sender_remaining = 0, recipient_total = 0;
+  repo_corp_transfer_result_t rc = repo_corp_transfer_member_asset
+    (game_db_get_handle (), ctx->player_id, target_id, asset, quantity,
+     &sender_remaining, &recipient_total);
+  if (rc != REPO_CORP_TRANSFER_OK)
+    {
+      int error_code = rc == REPO_CORP_TRANSFER_INSUFFICIENT
+        ? ERR_INSUFFICIENT_FUNDS
+        : rc == REPO_CORP_TRANSFER_CAPACITY ? ERR_INVALID_ARG
+        : rc == REPO_CORP_TRANSFER_INVALID ? ERR_PERMISSION_DENIED : ERR_DB;
+      const char *message = rc == REPO_CORP_TRANSFER_INSUFFICIENT
+        ? "Insufficient transferable assets."
+        : rc == REPO_CORP_TRANSFER_CAPACITY
+          ? "Recipient ship lacks capacity for this transfer."
+        : rc == REPO_CORP_TRANSFER_INVALID
+          ? "Both players must be active members of the same corporation and sector."
+          : "Asset transfer failed; no state was changed.";
+      send_response_error (ctx, root, error_code, message);
+      return 0;
+    }
+  json_t *response = json_object ();
+  json_object_set_new (response, "sender_player_id",
+                       json_integer (ctx->player_id));
+  json_object_set_new (response, "recipient_player_id",
+                       json_integer (target_id));
+  json_object_set_new (response, "asset", json_string (asset));
+  json_object_set_new (response, "quantity", json_integer (quantity));
+  json_object_set_new (response, "sender_remaining",
+                       json_integer (sender_remaining));
+  json_object_set_new (response, "recipient_total",
+                       json_integer (recipient_total));
+  send_response_ok_take (ctx, root, "corp.member.asset_transferred_v1",
+                         &response);
+  return 0;
+}
+
 
 int
 cmd_corp_statement (client_ctx_t *ctx, json_t *root)
@@ -1623,6 +1688,30 @@ cmd_equity_ipo_register (client_ctx_t *ctx, json_t *root)
       return 0;
     }
   int64_t new_equity_id_64 = 0;
+  int system_player_id = 0;
+  char unused_password[1] = { 0 };
+
+  /* Player IDs are sequence-backed and are not stable across database
+   * creation. Resolve the seeded treasury account by its canonical name. */
+  if (repo_cmds_get_login_info (db, "System", &system_player_id,
+                                unused_password, sizeof (unused_password),
+                                NULL) != 0
+      || system_player_id <= 0)
+    {
+      send_response_error (ctx, root, ERR_DB_NOT_FOUND,
+                           "System treasury account is unavailable.");
+      return 0;
+    }
+
+  db_error_t tx_err;
+  db_error_clear (&tx_err);
+  if (!db_tx_begin (db, DB_TX_DEFAULT, &tx_err))
+    {
+      send_response_error (ctx, root, ERR_DB,
+                           "Unable to begin IPO transaction.");
+      return 0;
+    }
+
   int rc =
     repo_corp_register_equity (db, corp_id, ticker, total_shares, par_value,
 			      &new_equity_id_64);
@@ -1645,12 +1734,14 @@ cmd_equity_ipo_register (client_ctx_t *ctx, json_t *root)
 			       ERR_DB,
 			       "Database error during IPO registration.");
 	}
+      db_tx_rollback (db, &tx_err);
       return 0;
     }
   int new_equity_id = (int) new_equity_id_64;
 
-  // Distribute initial shares to the corporation itself (using System player ID 1)
-  rc = h_update_player_shares (db, 1, new_equity_id, total_shares);	// player_id 1 for System/Treasury
+  /* Distribute initial shares to the System treasury account. */
+  rc = h_update_player_shares (db, system_player_id, new_equity_id,
+                               total_shares);
 
 
   if (rc != 0)
@@ -1658,7 +1749,17 @@ cmd_equity_ipo_register (client_ctx_t *ctx, json_t *root)
       LOGE
 	("cmd_equity_ipo_register: Failed to distribute initial shares to corp %d for stock %d: %d",
 	 corp_id, new_equity_id, rc);
-      // This is a critical error, consider rolling back or marking stock invalid
+	  db_tx_rollback (db, &tx_err);
+	  send_response_error (ctx, root, ERR_DB,
+	                       "Database error during initial share allocation.");
+	  return 0;
+    }
+  if (!db_tx_commit (db, &tx_err))
+    {
+      db_tx_rollback (db, &tx_err);
+      send_response_error (ctx, root, ERR_DB,
+                           "Database error committing IPO registration.");
+      return 0;
     }
   json_t *response_data = json_object ();
 

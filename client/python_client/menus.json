@@ -195,10 +195,25 @@
           }
         },
         {
+          "key": "t",
+          "label": "(T) Transwarp to Sector",
+          "show_if": ["has_authoritative_sector"],
+          "action": {
+            "pycall": "transwarp_flow"
+          }
+        },
+        {
           "key": "p",
           "label": "(P) Pathfind to Sector",
           "action": {
             "pycall": "pathfind_flow"
+          }
+        },
+        {
+          "key": "r",
+          "label": "(R) Server-saved autopilot route",
+          "action": {
+            "pycall": "saved_autopilot_route_flow"
           }
         },
         
@@ -225,7 +240,7 @@
         },
         {
           "key": "k",
-          "label": "(K) Autopilot Controls (Y/N/E)",
+          "label": "(K) Autopilot Controls (Y/N/E/S)",
           "action": {
             "pycall": "cli_autopilot_control"
           }
@@ -255,6 +270,13 @@
       "title": "--- Planet Surface ---",
       "options": [
         {
+          "key": "i",
+          "label": "(I) Planet Overview",
+          "action": {
+            "pycall": "planet_overview_flow"
+          }
+        },
+        {
           "key": "l",
           "label": "(L) Launch from Planet",
           "action": {
@@ -276,6 +298,41 @@
           }
         },
         {
+          "key": "w",
+          "label": "(W) Allocate Workforce",
+          "action": {
+            "pycall": "planet_workforce_flow"
+          }
+        },
+        {
+          "key": "h",
+          "label": "(H) Harvest Production · unavailable",
+          "action": {
+            "pycall": "planet_harvest_unavailable_flow"
+          }
+        },
+        {
+          "key": "s",
+          "label": "(S) Planet Stock Transfer",
+          "action": {
+            "pycall": "planet_stock_transfer_flow"
+          }
+        },
+        {
+          "key": "f",
+          "label": "(F) Transfer Fighters",
+          "action": {
+            "pycall": "planet_fighter_transfer_flow"
+          }
+        },
+        {
+          "key": "r",
+          "label": "(R) Rename Planet",
+          "action": {
+            "pycall": "planet_rename_flow"
+          }
+        },
+        {
           "key": "q",
           "label": "(Q) Back to Main Menu",
           "action": {
@@ -287,6 +344,27 @@
     "CITADEL": {
       "title": "--- Citadel Menu ---",
       "options": [
+        {
+          "key": "b",
+          "label": "(B) Build / Upgrade Citadel",
+          "action": {
+            "pycall": "citadel_build_flow"
+          }
+        },
+        {
+          "key": "d",
+          "label": "(D) Deposit Credits to Treasury",
+          "action": {
+            "pycall": "planet_treasury_deposit_flow"
+          }
+        },
+        {
+          "key": "w",
+          "label": "(W) Withdraw Credits from Treasury",
+          "action": {
+            "pycall": "planet_treasury_withdraw_flow"
+          }
+        },
         {
           "key": "q",
           "label": "(Q) Back to Surface",
@@ -304,10 +382,24 @@
           "label": "(S) Ship Info",
           "action": {
             "rpc": {
-              "command": "ship.info",
+              "command": "ship.status",
               "data": {}
             },
-            "post": "print_inspect_response_pretty"
+            "post": "print_active_ship_info"
+          }
+        },
+        {
+          "key": "o",
+          "label": "(O) Owned Ship Roster",
+          "action": {
+            "pycall": "ship_list_flow"
+          }
+        },
+        {
+          "key": "n",
+          "label": "(N) Inspect Owned Ship",
+          "action": {
+            "pycall": "ship_roster_inspect_flow"
           }
         },
         {
@@ -331,12 +423,27 @@
             "pycall": "scan_sector"
           }
 	    },
-	  {
+        {
           "key": "r",
           "label": "(R) Rename Ship",
           "action": {
             "pycall": "rename_ship_flow"
           }
+        },
+	    {
+          "key": "i",
+          "label": "(I) Current Sector Information",
+          "action": { "pycall": "sector_info_flow" }
+        },
+	    {
+          "key": "v",
+          "label": "(V) Detailed Sector Scan",
+          "action": { "pycall": "detailed_sector_scan_flow" }
+        },
+	    {
+          "key": "m",
+          "label": "(M) Combat Status",
+          "action": { "rpc": { "command": "combat.status", "data": {} }, "post": "print_last_rpc" }
         },
 	  {
 	      "key": "d",
@@ -358,6 +465,20 @@
           }
         },
         {
+          "key": "g",
+          "label": "(G) Transfer Cargo",
+          "action": {
+            "pycall": "transfer_cargo_flow"
+          }
+        },
+        {
+          "key": "b",
+          "label": "(B) Transfer Owned Ship",
+          "action": {
+            "pycall": "ship_transfer_flow"
+          }
+        },
+        {
           "key": "t",
           "label": "(T) Genesis Torpedo",
           "action": {
@@ -365,25 +486,17 @@
           }
         },
         {
-          "key": "k",
-          "label": "(K) Ranks",
+          "key": "e",
+          "label": "(E) Ferengi Traders and Offers",
           "action": {
-            "rpc": {
-              "command": "player.rankings",
-              "data": {}
-            },
-            "post": "print_last_rpc"
+            "pycall": "ferengi_traders_flow"
           }
         },
         {
-          "key": "c",
-          "label": "(C) Ship Catalogue",
+          "key": "k",
+          "label": "(K) Player Rankings",
           "action": {
-            "rpc": {
-              "command": "shipyard.list",
-              "data": {}
-            },
-            "post": "pretty_print_shipyard_list"
+            "pycall": "rankings_flow"
           }
         },
         {
@@ -401,6 +514,42 @@
             },
             "post": "pretty_print_trade_routes"
           }
+        },
+        {
+          "key": "a",
+          "label": "(A) Outstanding fines",
+          "action": {
+            "pycall": "fine_list_flow"
+          }
+        },
+        {
+          "key": "y",
+          "label": "(Y) Pay a fine",
+          "action": {
+            "pycall": "fine_pay_flow"
+          }
+        },
+        {
+          "key": "z",
+          "label": "(Z) Trade history",
+          "action": {
+            "pycall": "trade_history_flow"
+          }
+        },
+        {
+          "key": "x",
+          "label": "(X) Police status",
+          "action": { "pycall": "police_status_flow" }
+        },
+        {
+          "key": "w",
+          "label": "(W) Offer a bribe",
+          "action": { "pycall": "police_bribe_flow" }
+        },
+        {
+          "key": "u",
+          "label": "(U) Surrender to authorities",
+          "action": { "pycall": "police_surrender_flow" }
         },
         {
           "key": "q",
@@ -507,11 +656,14 @@
           "key": "r",
           "label": "(R) Repair Ship",
           "action": {
-            "rpc": {
-              "command": "ship.repair",
-              "data": {}
-            },
-            "post": "print_last_rpc"
+            "pycall": "ship_repair_flow"
+          }
+        },
+        {
+          "key": "s",
+          "label": "(S) Sell Current Ship",
+          "action": {
+            "pycall": "shipyard_sell_flow"
           }
         },
         {
@@ -545,6 +697,13 @@
           }
         },
         {
+          "key": "u",
+          "label": "(U) Upgrade Ship Equipment",
+          "action": {
+            "pycall": "ship_upgrade_flow"
+          }
+        },
+        {
           "key": "q",
           "label": "(Q) Back to Ship's Computer",
           "action": {
@@ -556,6 +715,41 @@
     "BANK": {
       "title": "--- Bank Menu ---",
       "options": [
+        {
+          "key": "b",
+          "label": "(B) Balance",
+          "action": {
+            "rpc": {
+              "command": "bank.balance",
+              "data": {}
+            },
+            "post": "print_last_rpc"
+          }
+        },
+        {
+          "key": "s",
+          "label": "(S) Statement",
+          "action": {
+            "rpc": {
+              "command": "bank.statement",
+              "data": {
+                "limit": "<prompt:int:Number of entries: [20]>"
+              }
+            },
+            "post": "print_last_rpc"
+          }
+        },
+        {
+          "key": "o",
+          "label": "(O) Standing orders",
+          "action": {
+            "rpc": {
+              "command": "bank.orders.list",
+              "data": {}
+            },
+            "post": "print_last_rpc"
+          }
+        },
         {
           "key": "d",
           "label": "(D) Deposit",
@@ -589,9 +783,8 @@
             "rpc": {
               "command": "bank.transfer",
               "data": {
-                "to_player_name": "<prompt:str:To whom (player name)>",
-                "amount": "<prompt:int:Amount>",
-                "memo": "<prompt:str:Memo (optional)>"
+                "to_player_id": "<prompt:int:Recipient player ID>",
+                "amount": "<prompt:int:Amount>"
               }
             },
             "post": "print_last_rpc"
@@ -663,11 +856,7 @@
           "key": "r",
           "label": "(R) Roster",
           "action": {
-            "rpc": {
-              "command": "corp.roster",
-              "data": {}
-            },
-            "post": "pretty_print_corp_roster"
+            "pycall": "corp_roster_flow"
             },
             "show_if_ctx": ["in_corporation"]
         },
@@ -835,27 +1024,23 @@
       "options": [
         {
           "key": "l",
-          "label": "(L) List Policies",
+          "label": "(L) List Policies · unavailable",
           "action": {
-            "rpc": {
-              "command": "insurance.policies.list",
-              "data": {}
-            },
-            "post": "print_last_rpc"
+            "pycall": "insurance_unavailable_flow"
           }
         },
         {
           "key": "b",
-          "label": "(B) Buy Policy",
+          "label": "(B) Buy Policy · unavailable",
           "action": {
-            "pycall": "insurance_buy_flow"
+            "pycall": "insurance_unavailable_flow"
           }
         },
         {
           "key": "c",
-          "label": "(C) File Claim",
+          "label": "(C) File Claim · unavailable",
           "action": {
-            "pycall": "insurance_claim_flow"
+            "pycall": "insurance_unavailable_flow"
           }
         },
         {
@@ -1268,7 +1453,7 @@
         },
         {
           "key": "i",
-          "label": "(I) Interactive Buy (ibuy)",
+          "label": "(I) Buy via quoted port flow (ibuy)",
           "action": {
             "pycall": "interactive_buy_handler"
           }
@@ -1296,8 +1481,8 @@
           }
         },
         {
-          "key": "l",
-          "label": "(L) Logout",
+          "key": "x",
+          "label": "(X) Logout",
           "action": {
             "rpc": {
               "command": "auth.logout",
@@ -1356,6 +1541,13 @@
           }
         },
         {
+          "key": "t",
+          "label": "(T) Default trade account",
+          "action": {
+            "pycall": "trade_account_preference_flow"
+          }
+        },
+        {
           "key": "b",
           "label": "(B) Bookmarks",
           "action": {
@@ -1374,6 +1566,46 @@
           "label": "(S) Subscriptions",
           "action": {
             "submenu": "SUBSCRIPTIONS"
+          }
+        },
+        {
+          "key": "n",
+          "label": "(N) List notes",
+          "action": {
+            "rpc": {
+              "command": "notes.list",
+              "data": {}
+            },
+            "post": "print_last_rpc"
+          }
+        },
+        {
+          "key": "w",
+          "label": "(W) Save note",
+          "action": {
+            "rpc": {
+              "command": "notes.set",
+              "data": {
+                "scope": "<prompt:str:Scope: [player]>",
+                "key": "<prompt:str:Note key>",
+                "note": "<prompt:str:Note text>"
+              }
+            },
+            "post": "print_last_rpc"
+          }
+        },
+        {
+          "key": "x",
+          "label": "(X) Delete note",
+          "action": {
+            "rpc": {
+              "command": "notes.delete",
+              "data": {
+                "scope": "<prompt:str:Scope: [player]>",
+                "key": "<prompt:str:Note key>"
+              }
+            },
+            "post": "print_last_rpc"
           }
         },
         {
@@ -1542,12 +1774,40 @@
           }
         },
         {
+          "key": "a",
+          "label": "(A) Acknowledge notice",
+          "action": {
+            "pycall": "comms_notice_ack_flow"
+          }
+        },
+        {
+          "key": "b",
+          "label": "(B) Active bounties",
+          "action": {
+            "pycall": "comms_bounty_board"
+          }
+        },
+        {
+          "key": "t",
+          "label": "(T) Player trade offers",
+          "action": { "submenu": "PLAYER_TRADES" }
+        },
+        {
           "key": "q",
           "label": "(Q) Back to Main Menu",
           "action": {
             "back": true
           }
         }
+      ]
+    },
+    "PLAYER_TRADES": {
+      "title": "--- Player Trade Offers ---",
+      "options": [
+        {"key": "c", "label": "(C) Create offer", "action": {"pycall": "trade_offer_create_flow"}},
+        {"key": "a", "label": "(A) Accept offer by ID", "action": {"pycall": "trade_offer_accept_flow"}},
+        {"key": "x", "label": "(X) Cancel offer by ID", "action": {"pycall": "trade_offer_cancel_flow"}},
+        {"key": "q", "label": "(Q) Back", "action": {"back": true}}
       ]
     },
     "CHAT": {
@@ -1673,6 +1933,16 @@
       "title": "--- Operations & Deployment Menu ---",
       "options": [
         {
+          "key": "a",
+          "label": "(A) Attack Listed Ship",
+          "action": { "pycall": "combat_attack_flow" }
+        },
+        {
+          "key": "p",
+          "label": "(P) Attack Listed Planet",
+          "action": { "pycall": "combat_attack_planet_flow" }
+        },
+        {
           "key": "f",
           "label": "(F) Deploy Fighters",
           "action": {
@@ -1701,10 +1971,7 @@
           "label": "(W) Tow SpaceCraft",
           "action": {
             "pycall": "tow_flow"
-          },
-          "show_if": [
-            "has_tow_target"
-          ]
+          }
         },
         {
           "key": "e",
@@ -1800,6 +2067,13 @@
           "label": "(L) List Deployed Mines",
           "action": {
             "pycall": "list_deployed_mines_flow"
+          }
+        },
+        {
+          "key": "s",
+          "label": "(S) Sweep Mines in Current Sector",
+          "action": {
+            "pycall": "sweep_mines_flow"
           }
         },
         {

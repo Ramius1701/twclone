@@ -130,7 +130,7 @@ CREATE TABLE players (
     `type` BIGINT DEFAULT 2,
     `number` bigint,
     `name` VARCHAR(191) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
-    passwd TEXT NOT NULL,
+    passwd VARCHAR(255) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
     sector_id bigint DEFAULT 1,
     ship_id bigint,
     experience bigint DEFAULT 0,
@@ -407,6 +407,9 @@ CREATE TABLE ports (
     `number` bigint,
     `name` TEXT NOT NULL,
     sector_id bigint NOT NULL,
+    is_active boolean NOT NULL DEFAULT TRUE,
+    active_sector_id BIGINT GENERATED ALWAYS AS
+        (CASE WHEN is_active THEN sector_id ELSE NULL END) STORED,
     size bigint,
     techlevel bigint,
     petty_cash bigint NOT NULL DEFAULT 0,
@@ -840,9 +843,9 @@ CREATE TABLE currencies (
 
 CREATE TABLE commodity_orders (
     commodity_orders_id BIGINT AUTO_INCREMENT PRIMARY KEY,
-    actor_type TEXT NOT NULL CHECK (actor_type IN ('player', 'corp', 'npc_planet', 'port')),
+    actor_type TEXT NOT NULL CHECK (actor_type IN ('player', 'corp', 'npc_planet', 'port', 'exchange')),
     actor_id bigint NOT NULL,
-    location_type TEXT NOT NULL CHECK (location_type IN ('planet', 'port')),
+    location_type TEXT NOT NULL CHECK (location_type IN ('planet', 'port', 'exchange')),
     location_id bigint NOT NULL,
     commodity_id bigint NOT NULL,
     side TEXT NOT NULL CHECK (side IN ('buy', 'sell')),
@@ -851,19 +854,21 @@ CREATE TABLE commodity_orders (
     price bigint NOT NULL CHECK (price >= 0),
     status VARCHAR(16) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'filled', 'cancelled', 'expired')),
     ts TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    expires_at TIMESTAMP NULL,
+    cancellation_reason VARCHAR(64) NULL,
     FOREIGN KEY (commodity_id) REFERENCES commodities (commodities_id) ON DELETE CASCADE
 );
 
 CREATE TABLE commodity_trades (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     commodity_id bigint NOT NULL,
-    buyer_actor_type TEXT NOT NULL CHECK (buyer_actor_type IN ('player', 'corp', 'npc_planet', 'port')),
+    buyer_actor_type TEXT NOT NULL CHECK (buyer_actor_type IN ('player', 'corp', 'npc_planet', 'port', 'exchange')),
     buyer_actor_id bigint NOT NULL,
-    buyer_location_type TEXT NOT NULL CHECK (buyer_location_type IN ('planet', 'port')),
+    buyer_location_type TEXT NOT NULL CHECK (buyer_location_type IN ('planet', 'port', 'exchange')),
     buyer_location_id bigint NOT NULL,
-    seller_actor_type TEXT NOT NULL CHECK (seller_actor_type IN ('player', 'corp', 'npc_planet', 'port')),
+    seller_actor_type TEXT NOT NULL CHECK (seller_actor_type IN ('player', 'corp', 'npc_planet', 'port', 'exchange')),
     seller_actor_id bigint NOT NULL,
-    seller_location_type TEXT NOT NULL CHECK (seller_location_type IN ('planet', 'port')),
+    seller_location_type TEXT NOT NULL CHECK (seller_location_type IN ('planet', 'port', 'exchange')),
     seller_location_id bigint NOT NULL,
     quantity bigint NOT NULL CHECK (quantity > 0),
     price bigint NOT NULL CHECK (price >= 0),
@@ -874,7 +879,7 @@ CREATE TABLE commodity_trades (
 );
 
 CREATE TABLE entity_stock (
-    entity_type VARCHAR(16) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL CHECK (entity_type IN ('port', 'planet')),
+    entity_type VARCHAR(16) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL CHECK (entity_type IN ('port', 'planet', 'exchange')),
     entity_id bigint NOT NULL,
     commodity_code VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
     quantity bigint NOT NULL,
@@ -919,11 +924,11 @@ CREATE TABLE bank_accounts (
 CREATE TABLE bank_transactions (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     account_id bigint NOT NULL,
-    tx_type TEXT NOT NULL CHECK (tx_type IN ('DEPOSIT', 'WITHDRAWAL', 'TRANSFER', 'INTEREST', 'FEE', 'WIRE', 'TAX', 'TRADE_BUY', 'TRADE_SELL', 'TRADE_BUY_FEE', 'TRADE_SELL_FEE', 'WITHDRAWAL_FEE', 'ADJUSTMENT')),
+    tx_type TEXT NOT NULL CHECK (tx_type IN ('DEPOSIT', 'WITHDRAWAL', 'TRANSFER', 'INTEREST', 'FEE', 'WIRE', 'TAX', 'TRADE_BUY', 'TRADE_SELL', 'TRADE_BUY_FEE', 'TRADE_SELL_FEE', 'WITHDRAWAL_FEE', 'ADJUSTMENT', 'SYSTEM_LIQUIDITY', 'INSURANCE_GUARANTEE')),
     direction TEXT NOT NULL CHECK (direction IN ('CREDIT', 'DEBIT')),
     amount bigint NOT NULL CHECK (amount > 0),
     currency TEXT NOT NULL,
-    tx_group_id TEXT,
+    tx_group_id VARCHAR(191) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin,
     related_account_id bigint,
     description TEXT,
     ts bigint NOT NULL,
@@ -1554,3 +1559,16 @@ CREATE TABLE player_visited_sectors (
     PRIMARY KEY (player_id, sector_id),
     FOREIGN KEY (player_id) REFERENCES players(player_id) ON DELETE CASCADE,
     FOREIGN KEY (sector_id) REFERENCES sectors(sector_id) ON DELETE CASCADE);
+
+-- Typed environmental hazards used by the sector-entry combat resolver.
+CREATE TABLE sector_hazards (
+    sector_id BIGINT NOT NULL,
+    hazard_type VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    severity INT NOT NULL,
+    PRIMARY KEY (sector_id, hazard_type),
+    KEY idx_sector_hazards_type (hazard_type, sector_id),
+    CONSTRAINT sector_hazards_sector_fk FOREIGN KEY (sector_id) REFERENCES sectors (sector_id) ON DELETE CASCADE,
+    CONSTRAINT sector_hazards_type_check CHECK
+        (hazard_type IN ('volcanic', 'nebula', 'radiation')),
+    CONSTRAINT sector_hazards_severity_check CHECK
+        (severity BETWEEN 1 AND 1000));

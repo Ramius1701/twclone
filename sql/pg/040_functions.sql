@@ -175,7 +175,7 @@ BEGIN
           AND NOT EXISTS (
                 SELECT 1
                   FROM ports p
-                 WHERE p.sector_id = s.sector_id
+                 WHERE p.sector_id = s.sector_id AND p.is_active = TRUE
           )
           AND random() <= (v_port_ratio / 100.0)
     ),
@@ -467,7 +467,6 @@ CREATE OR REPLACE FUNCTION generate_stardock ()
     AS $$
 DECLARE
     v_sector int;
-    v_max_sector int;
     v_lock_key bigint := 72002006;
     v_exists boolean;
     v_port_id int;
@@ -482,30 +481,30 @@ BEGIN
             FROM
                 ports
             WHERE
-                type = 9) INTO v_exists;
+                type = 9 AND is_active = TRUE) INTO v_exists;
     IF v_exists THEN
         PERFORM
             bigbang_unlock (v_lock_key);
         RETURN 0;
     END IF;
-    SELECT
-        MAX(sector_id) INTO v_max_sector
-    FROM
-        sectors;
-    -- Pick random sector_id > 10
-    v_sector := 11 + floor(random() * (v_max_sector - 10));
+    -- A StarPort may be the only port in its sector. Do not replace an
+    -- ordinary port merely to make room for Stardock.
+    SELECT s.sector_id INTO v_sector
+      FROM sectors s
+     WHERE s.sector_id > 10
+       AND NOT EXISTS (SELECT 1 FROM ports p WHERE p.sector_id = s.sector_id AND p.is_active = TRUE)
+     ORDER BY random()
+     LIMIT 1;
+    IF v_sector IS NULL THEN
+        PERFORM bigbang_unlock(v_lock_key);
+        RAISE EXCEPTION 'No eligible empty sector available for Stardock';
+    END IF;
     -- Insert Stardock (Type 9, Size 10, Tech 10)
     INSERT INTO ports (number, name, sector_id, type, size, techlevel, petty_cash,
                        porttype_id)
         VALUES (v_sector, 'Stardock', v_sector, 9, 10, 10, 1000000,
                 (SELECT porttype_id FROM porttypes WHERE code = 'STARDOCK'))
-    ON CONFLICT (sector_id, number)
-        DO UPDATE SET
-            name = EXCLUDED.name, type = EXCLUDED.type, size = EXCLUDED.size,
-            techlevel = EXCLUDED.techlevel, petty_cash = EXCLUDED.petty_cash,
-            porttype_id = EXCLUDED.porttype_id
-        RETURNING
-            port_id INTO v_port_id;
+    RETURNING port_id INTO v_port_id;
     -- Create bank account for Stardock
     IF v_port_id IS NOT NULL THEN
         INSERT INTO bank_accounts (owner_type, owner_id, currency, balance, interest_rate_bp, is_active)
@@ -1046,15 +1045,28 @@ BEGIN
     -- Get current Ferengi sector to avoid it
     SELECT sector_id INTO v_ferengi_sector FROM planets WHERE planet_id = 2;
     
-    -- Pick a random exit sector from longest_tunnels that isn't Ferenginar
-    SELECT exit_sector INTO v_orion_sector
-    FROM longest_tunnels 
-    WHERE exit_sector > 10 AND exit_sector != COALESCE(v_ferengi_sector, 0)
-    ORDER BY random() LIMIT 1;
-    
-    -- If no second tunnel or default conflict, use random sector
-    IF v_orion_sector IS NULL OR v_orion_sector = 0 THEN
-        v_orion_sector := (random() * 989)::int + 11;
+    -- Keep Orion provisioning idempotent and obey one-port-per-sector.
+    SELECT sector_id INTO v_orion_sector
+      FROM ports
+     WHERE type = 10 AND name = 'Orion Black Market Dock' AND is_active = TRUE
+     ORDER BY port_id LIMIT 1;
+    IF v_orion_sector IS NULL THEN
+        SELECT lt.exit_sector INTO v_orion_sector
+          FROM longest_tunnels lt
+         WHERE lt.exit_sector > 10
+           AND lt.exit_sector != COALESCE(v_ferengi_sector, 0)
+           AND NOT EXISTS (SELECT 1 FROM ports p WHERE p.sector_id = lt.exit_sector AND p.is_active = TRUE)
+         ORDER BY random() LIMIT 1;
+    END IF;
+    IF v_orion_sector IS NULL THEN
+        SELECT s.sector_id INTO v_orion_sector
+          FROM sectors s
+         WHERE s.sector_id > 10
+           AND NOT EXISTS (SELECT 1 FROM ports p WHERE p.sector_id = s.sector_id AND p.is_active = TRUE)
+         ORDER BY random() LIMIT 1;
+    END IF;
+    IF v_orion_sector IS NULL THEN
+        RAISE EXCEPTION 'No eligible empty sector available for Orion port';
     END IF;
     
     -- Create Orion Hideout planet (planet_id 3)
@@ -1088,12 +1100,12 @@ BEGIN
     -- Create Orion Black Market port (type 10 = blackmarket stardock)
     INSERT INTO ports (sector_id, name, type, number)
     VALUES (v_orion_sector, 'Orion Black Market Dock', 10, v_orion_sector)
-    ON CONFLICT (sector_id, number) DO UPDATE SET sector_id = EXCLUDED.sector_id, name = EXCLUDED.name
+    ON CONFLICT DO NOTHING
     RETURNING port_id INTO v_port_id;
 
     -- Ensure bank account exists (even if port already existed)
     IF v_port_id IS NULL THEN
-         SELECT port_id INTO v_port_id FROM ports WHERE sector_id = v_orion_sector AND type = 10;
+         SELECT port_id INTO v_port_id FROM ports WHERE sector_id = v_orion_sector AND type = 10 AND is_active = TRUE;
     END IF;
 
     IF v_port_id IS NOT NULL THEN
@@ -1121,39 +1133,64 @@ BEGIN
     END IF;
     
     -- Spawn Zydras with Heavy Fighter Patrol (shiptypes_id 18)
-    INSERT INTO ships (name, type_id, sector_id, holds, fighters, shields, destroyed)
-    VALUES ('Zydras Heavy Cruiser', 18, v_orion_sector, 10, 5, 3, FALSE)
+    INSERT INTO ships (name, type_id, sector_id, holds, mines, limpets, fighters,
+                       genesis, detonators, probes, photons, shields,
+                       installed_shields, beacons, colonists, equipment,
+                       organics, ore, slaves, weapons, drugs, cloaking_devices,
+                       destroyed, hull)
+    VALUES ('Zydras Heavy Cruiser', 18, v_orion_sector, 10, 0, 0, 5,
+            0, 0, 0, 0, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, FALSE, 100)
     RETURNING ship_id INTO v_ship_id;
     INSERT INTO ship_ownership (ship_id, player_id, role_id) VALUES (v_ship_id, 5, 1) ON CONFLICT DO NOTHING;
-    UPDATE players SET ship_id = v_ship_id WHERE player_id = 5;
+    UPDATE players SET ship_id = v_ship_id, sector_id = v_orion_sector WHERE player_id = 5;
     
     -- Spawn Krell with Scout/Looter (shiptypes_id 19)
-    INSERT INTO ships (name, type_id, sector_id, holds, fighters, shields, destroyed)
-    VALUES ('Krell Scout', 19, v_orion_sector, 10, 2, 1, FALSE)
+    INSERT INTO ships (name, type_id, sector_id, holds, mines, limpets, fighters,
+                       genesis, detonators, probes, photons, shields,
+                       installed_shields, beacons, colonists, equipment,
+                       organics, ore, slaves, weapons, drugs, cloaking_devices,
+                       destroyed, hull)
+    VALUES ('Krell Scout', 19, v_orion_sector, 10, 0, 0, 2,
+            0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, FALSE, 100)
     RETURNING ship_id INTO v_ship_id;
     INSERT INTO ship_ownership (ship_id, player_id, role_id) VALUES (v_ship_id, 6, 1) ON CONFLICT DO NOTHING;
-    UPDATE players SET ship_id = v_ship_id WHERE player_id = 6;
+    UPDATE players SET ship_id = v_ship_id, sector_id = v_orion_sector WHERE player_id = 6;
     
     -- Spawn Vex with Contraband Runner (shiptypes_id 20)
-    INSERT INTO ships (name, type_id, sector_id, holds, fighters, shields, destroyed)
-    VALUES ('Vex Contraband Runner', 20, v_orion_sector, 10, 3, 2, FALSE)
+    INSERT INTO ships (name, type_id, sector_id, holds, mines, limpets, fighters,
+                       genesis, detonators, probes, photons, shields,
+                       installed_shields, beacons, colonists, equipment,
+                       organics, ore, slaves, weapons, drugs, cloaking_devices,
+                       destroyed, hull)
+    VALUES ('Vex Contraband Runner', 20, v_orion_sector, 10, 0, 0, 3,
+            0, 0, 0, 0, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, FALSE, 100)
     RETURNING ship_id INTO v_ship_id;
     INSERT INTO ship_ownership (ship_id, player_id, role_id) VALUES (v_ship_id, 7, 1) ON CONFLICT DO NOTHING;
-    UPDATE players SET ship_id = v_ship_id WHERE player_id = 7;
+    UPDATE players SET ship_id = v_ship_id, sector_id = v_orion_sector WHERE player_id = 7;
     
     -- Spawn Jaxx with Smuggler's Kiss (shiptypes_id 21)
-    INSERT INTO ships (name, type_id, sector_id, holds, fighters, shields, destroyed)
-    VALUES ('Jaxx Smuggler', 21, v_orion_sector, 10, 3, 2, FALSE)
+    INSERT INTO ships (name, type_id, sector_id, holds, mines, limpets, fighters,
+                       genesis, detonators, probes, photons, shields,
+                       installed_shields, beacons, colonists, equipment,
+                       organics, ore, slaves, weapons, drugs, cloaking_devices,
+                       destroyed, hull)
+    VALUES ('Jaxx Smuggler', 21, v_orion_sector, 10, 0, 0, 3,
+            0, 0, 0, 0, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, FALSE, 100)
     RETURNING ship_id INTO v_ship_id;
     INSERT INTO ship_ownership (ship_id, player_id, role_id) VALUES (v_ship_id, 8, 1) ON CONFLICT DO NOTHING;
-    UPDATE players SET ship_id = v_ship_id WHERE player_id = 8;
+    UPDATE players SET ship_id = v_ship_id, sector_id = v_orion_sector WHERE player_id = 8;
     
     -- Spawn Sira with Black Market Guard (shiptypes_id 22)
-    INSERT INTO ships (name, type_id, sector_id, holds, fighters, shields, destroyed)
-    VALUES ('Sira Market Guard', 22, v_orion_sector, 10, 4, 2, FALSE)
+    INSERT INTO ships (name, type_id, sector_id, holds, mines, limpets, fighters,
+                       genesis, detonators, probes, photons, shields,
+                       installed_shields, beacons, colonists, equipment,
+                       organics, ore, slaves, weapons, drugs, cloaking_devices,
+                       destroyed, hull)
+    VALUES ('Sira Market Guard', 22, v_orion_sector, 10, 0, 0, 4,
+            0, 0, 0, 0, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, FALSE, 100)
     RETURNING ship_id INTO v_ship_id;
     INSERT INTO ship_ownership (ship_id, player_id, role_id) VALUES (v_ship_id, 9, 1) ON CONFLICT DO NOTHING;
-    UPDATE players SET ship_id = v_ship_id WHERE player_id = 9;
+    UPDATE players SET ship_id = v_ship_id, sector_id = v_orion_sector WHERE player_id = 9;
     -- Add all Orion captains to the Orion Syndicate corporation (by name, not ID)
     -- All are Officers; Zydras is the Owner at corporation level
     INSERT INTO corp_members (corporation_id, player_id, role)
@@ -1185,6 +1222,12 @@ DECLARE
     v_ship_id integer;
     v_exists boolean;
 BEGIN
+    -- Serialize repeated or concurrent initialization calls so the
+    -- ownerless-hull check and insert remain one idempotent operation.
+    PERFORM pg_advisory_xact_lock(
+        hashtextextended('spawn-initial-fleet', 0)
+    );
+
     -- 1. Seed npc_shipnames if empty
     SELECT EXISTS (SELECT 1 FROM npc_shipnames) INTO v_exists;
     IF NOT v_exists THEN
@@ -1205,8 +1248,25 @@ BEGIN
 
     -- 3. Iterate Ship Types and Create Derelicts
     FOR v_st_rec IN
-        SELECT shiptypes_id, name FROM shiptypes WHERE enabled = TRUE
+        SELECT shiptypes_id, name, initialholds, maxholds, maxfighters, maxshields
+        FROM shiptypes
+        WHERE enabled = TRUE AND can_purchase = TRUE
     LOOP
+        -- Re-running BigBang support code must not create a second abandoned
+        -- hull for the same player-ownable class.  Owned, NPC and destroyed
+        -- ships do not satisfy this derelict slot.
+        IF EXISTS (
+            SELECT 1
+            FROM ships s
+            WHERE s.type_id = v_st_rec.shiptypes_id
+              AND COALESCE(s.destroyed, FALSE) = FALSE
+              AND NOT EXISTS (
+                  SELECT 1 FROM ship_ownership so WHERE so.ship_id = s.ship_id
+              )
+        ) THEN
+            CONTINUE;
+        END IF;
+
         -- Pick random name
         SELECT name INTO v_name FROM npc_shipnames ORDER BY random() LIMIT 1;
         IF v_name IS NULL THEN
@@ -1214,11 +1274,30 @@ BEGIN
         END IF;
 
         -- Pick random sector > 10 (avoid FedSpace)
-        v_sector_id := 11 + floor(random() * (v_sector_count - 10));
+        SELECT sector_id INTO v_sector_id
+        FROM sectors
+        WHERE sector_id > 10
+        ORDER BY random()
+        LIMIT 1;
+        IF v_sector_id IS NULL THEN
+            CONTINUE;
+        END IF;
 
         -- Insert Ship (Ownerless by default as we don't insert into ship_ownership)
-        INSERT INTO ships (name, type_id, sector_id, holds, fighters, shields, destroyed)
-        VALUES (v_name, v_st_rec.shiptypes_id, v_sector_id, 10, 1, 1, FALSE)
+        INSERT INTO ships (name, type_id, sector_id, holds, mines, limpets,
+                           fighters, genesis, detonators, probes, photons,
+                           shields, installed_shields, beacons, colonists,
+                           equipment, organics, ore, slaves, weapons, drugs,
+                           cloaking_devices, destroyed, hull)
+        VALUES (v_name, v_st_rec.shiptypes_id, v_sector_id,
+                GREATEST(1, LEAST(COALESCE(v_st_rec.initialholds, 1),
+                                  COALESCE(v_st_rec.maxholds, COALESCE(v_st_rec.initialholds, 1)))),
+                0, 0,
+                LEAST(1, COALESCE(v_st_rec.maxfighters, 0)),
+                0, 0, 0, 0, 0,
+                LEAST(1, COALESCE(v_st_rec.maxshields, 0)),
+                LEAST(1, COALESCE(v_st_rec.maxshields, 0)),
+                0, 0, 0, 0, 0, 0, 0, 0, 0, FALSE, 100)
         RETURNING ship_id INTO v_ship_id;
 
         -- Optional: Add random cargo? (Old code didn't, but we could)

@@ -164,7 +164,11 @@ BEGIN
         FROM
             bank_accounts
         WHERE
-            bank_accounts_id = NEW.account_id;
+            bank_accounts_id = NEW.account_id
+        FOR UPDATE;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'BANK_ACCOUNT_NOT_FOUND';
+        END IF;
         IF (current_bal - NEW.amount) < 0 THEN
             RAISE EXCEPTION 'BANK_INSUFFICIENT_FUNDS';
         END IF;
@@ -179,25 +183,15 @@ CREATE TRIGGER trg_bank_transactions_before_insert
     FOR EACH ROW
     EXECUTE FUNCTION fn_bank_transactions_before_insert ();
 
--- 8. Bank Transactions: Update Balance
+-- 8. Bank Transactions: Record the balance already committed by the
+-- authoritative bank repository.  Balance mutation belongs to the repository
+-- transaction; this trigger must not apply the same delta a second time.
 CREATE OR REPLACE FUNCTION fn_bank_transactions_after_insert ()
     RETURNS TRIGGER
     AS $$
 BEGIN
-    UPDATE
-        bank_accounts
-    SET
-        balance = CASE NEW.direction
-        WHEN 'DEBIT' THEN
-            balance - NEW.amount
-        WHEN 'CREDIT' THEN
-            balance + NEW.amount
-        ELSE
-            balance
-        END
-    WHERE
-        bank_accounts_id = NEW.account_id;
-    -- Update the transaction record with the resulting balance (requires another update in PG unless logic is moved to app layer, keeping as is to match legacy logic)
+    -- The bank repository has already changed bank_accounts atomically.  Only
+    -- capture the resulting balance on the append-only ledger row.
     UPDATE
         bank_transactions
     SET
@@ -547,6 +541,11 @@ INSERT INTO config (key, value, type)
 VALUES ('death.escape_pod_shiptype_id', '0', 'int')
 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, type = EXCLUDED.type;
 
+INSERT INTO config (key, value, type)
+VALUES ('illegal_allowed_neutral', '1', 'bool'),
+       ('illegal_min_experience', '400', 'int')
+ON CONFLICT (key) DO NOTHING;
+
 -- Cron Tasks
 INSERT INTO cron_tasks(name,schedule,last_run_at,next_due_at,enabled,payload) VALUES
 ('daily_turn_reset', 'daily@03:00Z', NULL, now(), TRUE, NULL),
@@ -575,4 +574,3 @@ INSERT INTO cron_tasks(name,schedule,last_run_at,next_due_at,enabled,payload) VA
   ('daily_corp_tax', 'daily@05:00Z', NULL, now(), TRUE, NULL),
   ('citadel_construction_reap', 'every:1m', NULL, now(), TRUE, NULL)
 ON CONFLICT (name) DO NOTHING;
-

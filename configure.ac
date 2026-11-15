@@ -39,6 +39,7 @@ AC_CHECK_LIB(m, pow, , AC_MSG_ERROR("I need a math library."))
 AC_CHECK_LIB(pthread, pthread_create, , AC_MSG_ERROR("I need a pthread library."))
 AC_CHECK_LIB(readline, readline, , AC_MSG_WARN("Readline not found, command history will be disabled."))
 AC_CHECK_LIB(history, add_history, , AC_MSG_WARN("History library not found."))
+AC_SEARCH_LIBS([strlcpy], [bsd], , AC_MSG_ERROR([I need strlcpy (libc or libbsd).]))
 
 dnl PostgreSQL Backend
 AC_ARG_ENABLE([postgres],

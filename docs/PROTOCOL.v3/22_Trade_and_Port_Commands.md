@@ -1,5 +1,7 @@
 # 22. Trade & Port Commands
 
+Canonical product decisions: [`../V3_GAMEPLAY_DECISIONS.md`](../V3_GAMEPLAY_DECISIONS.md); Galactic Exchange lifecycle: [`../V3_GALACTIC_EXCHANGE_CONTRACT.md`](../V3_GALACTIC_EXCHANGE_CONTRACT.md).
+
 ## 1. Port Interaction
 
 ### `port.dock`
@@ -19,6 +21,20 @@ Trade commodities.
 port's stock and trading details only when the player is in that port's
 sector. Supplying a remote sector or port ID does not grant port knowledge.
 
+Each commodity in the returned port inventory includes the server-calculated
+player-facing `buy_price` and `sell_price` values. `buy_price` is the unit
+price when the player buys from the port; `sell_price` is the unit price when
+the player sells to the port. These are distinct from the legacy generic
+`price` stock field and must not be inferred from it. The `buys` and `sells`
+boolean fields identify whether the port's configured trade direction permits
+each action; stock, capacity, legality, and the authoritative `trade.quote`
+response can still refuse a transaction.
+
+Illegal commodities (`SLV`, `WPN`, and `DRG`) are visible and tradeable only
+when the player meets the configured `illegal_min_experience` threshold and
+is neutral or evil aligned. Neutral access is controlled by
+`illegal_allowed_neutral`; both settings are live SysOp configuration values.
+
 For port classes 1–8, each commodity's buy/sell direction is fixed by its
 `port_trade` mode. Inventory and capacity can prevent an otherwise valid
 transaction, but changing stock does not change the port's direction. Stardock
@@ -29,7 +45,9 @@ and black-market behavior follows their separately configured trade rows.
 *   `items`: Array of objects containing:
     *   `commodity`: Canonical 3-character code (e.g., "ORE", "ORG", "EQU").
     *   `quantity`: Integer amount.
-*   `account`: 0 for Petty Cash (default), 1 for Bank.
+*   `account`: Optional; 0 for petty cash, 1 for bank. If omitted, the
+    saved `player.set_trade_account_preference` is used, or petty cash if no
+    preference has been saved. An explicit account overrides the preference.
 
 Trade buy/sell requests require a non-empty `data.idempotency_key`. This is
 the established V2 trade contract. The server also accepts matching copies in
@@ -86,6 +104,19 @@ The server enforces two optional quantity restrictions on trades:
 
 **Events**: Emits `player.trade.v1` and `trade.deal.matched`.
 
+### Galactic Exchange settlement
+
+Planet and port inventory traded through the Galactic Exchange follows the
+authoritative ownership, funding, matching and conservation contract in
+[`../V3_GALACTIC_EXCHANGE_CONTRACT.md`](../V3_GALACTIC_EXCHANGE_CONTRACT.md).
+An order is not a completed trade. Executed transfers are immediate virtual
+inventory movements, recorded and settled atomically; no physical Exchange
+transport ship or travel delay is involved. No trade may create or discard
+commodities. The Exchange clearing account may receive explicit SysOp-configured
+system liquidity injections, recorded distinctly from player trades; see
+`galactic_exchange_liquidity_credits` in Protocol 29. Price haggling is not
+part of V3; current configured dynamic prices remain authoritative.
+
 ### Player trade offers
 
 `trade.offer` creates a persisted offer addressed to `to_player_id`. Required
@@ -114,6 +145,77 @@ offers expire automatically, and an accept/cancel request also detects and
 records expiry immediately.
 
 ## 2. Hardware & Services (Stardock)
+
+### StarPort construction and class (V3 parity)
+
+V3 includes the original StarPort lifecycle: construct a StarPort in an
+eligible sector, choose its trading class during construction, upgrade its
+commodity trading capacity, and destroy it under the applicable combat rules.
+Class selection configures a newly built port; it is not a way to reclassify
+an existing port. The B/S pattern is from the port's perspective:
+
+| Class | Fuel ore | Organics | Equipment |
+|---|---|---|---|
+| BBB | Buy | Buy | Buy |
+| BBS | Buy | Buy | Sell |
+| BSB | Buy | Sell | Buy |
+| BSS | Buy | Sell | Sell |
+| SBB | Sell | Buy | Buy |
+| SBS | Sell | Buy | Sell |
+| SSB | Sell | Sell | Buy |
+| SSS | Sell | Sell | Sell |
+
+At most one **active** StarPort may occupy a sector. Destroyed ports are
+retained as inactive records for trade/audit references; a sector with only
+inactive port records may host a replacement. A sector must be eligible and
+have no active port before construction. Basic V3
+ports have no persistent player/corporation owner; owner-specific policies,
+tariffs and access are V4 scope. Exact construction costs, timing, eligibility
+exceptions and destruction consequences must follow the project's selected
+historical reference and are not inferred from the class table.
+
+### `planet.trade.port`
+
+Execute a direct Planetary Trade Agreement sale to a StarPort in the same
+sector. This is separate from `planet.market.sell`, which sells to the Galactic
+Exchange. The caller must own the planet or have existing planet trading
+authority. The destination port must be configured to buy every requested
+commodity, and existing local police/faction restrictions apply. No ship or
+cargo holds are required; this transaction consumes zero turns and does not
+use Exchange matching.
+
+Request:
+
+```json
+{
+  "command": "planet.trade.port",
+  "data": {
+    "planet_id": 123,
+    "port_id": 501,
+    "items": [{"commodity": "ORE", "quantity": 100}],
+    "idempotency_key": "planet-port-sale-123"
+  }
+}
+```
+
+`items` accepts one entry per commodity (`ORE`, `ORG`, `EQU`), with a positive
+quantity. The requested set is settled atomically: planetary stock, port buy
+direction and capacity, port funds, and player petty-cash settlement must all
+permit the complete request. The server uses the authoritative dynamic port
+purchase price. Success is `planet.trade.port_receipt_v1`, containing planet,
+port, sector and player IDs; per-commodity quantity/unit-price/value lines;
+total proceeds; updated player credits; and `turns_consumed: 0`. A retry with
+the same key and identical request replays the receipt without transferring
+stock or credits again. Reusing the key for a different request is rejected.
+
+One transaction decrements planetary stock, adds the same quantity to port
+stock, debits the port CRD account, credits the player and records the trade.
+Failure rolls back all effects. Planet treasury visibility is unchanged.
+
+Historical basis: the [TradeWars 2002 Player's Manual (1990–2000)](https://electraphysics.com/documents/tradewarsmanual.pdf)
+describes PTA at lines 207–217 and construction/class, material, upgrade and
+single-port-per-sector behavior at lines 434–455. That reference does not
+establish exact numeric construction costs or a V3 port-owner/tariff model.
 
 ### `hardware.list`
 List available upgrades (ships, equipment) at the current port. At a
@@ -166,6 +268,11 @@ Rejection records a declined deal. Both outcomes update per-player reputation
 and interaction history. Actions are idempotent for already-settled,
 declined, or expired deals. Open offers expire on the NPC cron pass and are
 also checked when acted on. No haggling or price negotiation is defined.
+
+V3 trading is fixed-price: there is no haggling or random negotiation outcome.
+The fixed price is still the server's current authoritative quote, including
+applicable port-class, stock, supply/demand and black-market pricing rules; it
+is not one universal static commodity price.
 
 ## 3. Events
 

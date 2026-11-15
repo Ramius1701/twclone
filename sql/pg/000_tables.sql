@@ -434,6 +434,7 @@ CREATE TABLE ports (
     number integer,
     name text NOT NULL,
     sector_id integer NOT NULL,
+    is_active boolean NOT NULL DEFAULT TRUE,
     size bigint,
     techlevel bigint,
     petty_cash bigint NOT NULL DEFAULT 0,
@@ -908,7 +909,8 @@ CREATE TABLE commodity_orders (
     price integer NOT NULL CHECK (price >= 0),
     status text NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'filled', 'cancelled', 'expired')),
     ts timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    expires_at timestamptz
+    expires_at timestamptz,
+    cancellation_reason text
 );
 
 CREATE TABLE commodity_trades (

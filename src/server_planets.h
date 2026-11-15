@@ -15,6 +15,9 @@ typedef struct
 } planet_t;
 
 int cmd_planet_info (client_ctx_t * ctx, json_t * root);
+int cmd_planet_view (client_ctx_t * ctx, json_t * root);
+int cmd_planet_emancipate (client_ctx_t * ctx, json_t * root);
+int cmd_planet_fighters_transfer (client_ctx_t * ctx, json_t * root);
 int cmd_planet_rename (client_ctx_t * ctx, json_t * root);
 int cmd_planet_land (client_ctx_t * ctx, json_t * root);
 int cmd_planet_launch (client_ctx_t * ctx, json_t * root);
@@ -24,7 +27,9 @@ int cmd_planet_deposit (client_ctx_t * ctx, json_t * root);
 int cmd_planet_withdraw (client_ctx_t * ctx, json_t * root);
 int cmd_planet_genesis_create (client_ctx_t * ctx, json_t * root);
 int cmd_planet_market_sell (client_ctx_t * ctx, json_t * root);
+int cmd_planet_trade_port (client_ctx_t *ctx, json_t *root);
 int cmd_planet_market_buy_order (client_ctx_t * ctx, json_t * root);
+int cmd_planet_market_buy_order_cancel (client_ctx_t * ctx, json_t * root);
 int cmd_planet_transwarp (client_ctx_t * ctx, json_t * root);
 int cmd_planet_colonists_set (client_ctx_t * ctx, json_t * root);
 int cmd_planet_colonists_get (client_ctx_t * ctx, json_t * root);
@@ -37,5 +42,6 @@ int h_get_planet_owner_info (db_t * db, int pid, planet_t * p);
 int h_market_move_planet_stock (db_t * db, int pid, const char *code,
 				int delta);
 int h_get_commodity_id_by_code (db_t * db, const char *code);
+bool h_planet_is_terra (db_t * db, int planet_id);
 
 #endif

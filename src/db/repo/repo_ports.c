@@ -34,6 +34,53 @@ int db_ports_upsert_stock(db_t *db, const char *entity_type, int entity_id, cons
     return 0;
 }
 
+int db_ports_decrement_stock(db_t *db, const char *entity_type, int entity_id,
+                             const char *commodity_code, int quantity,
+                             int64_t ts) {
+    if (!db || !entity_type || !*entity_type || entity_id <= 0
+        || !commodity_code || !*commodity_code || quantity <= 0)
+        return ERR_INVALID_ARG;
+
+    db_error_t err;
+    db_error_clear(&err);
+    int64_t rows = 0;
+    const char *query =
+        "UPDATE entity_stock SET quantity = quantity - {1}, last_updated_ts = {2} "
+        "WHERE entity_type = {3} AND entity_id = {4} AND commodity_code = {5} "
+        "AND quantity >= {1};";
+    char sql[1024];
+    if (sql_build(db, query, sql, sizeof(sql)) != 0)
+        return ERR_DB_QUERY_FAILED;
+    if (!db_exec_rows_affected(db, sql,
+            (db_bind_t[]){ db_bind_i64(quantity), db_bind_i64(ts),
+                           db_bind_text(entity_type), db_bind_i64(entity_id),
+                           db_bind_text(commodity_code) },
+            5, &rows, &err))
+        return err.code ? err.code : ERR_DB_QUERY_FAILED;
+    return rows > 0 ? 0 : ERR_DB_CONSTRAINT;
+}
+
+int db_ports_lock_for_update(db_t *db, int port_id) {
+    if (!db || port_id <= 0 || db->tx_nest_level <= 0)
+        return ERR_INVALID_ARG;
+    const char *query = "SELECT port_id FROM ports WHERE port_id = {1} FOR UPDATE;";
+    char sql[256];
+    if (sql_build(db, query, sql, sizeof(sql)) != 0)
+        return ERR_DB_QUERY_FAILED;
+    db_res_t *res = NULL;
+    db_error_t err = {0};
+    if (!db_query(db, sql, (db_bind_t[]){ db_bind_i64(port_id) }, 1,
+                  &res, &err))
+        return err.code ? err.code : ERR_DB_QUERY_FAILED;
+    if (!db_res_step(res, &err)) {
+        db_res_finalize(res);
+        return err.code ? err.code : ERR_DB_NOT_FOUND;
+    }
+    int found_id = db_res_col_i32(res, 0, &err);
+    db_res_finalize(res);
+    return err.code ? err.code : (found_id == port_id ? 0 : ERR_DB_NOT_FOUND);
+}
+
 int db_ports_get_buy_eligibility(db_t *db, int port_id, const char *commodity_code, int *quantity, int *max_capacity) {
     db_res_t *res = NULL;
     db_error_t err;
@@ -306,7 +353,14 @@ int db_ports_get_commodities(db_t *db, int port_id, json_t **commodities_array) 
     db_error_clear(&err);
     *commodities_array = json_array();
     /* SQL_VERBATIM: Q16 */
-    const char *q16 = "SELECT es.commodity_code, es.quantity, es.price, c.illegal FROM entity_stock es JOIN commodities c ON es.commodity_code = c.code WHERE es.entity_type = 'port' AND es.entity_id = {1};";
+    const char *q16 = "SELECT es.commodity_code, es.quantity, es.price, c.illegal, "
+                      "       MAX(CASE WHEN pt.mode = 'buy' THEN 1 ELSE 0 END) AS buys, "
+                      "       MAX(CASE WHEN pt.mode = 'sell' THEN 1 ELSE 0 END) AS sells "
+                      "FROM entity_stock es "
+                      "JOIN commodities c ON es.commodity_code = c.code "
+                      "LEFT JOIN port_trade pt ON pt.port_id = es.entity_id AND pt.commodity = es.commodity_code "
+                      "WHERE es.entity_type = 'port' AND es.entity_id = {1} "
+                      "GROUP BY es.commodity_code, es.quantity, es.price, c.illegal;";
     char sql[1024]; sql_build(db, q16, sql, sizeof(sql));
     if (db_query(db, sql, (db_bind_t[]){ db_bind_i64(port_id) }, 1, &res, &err)) {
         while (db_res_step(res, &err)) {
@@ -316,6 +370,8 @@ int db_ports_get_commodities(db_t *db, int port_id, json_t **commodities_array) 
             json_object_set_new(obj, "quantity", json_integer(db_res_col_i32(res, 1, &err)));
             json_object_set_new(obj, "price", json_integer(db_res_col_i32(res, 2, &err)));
             json_object_set_new(obj, "illegal", json_integer(db_res_col_i32(res, 3, &err)));
+            json_object_set_new(obj, "buys", json_boolean(db_res_col_i32(res, 4, &err) != 0));
+            json_object_set_new(obj, "sells", json_boolean(db_res_col_i32(res, 5, &err) != 0));
             json_array_append_new(*commodities_array, obj);
         }
         db_res_finalize(res);
@@ -665,7 +721,10 @@ int db_ports_lookup_idemp(db_t *db, const char *key, int player_id, int sector_i
     db_error_t err;
     db_error_clear(&err);
     (void)sector_id; /* Idempotency keys are player-scoped, not sector-scoped. */
-    const char *q33 = "SELECT request_json, response_json FROM trade_idempotency WHERE key = {1} AND player_id = {2};";
+    char key_col[16];
+    if (sql_quote_identifier(db, "key", key_col, sizeof(key_col)) != 0) return -1;
+    char q33[512];
+    snprintf(q33, sizeof(q33), "SELECT request_json, response_json FROM trade_idempotency WHERE %s = {1} AND player_id = {2};", key_col);
     char sql[1024]; sql_build(db, q33, sql, sizeof(sql));
     if (db_query(db, sql, (db_bind_t[]){ db_bind_text(key), db_bind_i64(player_id) }, 2, &res, &err) && db_res_step(res, &err)) {
         const char *req = db_res_col_text(res, 0, &err);
@@ -726,8 +785,10 @@ int db_ports_insert_idemp_sell(db_t *db, const char *key, int player_id, int sec
     db_error_t err;
     db_error_clear(&err);
     const char *now_ts = sql_now_expr(db);
-    const char *q37 = "INSERT INTO trade_idempotency (key, player_id, sector_id, request_json, response_json, created_at) VALUES ({1}, {2}, {3}, {4}, {5}, %s);";
-    char sql_tmpl[1024], sql[1024]; snprintf(sql_tmpl, sizeof(sql_tmpl), q37, now_ts);
+    char key_col[16];
+    if (sql_quote_identifier(db, "key", key_col, sizeof(key_col)) != 0) return -1;
+    char sql_tmpl[1024], sql[1024];
+    snprintf(sql_tmpl, sizeof(sql_tmpl), "INSERT INTO trade_idempotency (%s, player_id, sector_id, request_json, response_json, created_at) VALUES ({1}, {2}, {3}, {4}, {5}, %s);", key_col, now_ts);
     sql_build(db, sql_tmpl, sql, sizeof(sql));
     if (db_exec(db, sql, (db_bind_t[]){ db_bind_text(key), db_bind_i64(player_id), db_bind_i64(sector_id), req_json ? db_bind_text(req_json) : db_bind_null(), resp_json ? db_bind_text(resp_json) : db_bind_null() }, 5, &err)) return 0;
     return -1;
@@ -799,8 +860,10 @@ int db_ports_insert_idemp_buy(db_t *db, const char *key, int player_id, int sect
     db_error_t err;
     db_error_clear(&err);
     const char *now_ts = sql_now_expr(db);
-    const char *q44 = "INSERT INTO trade_idempotency (key, player_id, sector_id, request_json, response_json, created_at) VALUES ({1},{2},{3},{4},{5},%s);";
-    char sql_tmpl[1024], sql[1024]; snprintf(sql_tmpl, sizeof(sql_tmpl), q44, now_ts);
+    char key_col[16];
+    if (sql_quote_identifier(db, "key", key_col, sizeof(key_col)) != 0) return -1;
+    char sql_tmpl[1024], sql[1024];
+    snprintf(sql_tmpl, sizeof(sql_tmpl), "INSERT INTO trade_idempotency (%s, player_id, sector_id, request_json, response_json, created_at) VALUES ({1},{2},{3},{4},{5},%s);", key_col, now_ts);
     sql_build(db, sql_tmpl, sql, sizeof(sql));
     if (db_exec(db, sql, (db_bind_t[]){ db_bind_text(key), db_bind_i64(player_id), db_bind_i64(sector_id), db_bind_text(req_json), db_bind_text(resp_json) }, 5, &err)) return 0;
     return -1;
@@ -814,7 +877,10 @@ int db_ports_replay_idemp_buy(db_t *db, const char *key, int player_id, int sect
     db_res_t *res = NULL;
     db_error_t err;
     db_error_clear(&err);
-    const char *q46 = "SELECT response_json FROM trade_idempotency WHERE key = {1} AND player_id = {2} AND sector_id = {3};";
+    char key_col[16];
+    if (sql_quote_identifier(db, "key", key_col, sizeof(key_col)) != 0) return -1;
+    char q46[512];
+    snprintf(q46, sizeof(q46), "SELECT response_json FROM trade_idempotency WHERE %s = {1} AND player_id = {2} AND sector_id = {3};", key_col);
     char sql[1024]; sql_build(db, q46, sql, sizeof(sql));
     if (db_query(db, sql, (db_bind_t[]){ db_bind_text(key), db_bind_i64(player_id), db_bind_i64(sector_id) }, 3, &res, &err) && db_res_step(res, &err)) {
         const char *resp = db_res_col_text(res, 0, &err);

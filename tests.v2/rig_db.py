@@ -10,29 +10,47 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tools.migrate_passwords_argon2id import encoded_hash, load_argon2
 
 _argon2 = load_argon2()
+QA_DEFAULT_PGPORT = 55438
+QA_DEFAULT_PGUSER = "twclone_qa_runner"
+PRODUCTION_DEFAULT_PGPORT = 5432
 
-def execute_sql(sql, dbname="twclone", user="postgres", password=None, host="localhost"):
+
+def validate_qa_target(dbname, host, port=None):
+    """Refuse fixtures against the shared game database or a remote host."""
+    if not dbname or not dbname.startswith(("twclone_qa_", "twclone_v3qa_")):
+        raise ValueError("database name must start with twclone_qa_ or twclone_v3qa_")
+    if host not in ("localhost", "127.0.0.1", "::1"):
+        raise ValueError("QA database host must be loopback")
+    if port is not None and int(port) == PRODUCTION_DEFAULT_PGPORT:
+        raise ValueError("PostgreSQL port 5432 is reserved for the live/default instance; use the dedicated QA port")
+
+
+def execute_sql(sql, dbname, user, host, port, password=None):
     print("EXEC: database fixture statement (values suppressed)")
     env = os.environ.copy()
     if password:
         env["PGPASSWORD"] = password
     
-    cmd = ["psql", "-h", host, "-U", user, "-d", dbname, "-c", sql]
+    cmd = ["psql", "-h", host, "-p", str(port), "-U", user, "-d", dbname,
+           "-v", "ON_ERROR_STOP=1", "-c", sql]
     
     result = subprocess.run(cmd, env=env, capture_output=True, text=True)
     
     if result.returncode != 0:
-        print(f"ERROR executing SQL (psql exit {result.returncode}); statement and output suppressed")
+        print(f"ERROR executing SQL (psql exit {result.returncode}); statement suppressed")
+        if result.stderr.strip():
+            print(f"DATABASE ERROR: {result.stderr.strip()}")
         sys.exit(1)
     return True
 
-def get_player_id(username, dbname="twclone", user="postgres", password=None, host="localhost"):
+def get_player_id(username, dbname, user, host, port, password=None):
     env = os.environ.copy()
     if password:
         env["PGPASSWORD"] = password
         
     sql = f"SELECT player_id FROM players WHERE name = '{username}'"
-    cmd = ["psql", "-h", host, "-U", user, "-d", dbname, "-t", "-A", "-c", sql]
+    cmd = ["psql", "-h", host, "-p", str(port), "-U", user, "-d", dbname,
+           "-t", "-A", "-v", "ON_ERROR_STOP=1", "-c", sql]
     
     result = subprocess.run(cmd, env=env, capture_output=True, text=True)
     
@@ -44,9 +62,24 @@ def main():
     parser = argparse.ArgumentParser(description="Rig the database for regression tests")
     parser.add_argument("--config", required=True, help="Path to test_rig.json")
     parser.add_argument("--reset", action="store_true", help="Reset test data before rigging")
+    parser.add_argument("--skip-ports", action="store_true",
+                        help="Keep the generated world's ports; do not apply fixture port rows")
+    parser.add_argument("--host", default=os.environ.get("QA_PGHOST", "127.0.0.1"))
+    parser.add_argument("--port", type=int, default=int(os.environ.get("QA_PGPORT", str(QA_DEFAULT_PGPORT))))
+    parser.add_argument("--dbname", default=os.environ.get("QA_PGDATABASE"),
+                        help="Disposable database (required; must use a twclone_qa_ or twclone_v3qa_ name)")
+    parser.add_argument("--user", default=os.environ.get("QA_PGUSER", QA_DEFAULT_PGUSER))
     args = parser.parse_args()
 
-    db_config = {"dbname": "twclone", "user": "postgres", "host": "localhost", "password": "B1lb0 Bagg1ns!"}
+    if not args.dbname:
+        parser.error("--dbname or QA_PGDATABASE is required; refusing the former implicit twclone target")
+    try:
+        validate_qa_target(args.dbname, args.host, args.port)
+    except ValueError as error:
+        parser.error(str(error))
+
+    db_config = {"dbname": args.dbname, "user": args.user, "host": args.host,
+                 "port": args.port, "password": os.environ.get("PGPASSWORD")}
 
     with open(args.config) as f:
         rig = json.load(f)
@@ -55,6 +88,12 @@ def main():
         print("Resetting test data...")
         execute_sql("ALTER TABLE corp_members DISABLE TRIGGER corp_one_leader_guard;", **db_config)
         execute_sql("TRUNCATE sessions, corp_members, citadels, planets, ships, ship_ownership, bank_accounts, turns, players, corporations, sector_assets, entity_stock CASCADE;", **db_config)
+        # The world (and its ports) survives this player-fixture reset. Rebuild
+        # the port settlement accounts that BigBang created before the reset;
+        # otherwise every real trade.buy request fails after the account table
+        # was truncated. These opening balances match generate_ports() and
+        # generate_stardock() in sql/pg/040_functions.sql.
+        execute_sql("INSERT INTO bank_accounts (owner_type, owner_id, currency, balance, interest_rate_bp, is_active) SELECT 'port', port_id, 'CRD', CASE WHEN type = 9 OR name = 'Orion Black Market Dock' THEN 1000000 ELSE 50000 END, 0, TRUE FROM ports ON CONFLICT (owner_type, owner_id, currency) DO NOTHING;", **db_config)
 
 
     # 1. Config
@@ -73,7 +112,7 @@ def main():
             execute_sql(sql, **db_config)
 
     # 3. Ports
-    if "ports" in rig:
+    if "ports" in rig and not args.skip_ports:
         print("Rigging Ports...")
         for p in rig["ports"]:
             sql = f"""
@@ -88,7 +127,11 @@ def main():
 
             if p['type'] == 10:
                 # Ensure it's in taverns table too
-                sql = f"INSERT INTO taverns (sector_id, name_id, enabled) VALUES ({p['sector_id']}, 3, TRUE) ON CONFLICT (sector_id) DO NOTHING;"
+                # The canonical PostgreSQL schema defaults enabled to TRUE;
+                # omit the column so this fixture follows the schema default
+                # rather than forcing a boolean literal into a legacy numeric
+                # enabled column when running against an existing QA schema.
+                sql = f"INSERT INTO taverns (sector_id, name_id) VALUES ({p['sector_id']}, 3) ON CONFLICT (sector_id) DO NOTHING;"
                 execute_sql(sql, **db_config)
 
     # 4. Users
@@ -118,7 +161,7 @@ def main():
             if pid:
                 sql = f"INSERT INTO turns (player_id, turns_remaining, last_update) VALUES ({pid}, 1000, now()) ON CONFLICT (player_id) DO UPDATE SET turns_remaining = 1000;"
                 execute_sql(sql, **db_config)
-                
+
                 # Seed bank account for player
                 sql = f"""
                 INSERT INTO bank_accounts (owner_type, owner_id, balance, currency, is_active)
@@ -135,9 +178,11 @@ def main():
             if owner_id:
                 sql = f"INSERT INTO corporations (corporation_id, name, owner_id) VALUES ({c['corporation_id']}, '{c['name']}', {owner_id}) ON CONFLICT (corporation_id) DO NOTHING;"
                 execute_sql(sql, **db_config)
-                
-                # Add owner to corp_members
-                sql = f"INSERT INTO corp_members (corporation_id, player_id, role) VALUES ({c['corporation_id']}, {owner_id}, 'Leader') ON CONFLICT (corporation_id, player_id) DO UPDATE SET role = 'Leader';"
+
+                # Corporation insertion creates the owner membership through
+                # its existing database trigger. Update that row instead of
+                # trying to insert a second Leader through the one-leader guard.
+                sql = f"UPDATE corp_members SET role = 'Leader' WHERE corporation_id = {c['corporation_id']} AND player_id = {owner_id};"
                 execute_sql(sql, **db_config)
                 
                 # Seed bank account for corporation
@@ -199,15 +244,20 @@ def main():
                 execute_sql(sql, **db_config)
 
                 if owner_id:
-                    sql = f"UPDATE players SET ship_id = {s['ship_id']} WHERE player_id = {owner_id};"
-                    execute_sql(sql, **db_config)
-                    
                     # Use subquery to avoid conflict issues if no unique index exists on (ship_id, player_id)
                     sql = f"""
                     INSERT INTO ship_ownership (ship_id, player_id, role_id, is_primary) 
                     SELECT {s['ship_id']}, {owner_id}, 1, TRUE
                     WHERE NOT EXISTS (SELECT 1 FROM ship_ownership WHERE ship_id = {s['ship_id']} AND player_id = {owner_id});
                     """
+                    execute_sql(sql, **db_config)
+
+                    # The V3 active-owner invariant requires the ownership row
+                    # to exist before players.ship_id is changed.  Keeping
+                    # these as two statements preserves the fixture's existing
+                    # idempotent semantics while respecting the database
+                    # trigger that validates the relationship.
+                    sql = f"UPDATE players SET ship_id = {s['ship_id']} WHERE player_id = {owner_id};"
                     execute_sql(sql, **db_config)
 
     # 8. Planets

@@ -31,6 +31,9 @@
 /* Define to 1 if you have the <math.h> header file. */
 #define HAVE_MATH_H 1
 
+/* Define when the MySQL/MariaDB backend is enabled */
+/* #undef HAVE_MYSQL */
+
 /* Define to 1 if you have the <netdb.h> header file. */
 #define HAVE_NETDB_H 1
 

@@ -1,5 +1,7 @@
 # 29. SysOp Commands (v1)
 
+Canonical gameplay/configuration decisions: [`../V3_GAMEPLAY_DECISIONS.md`](../V3_GAMEPLAY_DECISIONS.md).
+
 ## Overview
 
 This document defines the **SysOp (System Operator)** RPC commands.
@@ -17,9 +19,24 @@ Allows tuning of specific server parameters without a restart.
 **Scope**: Strictly limited to the **Allowed Key List**. All others are `1407 Refused`.
 
 ### Allowed Keys (v1)
-*   **Game Rules**: `turnsperday`, `neutral_band`, `illegal_allowed_neutral`, `max_cloak_duration`, `limpet_ttl_days`
-*   **Economy**: `bank_min_balance_for_interest`, `bank_max_daily_interest_per_account`, `planet_treasury_interest_rate_bps`, `bank_alert_threshold_player`, `bank_alert_threshold_corp`
-*   **Shipyard**: `shipyard_enabled`, `shipyard_trade_in_factor_bp`, `shipyard_require_cargo_fit`, `shipyard_require_fighters_fit`, `shipyard_require_shields_fit`, `shipyard_require_hardware_compat`, `shipyard_tax_bp`
+*   **Game Rules**: `turnsperday`, `neutral_band`, `illegal_allowed_neutral`, `illegal_min_experience`, `max_cloak_duration`, `limpet_ttl_days`
+*   **Economy**: `bank_min_balance_for_interest`, `bank_max_daily_interest_per_account`, `planet_treasury_interest_rate_bps`, `bank_alert_threshold_player`, `bank_alert_threshold_corp`, `planet_market.buy_order_expiry_seconds`
+*   **Shipyard**: `shipyard_enabled`, `shipyard_trade_in_factor_bp`, `shipyard_sale_factor_bp`, `shipyard_require_cargo_fit`, `shipyard_require_fighters_fit`, `shipyard_require_shields_fit`, `shipyard_require_hardware_compat`, `shipyard_tax_bp`
+*   **Planet population**: `planet.slave_unrest_interval_days`, `planet.slave_unrest_stoppage_cycles`, `planet.slave_unrest_population_loss`
+*   **Galactic Exchange**: `galactic_exchange_liquidity_credits` (nonnegative CRD target; default `0`; explicit system-created liquidity is recorded as `SYSTEM_LIQUIDITY`; zero disables injections)
+*   **Used ship resale**: `shipyard_used_resale_factor_bp` (integer 0–10000 basis points; default 8000; affects used-hull purchase price only)
+
+### Planet slave unrest policy
+
+The engine policy fields are `planet.slave_unrest_interval_days` (days),
+`planet.slave_unrest_stoppage_cycles` (production cycles), and
+`planet.slave_unrest_population_loss` (fixed number of population units). Each
+accepts a nonnegative integer. `0` is an explicit unset/disabled sentinel, not
+a gameplay default. No active gameplay interval or loss value is selected.
+Unrest processing remains inactive unless all three are configured positive.
+Even with values present, production/loss activation remains blocked until the
+deterministic rule for allocating losses across unassigned and working
+population is approved. No scheduler currently consumes these settings.
 
 ### `sysop.config.list`
 List all allowed config keys and their current values.
@@ -33,7 +50,8 @@ List all allowed config keys and their current values.
   "data": {
     "items": [
       { "key": "turnsperday", "value": "1000", "type": "int", "desc": "Turns allocated per day" },
-      { "key": "shipyard_tax_bp", "value": "500", "type": "int", "desc": "Shipyard tax in basis points" }
+      { "key": "shipyard_tax_bp", "value": "500", "type": "int", "desc": "Shipyard tax in basis points" },
+      { "key": "planet_market.buy_order_expiry_seconds", "value": "86400", "type": "int", "desc": "Planet buy-order lifetime in seconds (60-604800)" }
     ]
   }
 }
@@ -75,6 +93,15 @@ Update a config value.
 **Errors**:
 *   `1407 Refused`: Key not allowed, type mismatch, or bounds violation.
 *   `1302 Invalid Argument`: Missing confirmation.
+
+`planet_market.buy_order_expiry_seconds` is an integer from 60 through 604800
+inclusive. Its default is 86400 seconds when unset. Changing it affects newly
+placed planet buy orders only; orders already open retain their persisted
+`expires_at` timestamp.
+
+`shipyard_sale_factor_bp` is an integer from 0 through 10000 inclusive, default
+6000. It sets the standalone ship-sale percentage in basis points and does not
+change `shipyard_trade_in_factor_bp` used by ship upgrades.
 
 ### `sysop.config.history`
 View audit history for a key.

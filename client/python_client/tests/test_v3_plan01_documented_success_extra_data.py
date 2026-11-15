@@ -1,0 +1,35 @@
+"""V3-PLAN-01 acceptance for the typed landing ID with extra response data."""
+
+import client
+
+
+def test_typed_landing_response_keeps_nested_id_when_data_is_present(
+    ctx_factory, fake_conn, monkeypatch
+):
+    ctx = ctx_factory(sector={"id": 17, "planets": [{"id": 77, "name": "Terra"}]})
+    fake_conn.queue("planet.land", {
+        "status": "ok",
+        "type": "planet.land.success",
+        "data": {"planet_id": 77, "message": "Landing accepted"},
+    })
+    fake_conn.queue("player.my_info", {
+        "status": "ok", "type": "player.info", "data": {"player": {"id": 3, "ship_id": 9, "turns_remaining": 39}},
+    })
+    fake_conn.queue("ship.status", {
+        "status": "ok", "type": "ship.status", "data": {"ship": {"id": 9, "onplanet": 77}},
+    })
+    fake_conn.queue("planet.info", {
+        "status": "ok", "type": "planet.info", "data": {"planet": {"planet_id": 77, "sector_id": 17}},
+    })
+    monkeypatch.setattr("builtins.input", lambda *_: "")
+
+    fake_conn.queue("move.describe_sector", {
+        "status": "ok", "type": "sector.info", "data": {"id": 17},
+    })
+    client.land_flow(ctx)
+
+    assert ctx.state["on_planet"] is True
+    assert ctx.state["current_planet_id"] == 77
+    assert [call["command"] for call in fake_conn.calls] == [
+        "planet.land", "player.my_info", "ship.status", "move.describe_sector", "planet.info",
+    ]

@@ -1,5 +1,7 @@
 # 20. Player Commands
 
+Canonical product decisions: [`../V3_GAMEPLAY_DECISIONS.md`](../V3_GAMEPLAY_DECISIONS.md).
+
 ## 1. Profile & Info
 
 ### `player.my_info`
@@ -11,14 +13,20 @@ The player's `id` is authoritative and must be taken from the authenticated
 session rather than caller-supplied request data.
 
 ### `player.list_online`
-List online players.
-**Args**: `{ "page": 1, "limit": 50 }`
-**Response**: `{ "players": [...], "pagination": {...} }`
+List unique authenticated players with an active session. Request fields are
+`page` (1-based, default 1) and `limit` (bounded by the command schema).
+Players are deduplicated before pagination and returned in stable
+player-ID-ascending order. Each entry exposes only `player_id`, `username`,
+`corporation` (the existing corporation name or `null` when unaffiliated), and
+`alignment`. Sector, IP, session IDs and connection metadata are private and
+must not be returned.
 
 ### `player.rankings`
 Get player rankings.
 **Args**: `{ "by": "net_worth", "limit": 10 }`
-**Response**: `{ "rankings": [...] }`
+**Response**: `{ "rankings": [...] }`. Each entry contains `player_id`,
+`name`, `experience`, and `alignment`, ordered by experience descending and
+player ID ascending for ties. `limit` defaults to 10 and accepts 1–100.
 
 ### `player.computer.recommend_routes`
 Request recommended trade loops based on personally visited ports and their known buy/sell profiles. Each result identifies the matching commodity and direction, names both ports, and includes a current gross per-unit price spread estimate. The estimate excludes transaction fees and can change before arrival; the server remains authoritative for quotes and trades.

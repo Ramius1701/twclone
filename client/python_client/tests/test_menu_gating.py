@@ -20,6 +20,19 @@ KNOWN_ABSENT_COMMANDS = {
     "map.render",
 }
 
+# Registered RPC names whose current server handlers explicitly return
+# ERR_NOT_IMPLEMENTED. Keep them out of ordinary player-facing menu paths.
+KNOWN_SERVER_STUBS = {
+    "insurance.policies.list",
+    "insurance.policies.buy",
+    "insurance.claim.file",
+    "ship.sell",
+    "ship.transfer",
+    "ship.transfer_cargo",
+    "ship.upgrade",
+    "shipyard.sell",
+}
+
 
 def _iter_options(menu: dict):
     if "sections" in menu:
@@ -70,7 +83,7 @@ def test_normal_mode_excludes_debug_only_menu_entries(ctx_factory, menus):
     assert "k" in move_keys  # Supported autopilot controls are normal play.
 
     computer_keys = {o["key"] for o in _visible_options(menus["COMPUTER"], ctx)}
-    assert "g" not in computer_keys  # Unsupported game.get_clock is not offered.
+    assert "g" in computer_keys  # Supported cargo transfer is available in normal play.
 
     exchange_keys = {o["key"] for o in _visible_options(menus["EXCHANGE_MAIN"], ctx)}
     assert "l" in exchange_keys  # Canonical equity exchange list.
@@ -84,6 +97,26 @@ def test_normal_mode_excludes_debug_only_menu_entries(ctx_factory, menus):
     }
     assert "equity.exchange.list" in exchange_commands
     assert "equity.portfolio.list" in exchange_commands
+
+
+def test_transwarp_requires_authoritative_current_sector(ctx_factory, menus):
+    """NAV-02: do not expose a movement mutation without a server-owned ID."""
+    stale_ctx = ctx_factory(debug=False)
+    stale_ctx.last_sector_desc = {"name": "Unknown location"}
+    stale_flags = client.compute_flags(stale_ctx)
+    stale_keys = {
+        o["key"] for o in _visible_options(menus["MOVE"], stale_ctx)
+        if client.option_visible(o, stale_flags)
+    }
+    assert "t" not in stale_keys
+
+    fresh_ctx = ctx_factory(debug=False, sector={"id": 17, "name": "Current"})
+    fresh_flags = client.compute_flags(fresh_ctx)
+    fresh_keys = {
+        o["key"] for o in _visible_options(menus["MOVE"], fresh_ctx)
+        if client.option_visible(o, fresh_flags)
+    }
+    assert "t" in fresh_keys
 
 
 def test_debug_mode_exposes_retained_diagnostic_actions(ctx_factory, menus):
@@ -100,11 +133,93 @@ def test_debug_mode_exposes_retained_diagnostic_actions(ctx_factory, menus):
     assert "k" in move_keys
 
     computer_keys = {o["key"] for o in _visible_options(menus["COMPUTER"], ctx)}
-    assert "g" not in computer_keys
+    assert "g" in computer_keys
 
     exchange_keys = {o["key"] for o in _visible_options(menus["EXCHANGE_MAIN"], ctx)}
     assert "l" in exchange_keys
     assert "p" in exchange_keys
+
+
+def test_dock_buy_sell_and_star_dock_bank_use_distinct_hotkeys(ctx_factory, menus):
+    ctx = ctx_factory(debug=False)
+    ctx.state.update({"is_stardock": True, "is_shipyard_port": True})
+
+    options = _visible_options(menus["DOCK"], ctx)
+    by_key = {option["key"]: option for option in options}
+
+    assert len(by_key) == len(options)
+    assert by_key["b"]["label"].startswith("(B) Buy")
+    assert by_key["s"]["label"].startswith("(S) Sell")
+    assert by_key["k"]["label"].startswith("(K) Bank")
+    assert by_key["y"]["label"].startswith("(Y) Shipyard")
+
+
+def test_bank_transfer_uses_authoritative_player_id_contract(menus):
+    options = {item["key"]: item for item in menus["BANK"]["options"]}
+    transfer = options["t"]["action"]["rpc"]
+    assert transfer["command"] == "bank.transfer"
+    assert transfer["data"] == {
+        "to_player_id": "<prompt:int:Recipient player ID>",
+        "amount": "<prompt:int:Amount>",
+    }
+
+
+def test_rankings_uses_authoritative_server_endpoint(
+    ctx_factory, fake_conn, capsys
+):
+    ctx = ctx_factory()
+    ctx.push("COMPUTER")
+    fake_conn.queue("player.rankings", {"status": "ok", "type": "player.rankings.response", "data": {"rankings": [
+        {"player_id": 7, "name": "Nova", "experience": 42, "alignment": 10},
+    ]}})
+
+    client.handle_choice(ctx, "k")
+
+    assert "Nova" in capsys.readouterr().out
+    assert [call for call in fake_conn.calls if call["command"] == "player.rankings"] == [
+        {"command": "player.rankings", "data": {"by": "net_worth", "limit": 10}},
+    ]
+
+
+def test_rankings_refusal_is_displayed_without_assuming_response_shape(
+    ctx_factory, fake_conn, capsys
+):
+    fake_conn.queue("player.rankings", None)
+
+    client.rankings_flow(ctx_factory())
+
+    out = capsys.readouterr().out
+    assert "Player rankings refused or failed:" in out
+    assert fake_conn.calls == [{"command": "player.rankings", "data": {"by": "net_worth", "limit": 10}}]
+
+
+def test_rankings_ignores_malformed_rows_without_claiming_success(
+    ctx_factory, fake_conn, capsys
+):
+    fake_conn.queue("player.rankings", {
+        "status": "ok",
+        "data": {"rankings": [None, "not-a-ranking"]},
+    })
+
+    client.rankings_flow(ctx_factory())
+
+    assert "No player rankings are available yet." in capsys.readouterr().out
+
+
+def test_rankings_ignores_rows_without_authoritative_identity_or_types(
+    ctx_factory, fake_conn, capsys
+):
+    fake_conn.queue("player.rankings", {
+        "status": "ok",
+        "data": {"rankings": [
+            {"name": "Spoof", "experience": 99, "alignment": 1},
+            {"player_id": 8, "name": "Rook", "experience": "18", "alignment": -3},
+        ]},
+    })
+
+    client.rankings_flow(ctx_factory())
+
+    assert "No player rankings are available yet." in capsys.readouterr().out
 
 
 def test_no_normal_mode_rpc_action_uses_known_absent_command(ctx_factory, menus):
@@ -117,6 +232,13 @@ def test_no_normal_mode_rpc_action_uses_known_absent_command(ctx_factory, menus)
 
     absent_in_use = reachable_commands & KNOWN_ABSENT_COMMANDS
     assert absent_in_use == set(), f"Normal-mode menus reference absent commands: {absent_in_use}"
+
+
+def test_normal_mode_does_not_expose_server_stub_ship_commands(ctx_factory, menus):
+    ctx = ctx_factory(debug=False)
+    reachable_commands = _collect_rpc_commands(menus, "MAIN", ctx)
+    stub_commands = reachable_commands & KNOWN_SERVER_STUBS
+    assert stub_commands == set(), f"Player menus expose server stubs: {stub_commands}"
 
 
 def test_enter_ship_set_primary_hidden_and_disabled_without_debug(ctx_factory, fake_conn, monkeypatch, capsys):
@@ -149,3 +271,45 @@ def test_enter_ship_set_primary_available_with_debug(ctx_factory, fake_conn, mon
     out = capsys.readouterr().out
     assert "Set Primary" in out
     assert "ship.set_primary" in [c["command"] for c in fake_conn.calls]
+
+
+def test_enter_ship_uses_selected_ship_inspection_contract(
+    ctx_factory, fake_conn, monkeypatch, capsys
+):
+    target = {
+        "id": 99,
+        "name": "Derelict",
+        "ship_type": "Scout",
+        "owner": "derelict",
+    }
+    ctx = ctx_factory(sector={"id": 1, "ships": [target]})
+    ctx.player_info = {"player": {"ship_id": 10, "username": "test"}}
+    fake_conn.queue("ship.inspect", {"status": "ok", "type": "ship.inspect", "data": {
+        "ship": {"ship_id": 99, "name": "Confirmed Derelict", "ship_type": "Scout"},
+    }})
+    inputs = iter(["", "i", "q"])
+    monkeypatch.setattr("builtins.input", lambda *_: next(inputs))
+
+    client.enter_ship_menu(ctx)
+
+    output = capsys.readouterr().out
+    assert "Show visible sector data" in output
+    assert "Confirmed Derelict" in output
+    assert "Server-authoritative ship inspection" in output
+    assert fake_conn.calls == [{"command": "ship.inspect", "data": {"ship_id": 99}}]
+
+
+def test_insurance_placeholder_actions_are_explicit_and_never_claim_success(
+    ctx_factory, fake_conn, capsys
+):
+    ctx = ctx_factory()
+    ctx.push("INSURANCE_MAIN")
+
+    for choice in ("l", "b", "c"):
+        client.handle_choice(ctx, choice)
+
+    output = capsys.readouterr().out
+    assert output.count("Insurance is unavailable") == 3
+    assert "do not persist policies or claims" in output
+    assert "No request was sent" in output
+    assert all(call["command"] == "player.my_info" for call in fake_conn.calls)

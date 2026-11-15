@@ -3,13 +3,14 @@ import time
 import socket
 import errno
 import json
+import copy
 import logging
 import os
 import uuid
 import re
 import random # Add this import
 import select
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 from bug_reporter import BugReporter, redact_secrets
 from planner import Planner
@@ -18,6 +19,12 @@ from llm_client import get_ollama_response, parse_llm_json
 from bandit_policy import BanditPolicy, make_context_key 
 from typing import Optional
 from helpers import canon_commodity
+from v3_capabilities import (
+    build_system_hello,
+    capability_snapshot,
+    build_player_command,
+    normalize_command_catalogue,
+)
 
 # --- Standard Logging Setup ---
 logger = logging.getLogger()
@@ -56,6 +63,214 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # --- Global Shutdown Flag ---
 shutdown_flag = False
+
+
+def _utc_clock_minutes(value):
+    try:
+        hour_text, minute_text = str(value).split(":", 1)
+        hour, minute = int(hour_text), int(minute_text)
+        if 0 <= hour < 24 and 0 <= minute < 60:
+            return hour * 60 + minute
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+def population_pause_seconds(config, state_manager, now=None, turns_remaining=None):
+    """Return seconds until the next active period, or zero while population is active.
+
+    Population pacing is opt-in. Turn use is counted from observed server
+    `turns_remaining` decreases; this function never estimates or grants turns.
+    """
+    if not config.get("population_mode", False):
+        return 0.0
+    now = time.time() if now is None else float(now)
+    state = state_manager.state
+    updates = {}
+
+    start_minute = _utc_clock_minutes(config.get("population_daily_start_utc", "00:00"))
+    end_minute = _utc_clock_minutes(config.get("population_daily_end_utc", "00:00"))
+    if start_minute is not None and end_minute is not None and start_minute != end_minute:
+        current = datetime.fromtimestamp(now, timezone.utc)
+        minute = current.hour * 60 + current.minute
+        if start_minute < end_minute:
+            in_window = start_minute <= minute < end_minute
+        else:
+            in_window = minute >= start_minute or minute < end_minute
+        if not in_window:
+            if state.get("population_active_since") is not None:
+                updates.update({
+                    "population_active_since": None,
+                    "population_turns_used": 0,
+                    "population_last_turns": None,
+                })
+            if updates:
+                state.update(updates)
+                state_manager.save_state()
+            next_start = current.replace(hour=start_minute // 60,
+                                         minute=start_minute % 60,
+                                         second=0, microsecond=0)
+            if next_start.timestamp() <= now:
+                next_start += timedelta(days=1)
+            return max(1.0, next_start.timestamp() - now)
+
+    if state.get("population_turns_unverified"):
+        try:
+            return max(1.0, float(config.get("population_turn_readback_retry_seconds", 60)))
+        except (TypeError, ValueError):
+            return 60.0
+
+    inactive_until = state.get("population_inactive_until")
+    try:
+        remaining_inactive = float(inactive_until) - now if inactive_until is not None else 0.0
+    except (TypeError, ValueError):
+        remaining_inactive = 0.0
+    if remaining_inactive > 0:
+        return remaining_inactive
+    if inactive_until is not None:
+        updates["population_inactive_until"] = None
+        updates["population_active_since"] = now
+        updates["population_turns_used"] = 0
+        updates["population_last_turns"] = turns_remaining
+    elif state.get("population_active_since") is None:
+        updates.update({
+            "population_active_since": now,
+            "population_turns_used": 0,
+            "population_last_turns": turns_remaining,
+        })
+
+    active_since = updates.get("population_active_since", state.get("population_active_since"))
+    turns_used = int(updates.get("population_turns_used", state.get("population_turns_used", 0)) or 0)
+    last_turns = updates.get("population_last_turns", state.get("population_last_turns"))
+    try:
+        current_turns = int(turns_remaining) if turns_remaining is not None else None
+        previous_turns = int(last_turns) if last_turns is not None else None
+    except (TypeError, ValueError):
+        current_turns = previous_turns = None
+    if current_turns is not None:
+        if previous_turns is not None and current_turns < previous_turns:
+            turns_used += previous_turns - current_turns
+            updates["population_turns_used"] = turns_used
+        if current_turns != previous_turns:
+            updates["population_last_turns"] = current_turns
+
+    try:
+        active_seconds = max(60.0, float(config.get("population_active_minutes", 30)) * 60.0)
+    except (TypeError, ValueError):
+        active_seconds = 1800.0
+    try:
+        inactive_seconds = max(0.0, float(config.get("population_inactive_minutes", 120)) * 60.0)
+    except (TypeError, ValueError):
+        inactive_seconds = 7200.0
+    try:
+        turn_budget = max(1, int(config.get("population_max_turns_per_period", 12)))
+    except (TypeError, ValueError):
+        turn_budget = 12
+
+    elapsed = now - float(active_since) if active_since is not None else 0.0
+    if elapsed >= active_seconds or turns_used >= turn_budget:
+        inactive_until = now + inactive_seconds
+        updates.update({
+            "population_active_since": None,
+            "population_inactive_until": inactive_until if inactive_seconds else None,
+            "population_turns_used": turns_used,
+        })
+        wait = inactive_seconds
+    else:
+        wait = 0.0
+    if updates:
+        state.update(updates)
+        state_manager.save_state()
+    return wait
+
+
+def population_turn_readback_required(command_name, config):
+    """Whether a successful command may have consumed a server turn."""
+    read_only = {
+        "auth.login", "auth.register", "player.my_info", "player.info", "player.ping",
+        "ship.info", "ship.status", "sector.info", "trade.port_info", "trade.quote",
+        "system.schema", "system.cmd_list", "system.schema_list",
+        "player.computer.recommend_routes", "move.autopilot.status",
+    }
+    return bool(command_name) and command_name not in read_only and not command_name.startswith("system.")
+
+
+def mutation_reconciliation_contract(command_name):
+    """Describe authoritative evidence required before clearing ambiguity."""
+    contracts = {
+        "trade.buy": ["trade.buy_receipt_v1", "player.my_info", "ship.info"],
+        "trade.sell": ["trade.sell_receipt_v1", "player.my_info", "ship.info"],
+        "move.warp": ["move.result", "player.my_info", "ship.info"],
+        "bank.deposit": ["bank.balance", "player.my_info"],
+        "bank.withdraw": ["bank.balance", "player.my_info"],
+        "ship.upgrade": ["ship.info", "player.my_info"],
+        "planet.land": ["planet.land.success", "player.my_info", "ship.info"],
+        "planet.launch": ["planet.launch.success", "player.my_info", "ship.info"],
+        "port.dock": ["player.dock.v1", "player.my_info", "ship.info"],
+        "move.transwarp": ["move.result", "player.my_info", "ship.info"],
+        "move.autopilot.start": ["move.autopilot.route_v1", "player.my_info"],
+        "move.autopilot.control": ["move.autopilot.controlled_v1", "player.my_info"],
+        "move.autopilot.stop": ["move.autopilot.stopped_v1", "player.my_info"],
+        "planet.deposit": ["player.planet_transfer.v1", "planet.info", "ship.info"],
+        "planet.withdraw": ["player.planet_transfer.v1", "planet.info", "ship.info"],
+        "planet.fighters.transfer": ["planet.fighters.transferred_v1", "planet.info"],
+        "planet.colonists.set": ["planet.info", "player.my_info"],
+        "planet.colonists.allocate": ["planet.info", "player.my_info"],
+        "planet.genesis_create": ["planet.genesis_created_v1", "planet.info", "player.my_info"],
+        "planet.create": ["planet.genesis_created_v1", "planet.info", "player.my_info"],
+        "citadel.build": ["citadel.upgrade_started", "planet.info"],
+        "citadel.upgrade": ["citadel.upgrade_started", "planet.info"],
+        "planet.market.sell": ["planet.info", "player.my_info"],
+        "planet.market.buy_order": ["planet.info", "player.my_info"],
+        "bank.transfer": ["bank.balance", "bank.statement"],
+        "corp.create": ["corp.create.success", "corp.status"],
+        "corp.invite": ["corp.invite.success", "corp.status"],
+        "corp.join": ["corp.join.success", "corp.status"],
+        "corp.kick": ["corp.kick.success", "corp.status"],
+        "corp.leave": ["corp.leave.success", "corp.status"],
+        "corp.dissolve": ["corp.leave.dissolved", "corp.status"],
+        "corp.transfer_ceo": ["corp.transfer_ceo.success", "corp.status"],
+        "corp.deposit": ["corp.deposit.success", "corp.balance"],
+        "corp.withdraw": ["corp.withdraw.success", "corp.balance"],
+        "corp.set_tax": ["corp.status"],
+        "corp.issue_dividend": ["corp.status", "corp.balance"],
+        "hardware.buy": ["ship.info", "player.my_info"],
+        "shipyard.upgrade": ["ship.info", "player.my_info"],
+        "ship.repair": ["ship.info", "player.my_info"],
+        "ship.transfer_cargo": ["ship.info", "player.my_info"],
+        "ship.jettison": ["ship.info"],
+        "ship.rename": ["ship.info"],
+        "notes.set": ["player.note.set_v1", "notes.list"],
+        "notes.delete": ["player.note.deleted_v1", "notes.list"],
+        "fine.pay": ["fine.paid", "player.my_info"],
+        "bounty.post": ["bounty.list", "player.my_info"],
+        "trade.offer": ["trade.offer.created_v1", "player.my_info"],
+        "trade.accept": ["trade.offer.accepted_v1", "player.my_info"],
+        "trade.cancel": ["trade.offer.cancelled_v1", "player.my_info"],
+        "combat.attack.ship": ["combat.ship_damage.v1", "ship.info", "player.my_info"],
+        "combat.attack.port": ["player.port_strike.v1", "player.my_info", "ship.info"],
+        "combat.attack_planet": ["player.attack_planet.v1", "planet.info", "ship.info"],
+        "move.intercept": ["move.result", "player.my_info", "ship.info"],
+        "ship.repair": ["ship.repair", "player.my_info", "ship.info"],
+        "fighters.recall": ["combat.fighters.deployed", "sector.info", "ship.info"],
+        "mines.recall": ["combat.mines.recalled", "sector.info", "ship.info"],
+        "notice.ack": ["notice.acknowledged", "notice.list"],
+        "nav.avoid.add": ["nav.avoid.add", "nav.avoid.list"],
+        "nav.avoid.remove": ["nav.avoid.remove", "nav.avoid.list"],
+    }
+    return {"response_types": contracts.get(command_name, []), "readback_required": True}
+
+
+def classify_protocol_outcome(response, config):
+    """Classify ordinary refusals separately from server/infrastructure errors."""
+    if isinstance(response, dict) and response.get("status") == "refused":
+        error = response.get("error") or {}
+        code = error.get("code")
+        unexpected = set(config.get("qa_unexpected_refusal_codes", []))
+        return "unexpected_refusal" if code in unexpected else "expected_refusal"
+    if isinstance(response, dict) and response.get("status") == "error":
+        return "infrastructure_or_protocol_error"
+    return "success" if isinstance(response, dict) and response.get("status") == "ok" else "unknown"
 
 # --- Game Connection Class ---
 class GameConnection:
@@ -260,7 +475,54 @@ def _get_filtered_game_state_for_llm(game_state, state_manager):
     # Navigation hints (just IDs, no details)
     sector_data = game_state.get("sector_data", {}).get(str(current_sector_id), {})
     adj = sector_data.get("adjacent") or sector_data.get("adjacent_sectors") or []
-    filtered_state["adjacent_sectors"] = [s["to_sector"] if isinstance(s, dict) else s for s in adj]
+    adjacent_ids = []
+    for item in adj:
+        value = item.get("to_sector", item.get("to_sector_id")) if isinstance(item, dict) else item
+        try:
+            adjacent_ids.append(int(value))
+        except (TypeError, ValueError):
+            continue
+    filtered_state["adjacent_sectors"] = adjacent_ids
+
+    # Only expose map knowledge already held by this player. Without these
+    # distinctions the model can repeatedly route between familiar sectors
+    # while believing each destination is unexplored.
+    known_sector_ids = set()
+    for sector_id in game_state.get("sector_data", {}):
+        try:
+            known_sector_ids.add(int(sector_id))
+        except (TypeError, ValueError):
+            continue
+    try:
+        if current_sector_id is not None:
+            known_sector_ids.add(int(current_sector_id))
+    except (TypeError, ValueError):
+        pass
+    known_port_sectors = set()
+    for sector_id, port in all_port_info.items():
+        if isinstance(port, dict) and port:
+            try:
+                known_port_sectors.add(int(sector_id))
+            except (TypeError, ValueError):
+                continue
+    for sector_id, details in (game_state.get("sector_data") or {}).items():
+        if isinstance(details, dict) and details.get("has_port"):
+            try:
+                known_port_sectors.add(int(sector_id))
+            except (TypeError, ValueError):
+                continue
+    filtered_state["known_sector_ids"] = sorted(known_sector_ids)
+    filtered_state["known_port_sector_ids"] = sorted(known_port_sectors)
+    filtered_state["all_known_sectors"] = sorted(known_sector_ids)
+    warp_blacklist = {
+        str(sector) for sector in state_manager.get("warp_blacklist", [])
+    }
+    filtered_state["valid_goto_sectors"] = [
+        sector_id for sector_id in adjacent_ids if str(sector_id) not in warp_blacklist
+    ]
+    filtered_state["unexplored_adjacent_sector_ids"] = [
+        sector_id for sector_id in adjacent_ids if sector_id not in known_sector_ids
+    ]
     
     # Global Market Intelligence (Top 3 profitable routes only)
     market_intel = game_state.get("market_intelligence", {})
@@ -277,8 +539,10 @@ def _audit_state_snapshot(game_state):
     """Small before-state record for live gameplay outcome verification."""
     return {
         "player_location_sector": game_state.get("player_location_sector"),
-        "player_info": game_state.get("player_info"),
-        "ship_info": game_state.get("ship_info"),
+        # StateManager merges player/ship responses in place. Deep-copy them
+        # so a later authoritative readback cannot rewrite the before snapshot.
+        "player_info": copy.deepcopy(game_state.get("player_info")),
+        "ship_info": copy.deepcopy(game_state.get("ship_info")),
     }
 
 
@@ -428,18 +692,169 @@ QA_WORKFLOWS = {
     ]
 }
 
+# Normative V3 ordinary-player request inventory used by the exhaustive QA
+# rotation.  Response/event types, engine commands, and SysOp/S2S operations
+# are intentionally excluded.  Availability is still checked against the
+# server's runtime command catalogue before a request is sent.
+V3_ORDINARY_PLAYER_COMMANDS = [
+    "player.my_info", "player.list_online", "player.rankings",
+    "player.computer.recommend_routes", "player.get_settings", "player.get_prefs",
+    "player.set_prefs", "player.get_subscriptions", "player.get_topics",
+    "player.set_subscriptions", "player.set_topics", "notes.set", "notes.delete",
+    "notes.list", "fine.list", "fine.pay", "session.ping",
+    "sector.info", "sector.scan", "sector.scan.density", "sector.search",
+    "sector.set_beacon", "move.describe_sector", "move.scan", "move.warp", "move.transwarp",
+    "move.pathfind", "move.intercept", "move.autopilot.start", "move.autopilot.status",
+    "move.autopilot.control", "move.autopilot.stop", "nav.bookmark.add",
+    "nav.bookmark.remove", "nav.bookmark.list", "nav.avoid.add", "nav.avoid.remove",
+    "nav.avoid.list", "port.dock", "dock.status", "trade.buy", "trade.sell",
+    "trade.offer", "trade.accept", "trade.cancel", "hardware.list", "hardware.buy",
+    "ship.status", "ship.info", "ship.inspect", "ship.rename", "ship.repair",
+    "ship.upgrade", "ship.transfer_cargo", "ship.jettison", "combat.status",
+    "deploy.fighters.list", "deploy.mines.list", "fighters.recall", "mines.recall",
+    "ship.tow.status", "ship.tow", "shipyard.list", "shipyard.upgrade",
+    "combat.attack.ship", "combat.attack_planet", "combat.attack.port",
+    "planet.land", "planet.launch", "planet.info", "planet.fighters.transfer",
+    "planet.rename", "planet.transfer_ownership", "planet.harvest", "planet.genesis",
+    "planet.deposit", "planet.withdraw", "planet.colonists.get",
+    "planet.colonists.set", "planet.colonists.allocate", "planet.genesis_create",
+    "planet.view", "planet.market.sell", "planet.market.buy_order",
+    "citadel.build", "citadel.upgrade", "corp.create", "corp.list", "corp.status",
+    "corp.invite", "corp.join", "corp.roster", "corp.kick", "corp.leave",
+    "corp.transfer_ceo", "corp.balance", "corp.statement",
+    "corp.deposit", "corp.withdraw", "corp.set_tax", "corp.issue_dividend",
+    "bank.balance", "bank.statement", "bank.deposit", "bank.withdraw", "bank.transfer",
+    "bank.history", "bank.leaderboard", "bank.orders.list", "bounty.list", "bounty.post",
+    "trade.history", "trade.jettison", "port.rob", "combat.sweep_mines",
+    "player.set_trade_account_preference", "player.get_bookmarks", "player.set_bookmarks",
+    "player.get_avoids", "player.set_avoids", "nav.bookmark.set", "nav.avoid.set",
+    "news.get_feed", "news.read", "news.mark_feed_read", "subscribe.add",
+    "subscribe.remove", "subscribe.list", "subscribe.catalog", "ship.claim",
+    "ship.reregister", "shipyard.sell", "insurance.policies_list", "insurance.policies_buy",
+    "insurance.claim_file", "fine.list", "trade.offer", "trade.accept", "trade.cancel",
+    "notice.list", "notice.ack", "chat.send", "mail.send", "mail.inbox", "mail.read", "mail.delete",
+    "insurance.policies.list", "ferengi.traders",
+]
+QA_WORKFLOWS["v3_inventory"] = list(V3_ORDINARY_PLAYER_COMMANDS)
+
 # Workflow order for round-robin rotation
-QA_WORKFLOW_ORDER = ["planet", "combat", "corp", "stock", "mail", "banking", "bounty", "trade"]
+QA_WORKFLOW_ORDER = ["planet", "combat", "corp", "stock", "mail", "banking", "bounty", "trade", "v3_inventory"]
+
+QA_COMMAND_ALIASES = {
+    "player:info": "player.my_info", "player:my_info": "player.my_info",
+    "ship:status": "ship.status", "sector:info": "sector.info",
+    "planet:list": "planet.list", "move:pathfind": "move.pathfind",
+    "move:warp": "move.warp", "planet:land": "planet.land",
+    "planet:info": "planet.info", "planet:launch": "planet.launch",
+    "trade:port_info": "trade.port_info", "trade:quote": "trade.quote",
+    "trade:buy": "trade.buy", "trade:sell": "trade.sell",
+    "bank:balance": "bank.balance", "bank:deposit": "bank.deposit",
+    "bank:withdraw": "bank.withdraw",
+}
+QA_RESPONSE_ONLY = {"move:result"}
+
+
+def resolve_qa_command(label: str, server_commands=None):
+    """Resolve a workflow label to an advertised request command."""
+    if label in QA_RESPONSE_ONLY:
+        return None
+    command = QA_COMMAND_ALIASES.get(label, label.replace(":", "."))
+    if server_commands is not None and command not in set(server_commands):
+        return None
+    return command
+
+
+def validate_config(config: dict) -> list[str]:
+    """Return actionable startup configuration errors without side effects."""
+    if not isinstance(config, dict):
+        return ["configuration must be a JSON object"]
+    errors = []
+    try:
+        if not 1 <= int(config.get("game_port", 1234)) <= 65535:
+            errors.append("game_port must be between 1 and 65535")
+    except (TypeError, ValueError):
+        errors.append("game_port must be an integer")
+    if config.get("strategy_mode", "deterministic") not in {"deterministic", "ollama"}:
+        errors.append("strategy_mode must be 'deterministic' or 'ollama'")
+    if config.get("population_mode") and config.get("qa_mode"):
+        errors.append("population_mode and qa_mode cannot both be enabled")
+    for key in ("state_file", "log_file", "bug_report_path"):
+        value = config.get(key)
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            errors.append(f"{key} must be a non-empty path")
+    try:
+        if int(config.get("max_retries_per_command", 5)) < 0:
+            errors.append("max_retries_per_command must be non-negative")
+    except (TypeError, ValueError):
+        errors.append("max_retries_per_command must be an integer")
+    return errors
+
+
+def qa_coverage_snapshot(tested_commands, server_commands, scenario_ids=None):
+    """Calculate coverage from the current advertised inventory."""
+    inventory = sorted(set(server_commands or []))
+    tested_input = set(tested_commands or [])
+    tested = sorted(tested_input & set(inventory))
+    return {
+        "inventory_size": len(inventory),
+        "tested_count": len(tested),
+        "tested_commands": tested,
+        "unsupported_tested_commands": sorted(tested_input - set(inventory)),
+        "scenario_ids": sorted(set(scenario_ids or [])),
+        "coverage_percent": len(tested) / len(inventory) * 100 if inventory else 0.0,
+    }
+
+def _pause_for_turn_refresh(state_manager, seconds=3600):
+    """Refresh the authoritative turn balance after an exhausted-turn pause."""
+    # Persist the need for a fresh read before sleeping, so a shutdown during
+    # the pause does not resume with an indefinitely stale zero-turn balance.
+    state_manager.set("player_info", None)
+    # Preserve the short, testable wait contract; long population waits are
+    # chunked so SIGINT can be observed promptly.
+    if seconds <= 60:
+        time.sleep(seconds)
+        return
+    deadline = time.monotonic() + max(0.0, float(seconds))
+    while not shutdown_flag and time.monotonic() < deadline:
+        time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
+
 
 def _get_fallback_plan(game_state, state_manager, planner):
     """
     Provides a simple fallback plan when the LLM fails to respond.
     Prioritizes surveying, then selling cargo, then buying if empty, then exploration.
     """
-    logger.info("Generating fallback plan (LLM unavailable)")
+    logger.info("Generating local strategy plan")
 
     current_sector = game_state.get("player_location_sector")
     sector_data = game_state.get("sector_data", {}).get(str(current_sector), {})
+
+    # Solo players need a persistent win path, not just an endless trade loop.
+    # The planner only emits these milestones when the required state is
+    # observed, so a refused/unsupported action cannot strand the strategy.
+    mission_goal = planner._mission_goal(game_state)
+    if mission_goal:
+        return [mission_goal]
+
+    diplomacy_goal = planner._diplomacy_goal(game_state)
+    if diplomacy_goal:
+        return [diplomacy_goal]
+
+    fleet_goal = planner._fleet_goal(game_state)
+    if fleet_goal:
+        return [fleet_goal]
+
+    endgame_goal = planner._endgame_goal(game_state)
+    if endgame_goal:
+        return [endgame_goal]
+
+    readiness_action = planner._combat_readiness_command(game_state)
+    if readiness_action:
+        return ["combat: readiness"]
+
+    progression_goal = planner._solo_progression_goal(game_state)
+    if progression_goal:
+        return [progression_goal]
     
     # 0. Survey Logic: If we are at a port and haven't surveyed it, DO IT.
     if sector_data.get("has_port"):
@@ -456,34 +871,15 @@ def _get_fallback_plan(game_state, state_manager, planner):
     
     # 1. Sell Logic: If we have cargo, find where to sell it
     if sellable_items:
-        # Check if current port buys it PROFITABLY
         if sector_data.get("has_port"):
-            port_id = str(planner._find_port_in_sector(game_state, current_sector))
-            port_sell_prices = game_state.get("price_cache", {}).get(port_id, {}).get("sell", {})
-            
-            for item in sellable_items:
-                commodity = canon_commodity(item.get("commodity"))
-                purchase_price = item.get("purchase_price")
-                sell_price = port_sell_prices.get(commodity)
-                
-                if sell_price is not None and purchase_price is not None and sell_price > purchase_price:
-                    logger.info(f"Fallback: Profitable sell opportunity for {commodity} at current port ({sell_price} > {purchase_price}).")
-                    return [f"sell: {commodity}"]
-        
-        # Find nearest port that DOES buy it profitably
-        for item in sellable_items:
-            commodity = canon_commodity(item.get("commodity"))
-            purchase_price = item.get("purchase_price")
-            if purchase_price is None: continue
+            commodity = planner._get_best_commodity_to_sell(game_state)
+            if commodity:
+                return [f"sell: {commodity}"]
 
-            for s_id, p_info in game_state.get("port_info_by_sector", {}).items():
-                p_id_str = str(p_info.get("port_id"))
-                sell_price = game_state.get("price_cache", {}).get(p_id_str, {}).get("sell", {}).get(commodity)
-                
-                if sell_price is not None and sell_price > purchase_price:
-                    target_sector = int(s_id)
-                    logger.info(f"Fallback: Found profitable sell for {commodity} in sector {target_sector} ({sell_price} > {purchase_price}). Going there.")
-                    return [f"goto: {target_sector}", f"sell: {commodity}"]
+        cargo_route = planner._find_port_for_cargo(game_state)
+        if cargo_route:
+            target_sector, commodity = cargo_route
+            return [f"goto: {target_sector}", f"sell: {commodity}"]
 
     # 2. Buy Logic: If we have space and credits, and are at a port, buy something PROFITABLE
     if sector_data.get("has_port"):
@@ -529,7 +925,24 @@ def _get_fallback_plan(game_state, state_manager, planner):
     logger.warning("Fallback: No known navigation targets are available.")
     return ["scan: density"]
 
-def get_strategy_from_llm(game_state, model, stage, state_manager, qa_objective: Optional[str] = None, bot_number: int = 0, planner: Optional[Planner] = None):
+def _behavior_profile_guidance(profile):
+    guidance = {
+        "trader": "Prioritize viable market trades and profit from public quotes; sell carried cargo before considering another purchase.",
+        "explorer": "Prioritize unexplored reachable sectors and discovering ports; trade when public information shows a worthwhile opportunity.",
+        "cautious": "Prefer known, surveyed reachable locations and avoid unnecessary uncertainty; follow normal resource and safety constraints.",
+        "opportunist": "Prioritize fresh public route recommendations with positive estimated returns; otherwise explore a reachable frontier.",
+        "balanced": "Balance exploration and trading using only the information currently available to this player.",
+    }
+    normalized = str(profile or "balanced").strip().lower()
+    return guidance.get(normalized, guidance["balanced"])
+
+
+def get_strategy_from_llm(game_state, model, stage, state_manager,
+                          qa_objective: Optional[str] = None, bot_number: int = 0,
+                          planner: Optional[Planner] = None, ollama_url: Optional[str] = None,
+                          inference_diagnostics: Optional[dict] = None,
+                          behavior_profile: Optional[str] = None,
+                          inference_timeout: Optional[float] = None):
     """
     Asks the LLM for a high-level strategic plan.
     """
@@ -557,19 +970,37 @@ def get_strategy_from_llm(game_state, model, stage, state_manager, qa_objective:
         prompt = qa_intro + PROMPT_CONTRACT_BLOCK.format(game_state=json.dumps(filtered_game_state, indent=2))
         logger.info(f"Using QA Objective prompt for LLM: {qa_objective}")
     elif stage == "explore":
-        prompt = "You are a master space explorer. Your goal is to find new sectors and ports.\n" + PROMPT_CONTRACT_BLOCK.format(game_state=json.dumps(filtered_game_state, indent=2))
+        prompt = (
+            "You are a space explorer. Choose a useful exploration plan.\n"
+            f"Behaviour profile: {_behavior_profile_guidance(behavior_profile)}\n"
+            + PROMPT_CONTRACT_BLOCK.format(game_state=json.dumps(filtered_game_state, indent=2))
+        )
     else:
-        prompt = "You are a master space trader. Your goal is to make profit.\n" + PROMPT_CONTRACT_BLOCK.format(game_state=json.dumps(filtered_game_state, indent=2))
+        prompt = (
+            "You are a space trader. Choose a useful trade or exploration plan.\n"
+            f"Behaviour profile: {_behavior_profile_guidance(behavior_profile)}\n"
+            + PROMPT_CONTRACT_BLOCK.format(game_state=json.dumps(filtered_game_state, indent=2))
+        )
 
     try:
+        client_error = {}
+        ollama_kwargs = {
+            "override_prompt": prompt,
+            "endpoint": ollama_url,
+            "error_report": client_error,
+        }
+        if inference_timeout is not None:
+            ollama_kwargs["request_timeout"] = inference_timeout
         response_text = get_ollama_response(
-            filtered_game_state,
-            model,
-            "PROMPT_STRATEGY",
-            override_prompt=prompt
+            filtered_game_state, model, "PROMPT_STRATEGY", **ollama_kwargs
         )
         
         if not response_text:
+            if inference_diagnostics is not None:
+                inference_diagnostics.update({
+                    "status": client_error.get("status", "failed"),
+                    "reason": client_error.get("reason", "Ollama returned no response"),
+                })
             return None
 
         raw_plan = []
@@ -642,8 +1073,11 @@ def get_strategy_from_llm(game_state, model, stage, state_manager, qa_objective:
         # Context for validation
         valid_gotos = set(filtered_game_state.get("valid_goto_sectors", []))
         all_known = set(filtered_game_state.get("all_known_sectors", []))
+        known_sector_ids = set(filtered_game_state.get("known_sector_ids", []))
+        known_port_sector_ids = set(filtered_game_state.get("known_port_sector_ids", []))
         valid_comms = set(c.upper() for c in filtered_game_state.get("valid_commodity_names", []))
         can_trade = filtered_game_state.get("can_trade_at_current_location", False)
+        has_cargo = bool((filtered_game_state.get("ship") or {}).get("cargo"))
         
         goal_pattern = re.compile(r'^(goto|buy|sell|scan|planet|combat)\s*:\s*(.+)$', re.IGNORECASE)
 
@@ -666,8 +1100,16 @@ def get_strategy_from_llm(game_state, model, stage, state_manager, qa_objective:
             if verb == "goto":
                 try:
                     sid = int(arg)
-                    # Relaxed validation: Allow any integer target.
-                    # The Planner will handle pathfinding or rejection if truly unreachable.
+                    # During exploration, do not let an Ollama plan loop back
+                    # through already-known non-port sectors. Known ports and
+                    # cargo destinations remain valid strategic targets.
+                    if (stage == "explore" and not has_cargo
+                            and sid in known_sector_ids
+                            and sid not in known_port_sector_ids):
+                        logger.warning(
+                            "Skipping exploration destination %s already known to this player.", sid
+                        )
+                        continue
                     validated_plan.append(f"goto: {sid}")
                 except ValueError:
                     logger.warning(f"Skipping invalid goto format: {goal}")
@@ -719,20 +1161,127 @@ def get_strategy_from_llm(game_state, model, stage, state_manager, qa_objective:
                 logger.warning("BOREDOM FILTER: LLM tried to scan twice. Forcing a move!")
                 target = planner._get_next_warp_target(game_state) if planner else None
                 if target is not None:
+                    if inference_diagnostics is not None:
+                        inference_diagnostics.update({"status": "safely_rejected", "reason": "Ollama plan suppressed by repeated-scan safeguard"})
                     return [f"goto: {target}"]
                 logger.info("Boredom filter found no known adjacent destination; defer to fallback planning.")
+                if inference_diagnostics is not None:
+                    inference_diagnostics.update({"status": "safely_rejected", "reason": "Ollama plan suppressed by repeated-scan safeguard; no known adjacent destination"})
                 return None
             # ---------------------------------------------------------------
 
             logger.info(f"LLM provided valid plan: {final_plan}")
+            if inference_diagnostics is not None:
+                inference_diagnostics.update({"status": "succeeded", "reason": None})
             return final_plan
         
         logger.warning(f"LLM response yielded no valid goals after validation. Raw goals: {raw_plan}, response_text: {response_text}")
+        if inference_diagnostics is not None:
+            inference_diagnostics.update({
+                "status": "invalid_response",
+                "reason": "Ollama responded, but no strategy goal passed parsing and validation",
+            })
         return None
 
     except Exception as e:
         logger.error(f"Error parsing strategy from LLM response: {e}", exc_info=True)
+        if inference_diagnostics is not None:
+            inference_diagnostics.update({"status": "failed", "reason": f"Strategy processing failed: {type(e).__name__}"})
         return None
+
+
+def select_strategy_plan(game_state, config, state_manager, planner):
+    """Select a local plan or optionally ask Ollama for high-level strategy."""
+    mode = config.get("strategy_mode", "ollama")
+    if mode not in ("deterministic", "ollama"):
+        raise ValueError(f"Unknown strategy_mode: {mode!r}")
+    # Safety and victory transitions are controller-owned and must preempt a
+    # stale or imaginative LLM plan in every strategy mode.
+    endgame_reader = getattr(planner, "_endgame_goal", None)
+    readiness_reader = getattr(planner, "_combat_readiness_command", None)
+    mission_reader = getattr(planner, "_mission_goal", None)
+    diplomacy_reader = getattr(planner, "_diplomacy_goal", None)
+    fleet_reader = getattr(planner, "_fleet_goal", None)
+    priority_goal = mission_reader(game_state) if callable(mission_reader) else None
+    if priority_goal is None and callable(diplomacy_reader):
+        priority_goal = diplomacy_reader(game_state)
+    if priority_goal is None and callable(fleet_reader):
+        priority_goal = fleet_reader(game_state)
+    if priority_goal is None and callable(endgame_reader):
+        priority_goal = endgame_reader(game_state)
+    if priority_goal is None and callable(readiness_reader) and readiness_reader(game_state):
+        priority_goal = "combat: readiness"
+    if priority_goal:
+        state_manager.set("strategy_plan_source", "controller_priority")
+        state_manager.set("strategy_inference_status", {"status": "preempted", "reason": priority_goal})
+        state_manager.record_decision({"goal": priority_goal, "reason": "controller priority", "source": "controller"})
+        return [priority_goal]
+    if mode == "deterministic":
+        plan = _get_fallback_plan(game_state, state_manager, planner)
+        state_manager.set("strategy_plan_source", "deterministic")
+        state_manager.set("strategy_inference_status", {"status": "disabled", "reason": None})
+        state_manager.record_decision({"goal": plan[0] if plan else None, "reason": "deterministic fallback", "source": "deterministic"})
+        return plan
+    diagnostics = {}
+    try:
+        profile = planner._behavior_profile(game_state)
+    except (AttributeError, TypeError):
+        profile = config.get("behavior_profile", "balanced")
+    plan = get_strategy_from_llm(
+        game_state,
+        config.get("ollama_model"),
+        planner.current_stage,
+        state_manager,
+        planner=planner,
+        ollama_url=config.get("ollama_url"),
+        inference_diagnostics=diagnostics,
+        behavior_profile=profile,
+        inference_timeout=config.get("inference_timeout_seconds"),
+    )
+    if plan and isinstance(plan, list) and all(
+        isinstance(goal, str) and ":" in goal for goal in plan
+    ):
+        if diagnostics.get("status") == "safely_rejected":
+            source = "controller_safety_override"
+            logger.info("Strategy decision source=%s plan=%s", source, plan)
+        else:
+            source = "ollama"
+            logger.info("Strategy decision source=ollama model=%s plan=%s", config.get("ollama_model"), plan)
+    else:
+        source = "fallback"
+        diagnostics.setdefault("status", "invalid_response")
+        diagnostics.setdefault("reason", "Ollama strategy was empty or invalid")
+        logger.warning(
+            "Strategy decision source=fallback inference_status=%s reason=%s",
+            diagnostics["status"], diagnostics["reason"],
+        )
+        plan = _get_fallback_plan(game_state, state_manager, planner)
+    state_manager.set("strategy_plan_source", source)
+    state_manager.set("strategy_inference_status", diagnostics)
+    state_manager.record_decision({"goal": plan[0] if plan else None, "reason": diagnostics.get("reason"), "source": source})
+    return plan
+
+
+def quarantine_timed_out_trades(state_manager, expired_commands):
+    """Persist ambiguous mutation outcomes until they can be reconciled."""
+    for request_id, command in expired_commands:
+        if command.get("command") in ("trade.buy", "trade.sell"):
+            if (state_manager.get("uncertain_trade") or {}).get("request_id") == request_id:
+                return
+            state_manager.set("uncertain_trade", {
+                "request_id": request_id, "command": command["command"],
+            })
+            return
+        if command.get("command") == "move.warp":
+            if (state_manager.get("uncertain_warp") or {}).get("request_id") == request_id:
+                return
+            data = command.get("data") or {}
+            state_manager.set("uncertain_warp", {
+                "request_id": request_id,
+                "command": "move.warp",
+                "to_sector_id": data.get("to_sector_id"),
+            })
+            return
 
 def is_goal_complete(goal_str, game_state, response_data, response_type):
     """
@@ -800,10 +1349,40 @@ def is_goal_complete(goal_str, game_state, response_data, response_type):
         elif goal_type == "scan" and goal_target == "density":
             return response_type == "sector.density.scan"
         
-        elif goal_type == "planet.land":
-             # Assume success if we got a planet.info or planet.land response, or just OK
-             # This is a bit loose but sufficient for now
-             return response_type in ["planet.info", "planet.land"]
+        elif goal_type == "planet" and goal_target == "land":
+            # Landing is complete only after the public land command succeeds;
+            # an information read alone must not advance this goal.
+            return response_type == "planet.land" and response_data.get("status") == "landed"
+
+        elif goal_type == "planet" and goal_target == "info":
+            return response_type == "planet.info"
+
+        elif goal_type == "bank" and goal_target in ("secure", "deposit"):
+            return response_type in ("bank.deposit.confirmed", "bank.balance")
+
+        elif goal_type == "planet" and goal_target == "create":
+            return response_type in ("planet.genesis_created_v1", "planet.create.success")
+
+        elif goal_type == "citadel" and goal_target in ("maintain", "build", "upgrade"):
+            return response_type in ("citadel.upgrade_started", "planet.info")
+
+        elif goal_type == "planet" and goal_target == "workforce":
+            return response_type == "planet.colonists.allocate"
+
+        elif goal_type == "planet" and goal_target == "defend":
+            return response_type == "planet.fighters.transferred_v1"
+
+        elif goal_type == "victory" and goal_target == "claim":
+            return response_type in ("game.victory_claimed", "victory.claimed")
+
+        elif goal_type == "victory" and goal_target == "consolidate":
+            return response_type in ("bank.deposit.confirmed", "ship.repair", "planet.info")
+
+        elif goal_type == "fleet" and goal_target in ("assign", "acquire"):
+            return response_type in ("ship.info", "ship.claimed", "ship.claim.success")
+
+        elif goal_type == "diplomacy" and goal_target == "offer":
+            return response_type in ("trade.offer.created_v1", "trade.offer.accepted_v1")
 
     except Exception as e:
         logger.warning(f"Error checking goal completion for '{goal_str}': {e}")
@@ -818,12 +1397,118 @@ def advance_completed_goals(strategy_plan, game_state):
         remaining.pop(0)
     return remaining
 
+
+def discard_stale_exploration_goals(strategy_plan, game_state):
+    """Drop persisted non-port revisits when no cargo needs delivery.
+
+    Strategy plans survive controller restarts, so fresh-plan validation alone
+    cannot prevent an old exploration loop from resuming after reconnect.
+    """
+    if not isinstance(strategy_plan, list):
+        return []
+    cargo = (game_state.get("ship_info") or {}).get("cargo", [])
+    has_cargo = False
+    if isinstance(cargo, list):
+        for item in cargo:
+            if not isinstance(item, dict):
+                continue
+            try:
+                has_cargo = float(item.get("quantity", 0) or 0) > 0
+            except (TypeError, ValueError):
+                has_cargo = False
+            if has_cargo:
+                break
+    if has_cargo:
+        return strategy_plan
+
+    known_sectors = set()
+    for sector_id in (game_state.get("sector_data") or {}):
+        try:
+            known_sectors.add(int(sector_id))
+        except (TypeError, ValueError):
+            continue
+    known_ports = set()
+    for sector_id, port in (game_state.get("port_info_by_sector") or {}).items():
+        if isinstance(port, dict) and port:
+            try:
+                known_ports.add(int(sector_id))
+            except (TypeError, ValueError):
+                continue
+    for sector_id, details in (game_state.get("sector_data") or {}).items():
+        if isinstance(details, dict) and details.get("has_port"):
+            try:
+                known_ports.add(int(sector_id))
+            except (TypeError, ValueError):
+                continue
+
+    kept = []
+    for goal in strategy_plan:
+        match = re.match(r"^goto\s*:\s*(\d+)\s*$", str(goal), re.IGNORECASE)
+        if match and int(match.group(1)) in known_sectors - known_ports:
+            continue
+        kept.append(goal)
+    return kept
+
+
+AI_SCHEMA_BOOTSTRAP_COMMANDS = frozenset({
+    "player.my_info", "ship.info", "ship.status", "sector.info",
+    "sector.scan.density", "move.warp", "move.pathfind",
+    "move.autopilot.start", "move.autopilot.status", "move.autopilot.stop",
+    "trade.port_info", "trade.quote", "trade.buy", "trade.sell",
+    "bank.balance", "bank.withdraw", "planet.info", "planet.land",
+})
+
+
+def cache_server_command_catalogue(response_data, state_manager):
+    """Store the normalized ordinary-player command inventory."""
+    commands = normalize_command_catalogue(response_data)
+    state_manager.set("server_commands", commands)
+    state_manager.set("ordinary_player_commands", commands)
+    cached_schemas = (
+        state_manager.get("command_schemas", {})
+        if hasattr(state_manager, "get")
+        else state_manager.state.get("command_schemas", {})
+    )
+    state_manager.set(
+        "capability_snapshot",
+        capability_snapshot(commands, cached_schemas),
+    )
+    # Schema fetches are not part of gameplay planning. Discard pending IDs
+    # from older saved state so they cannot hold the controller in bootstrap.
+    state_manager.set("pending_schema_requests", {})
+    logger.info("Received public command catalogue (%d commands).", len(commands))
+    return commands
+
+
+def schema_commands_to_fetch(commands, cached_schemas=None, include_all=False):
+    """Return missing schemas for gameplay, or the complete public inventory."""
+    cached_schemas = cached_schemas or {}
+    return [
+        command for command in commands
+        if (include_all or command in AI_SCHEMA_BOOTSTRAP_COMMANDS)
+        and command not in cached_schemas
+    ]
+
+
+def should_attempt_registration(config, state_manager):
+    """Registration is opt-in and attempted at most once across restarts."""
+    return bool(
+        config.get("register_if_missing")
+        and not state_manager.get("registration_attempted", False)
+    )
+
+
 # --- Main Game Loop ---
 
 
 def bootstrap_schemas(game_conn, state_manager, config):
     """
-    Fetches all command schemas from the server on startup.
+    Fetch the server's public command catalogue.
+
+    The planner uses the advertised command names to check availability and
+    consumes schemas for its bounded public gameplay command set. Fetching a
+    schema for every server-advertised command floods the authenticated rate
+    limit and delays gameplay.
     """
     logger.info("Bootstrapping command schemas...")
 
@@ -866,6 +1551,11 @@ def main(config_path="config.json"):
         return
     except json.JSONDecodeError:
         logger.critical("%s is not valid JSON. Exiting.", config_path)
+        return
+
+    config_errors = validate_config(config)
+    if config_errors:
+        logger.critical("Invalid configuration: %s", "; ".join(config_errors))
         return
     
     # --- Setup Logging from Config ---
@@ -914,8 +1604,14 @@ def main(config_path="config.json"):
     state_manager.set_default("qa_tested_commands", [])  # Track which commands have been tested
     state_manager.set_default("valid_commodity_names", ["ORE", "ORG", "EQU", "DRG", "SLV", "WPN"])  # All tradable commodities
     # We must reset session_id on start, as it's not persistent
-    state_manager.set("session_id", None) 
-    state_manager._registration_attempted = False
+    state_manager.set("session_id", None)
+    state_manager.set("handshake_complete", False)
+    state_manager.set("server_commands", [])
+    state_manager.set_default("registration_attempted", False)
+    state_manager.set_default("handshake_complete", False)
+    state_manager.set_default("server_capabilities", {})
+    state_manager.set_default("ordinary_player_commands", [])
+    state_manager.set_default("server_commands", [])
 
     last_heartbeat = time.time()
     schemas_bootstrapped = False
@@ -944,11 +1640,21 @@ def main(config_path="config.json"):
                 response_timeout = 30.0
             expired_commands = state_manager.expire_pending_commands(response_timeout)
             if expired_commands:
-                logger.warning("Timed out waiting for %d command response(s); refreshing authoritative player and ship state.", len(expired_commands))
+                quarantine_timed_out_trades(state_manager, expired_commands)
+                expired_names = [
+                    str(command.get("command") or "unknown")
+                    for _, command in expired_commands
+                ]
+                logger.warning(
+                    "Timed out waiting for %d command response(s) (%s); "
+                    "refreshing authoritative player and ship state.",
+                    len(expired_commands), ", ".join(expired_names),
+                )
                 for _request_id, expired_command in expired_commands:
-                    state_manager.record_ai_metric("commands_timed_out")
-                    state_manager.record_command_failure(expired_command.get("command", "unknown"))
-                    if expired_command.get("command") in ("move.autopilot.start", "move.autopilot.status"):
+                    command_name = expired_command.get("command", "unknown")
+                    state_manager.record_command_timeout(command_name)
+                    state_manager.record_command_failure(command_name)
+                    if command_name in ("move.autopilot.start", "move.autopilot.status"):
                         state_manager.set("autopilot_status_checked", False)
                     if expired_command.get("command") == "player.computer.recommend_routes":
                         state_manager.set("market_recommendations_requested_at", 0)
@@ -972,12 +1678,38 @@ def main(config_path="config.json"):
                 continue
             # -----------------------------------------------------------------
 
+            if (config.get("population_mode") and not config.get("qa_mode")
+                    and not game_state.get("pending_commands")):
+                player = (game_state.get("player_info") or {}).get("player") or {}
+                pause_seconds = population_pause_seconds(
+                    config, state_manager, turns_remaining=player.get("turns_remaining")
+                )
+                if pause_seconds > 0:
+                    logger.info("Population schedule inactive; pausing for %.0f seconds.", pause_seconds)
+                    if game_conn.sock or game_state.get("session_id"):
+                        game_conn.disconnect()
+                        state_manager.clear_connection_state(record_reconnect=False)
+                        schemas_bootstrapped = False
+                    time.sleep(min(60.0, max(1.0, pause_seconds)))
+                    continue
+
             # 1. Handle Connection & Authentication
             if not game_conn.sock:
                 if not game_conn.connect():
                     logger.info("Attempting to reconnect in 5 seconds...")
                     time.sleep(5)
                     continue
+
+            # V3 requires a system handshake before authentication. Older
+            # servers may refuse it; in that case retain the legacy flow so
+            # compatibility is explicit rather than silently assumed.
+            if not game_state.get("handshake_complete") and not state_manager.get("pending_commands"):
+                hello = build_system_hello(config)
+                if game_conn.send_command(hello):
+                    state_manager.add_pending_command(hello["id"], hello)
+                    state_manager.record_ai_metric("commands_sent")
+                    state_manager.set("handshake_attempted", True)
+                continue
 
             # Serialize actions: choosing against state from before an
             # unacknowledged mutation can duplicate purchases, warps, or builds.
@@ -1000,8 +1732,7 @@ def main(config_path="config.json"):
                 # enabled, use the public auth.register command once, then
                 # fall back to login if the username already exists. A lost
                 # registration reply is reconciled by login, never blind retry.
-                if (config.get("register_if_missing")
-                        and not getattr(state_manager, "_registration_attempted", False)):
+                if should_attempt_registration(config, state_manager):
                     retry_info = game_state.get("command_retry_info", {})
                     if not planner._is_command_ready("auth.register", retry_info):
                         time.sleep(1)
@@ -1009,7 +1740,7 @@ def main(config_path="config.json"):
                     registration_key = str(uuid.uuid4())
                     registration = build_registration_command(config, registration_key)
                     if game_conn.send_command(registration):
-                        state_manager._registration_attempted = True
+                        state_manager.set("registration_attempted", True)
                         state_manager.add_pending_command(registration["id"], registration)
                         state_manager.record_command_sent("auth.register")
                         state_manager.record_ai_metric("commands_sent")
@@ -1071,6 +1802,16 @@ def main(config_path="config.json"):
                 # Give server time to respond to schema requests
                 logger.info("Waiting for schema responses...")
                 time.sleep(2) 
+                continue
+
+            if game_state.get("uncertain_trade"):
+                logger.error("Trade outcome is uncertain; gameplay is paused pending operator reconciliation.")
+                time.sleep(10)
+                continue
+
+            if game_state.get("uncertain_warp"):
+                logger.error("Warp outcome is uncertain; gameplay is paused pending operator reconciliation.")
+                time.sleep(10)
                 continue
 
             # Reconcile a server-persisted autopilot route after each login.
@@ -1143,10 +1884,15 @@ def main(config_path="config.json"):
             # --- FIX: Cooldown if out of turns ---
             if (game_state.get("player_info") or {}).get("player", {}).get("turns_remaining", 1) <= 0:
                 logger.info("Out of turns. Cooling down for 1 hour.")
-                time.sleep(3600)
+                _pause_for_turn_refresh(state_manager)
                 continue
 
             strategy_plan = game_state.get("strategy_plan", [])
+            valid_plan = discard_stale_exploration_goals(strategy_plan, game_state)
+            if valid_plan != strategy_plan:
+                logger.warning("Dropping persisted exploration goals for already-known non-port sectors.")
+                strategy_plan = valid_plan
+                state_manager.set("strategy_plan", strategy_plan)
             current_goal = None
 
             # 5. Check if we need a new strategy
@@ -1226,8 +1972,17 @@ def main(config_path="config.json"):
                         
                         # Log coverage stats
                         tested_cmds = state_manager.get("qa_tested_commands", [])
-                        coverage_pct = (len(tested_cmds) / 215) * 100 if tested_cmds else 0
-                        logger.info(f"QA Workflow rotation: {workflow_name.upper()} ({workflow_idx % len(QA_WORKFLOW_ORDER)}). Coverage: {coverage_pct:.1f}% ({len(tested_cmds)}/215 commands tested)")
+                        coverage = qa_coverage_snapshot(
+                            tested_cmds,
+                            state_manager.get("server_commands", []),
+                            state_manager.get("qa_scenario_ids", []),
+                        )
+                        logger.info(
+                            "QA Workflow rotation: %s (%d). Coverage: %.1f%% (%d/%d advertised commands; scenarios=%d)",
+                            workflow_name.upper(), workflow_idx % len(QA_WORKFLOW_ORDER),
+                            coverage["coverage_percent"], coverage["tested_count"],
+                            coverage["inventory_size"], len(coverage["scenario_ids"]),
+                        )
                         
                         current_workflow_queue = workflow_commands.copy()
                         state_manager.set("qa_workflow_queue", current_workflow_queue)
@@ -1247,25 +2002,20 @@ def main(config_path="config.json"):
                             goal = f"execute: {next_cmd}"  # Raw command, needs execution wrapper
                         strategy_plan = [goal]
                         state_manager.set("strategy_plan", strategy_plan)
+                        state_manager.set("strategy_plan_source", "qa_workflow")
                         logger.info(f"QA: Next workflow command: {next_cmd}")
                 else: # Not in QA mode, revert to old strategy logic
                     if survey_needed:
                         logger.info("At a port, but survey is incomplete. Setting goal to survey.")
                         state_manager.set("strategy_plan", ["survey: port"])
+                        state_manager.set("strategy_plan_source", "controller")
                     else:
                         if game_state.get("player_info") and game_state.get("ship_info"): # Only ask if we are 'in-game'
-                            logger.info("Strategy plan is empty. Requesting a new one from LLM.")
-                            logger.debug(f"Calling LLM with model: {config.get('ollama_model')}")
-                            new_plan = get_strategy_from_llm(game_state, config.get("ollama_model"), planner.current_stage, state_manager, planner=planner)
-                            if new_plan and isinstance(new_plan, list) and all(isinstance(g, str) and ":" in g for g in new_plan):
-                                state_manager.set("strategy_plan", new_plan)
-                                strategy_plan = new_plan
-                            else:
-                                logger.warning(f"LLM provided an invalid plan: {new_plan}. Using fallback plan.")
-                                # Fallback: Create a simple exploration plan
-                                fallback_plan = _get_fallback_plan(game_state, state_manager, planner)
-                                state_manager.set("strategy_plan", fallback_plan)
-                                strategy_plan = fallback_plan
+                            logger.info("Strategy plan is empty. Selecting a new plan.")
+                            new_plan = select_strategy_plan(game_state, config, state_manager, planner)
+                            state_manager.set("strategy_plan", new_plan)
+                            strategy_plan = new_plan
+                            if state_manager.get("strategy_plan_source") == "fallback":
                                 time.sleep(2) # Wait a moment before continuing
             
             # Drop goals already satisfied by authoritative state. This also
@@ -1295,22 +2045,38 @@ def main(config_path="config.json"):
                 )
 
                 
-                # Build the full command packet
-                full_command = {
-                    "id": f"c-{idempotency_key[:8]}",
-                    "command": command_name,
-                    "data": data_payload,
-                    "meta": {
-                        "client_version": config.get("client_version"),
-                        # --- THIS IS THE FIX for 1306 ERROR ---
-                        # Always include the idempotency_key in meta
-                        "idempotency_key": idempotency_key,
-                        "session_token": game_state.get("session_id")
-                    }
-                }
+                # Build through the V3 safety gate so a planner or persisted
+                # QA workflow cannot submit a response-only/privileged command.
+                try:
+                    full_command = build_player_command(
+                        command_name, data_payload, game_state.get("session_id"),
+                        config.get("client_version"), game_state.get("server_commands"),
+                        idempotency_key,
+                    )
+                except (TypeError, ValueError) as exc:
+                    logger.error("Refusing unsafe or unavailable command: %s", exc)
+                    state_manager.record_command_failure(command_name or "unknown")
+                    state_manager.set("strategy_plan", [])
+                    continue
 
                 logger.info("Sending command: %s", redact_secrets(full_command))
-                
+                if population_turn_readback_required(command_name, config) and hasattr(state_manager, "mark_uncertain_mutation"):
+                    state_manager.mark_uncertain_mutation(
+                        full_command["id"], command_name, data_payload,
+                        mutation_reconciliation_contract(command_name),
+                    )
+                if command_name in ("trade.buy", "trade.sell"):
+                    state_manager.set("uncertain_trade", {
+                        "request_id": full_command["id"], "command": command_name,
+                        "idempotency_key": idempotency_key,
+                    })
+                elif command_name == "move.warp":
+                    state_manager.set("uncertain_warp", {
+                        "request_id": full_command["id"], "command": command_name,
+                        "idempotency_key": idempotency_key,
+                        "to_sector_id": data_payload.get("to_sector_id"),
+                    })
+
                 if game_conn.send_command(full_command):
                     state_manager.add_pending_command(full_command['id'], full_command)
                     state_manager.record_ai_metric("commands_sent")
@@ -1318,8 +2084,14 @@ def main(config_path="config.json"):
 
                     if (config.get("live_gameplay_audit")
                             and command_name in ("move.warp", "trade.buy", "trade.sell")):
+                        state_before = _audit_state_snapshot(game_state)
+                        audit_before_states = getattr(
+                            state_manager, "_live_audit_command_before", {}
+                        )
+                        audit_before_states[full_command["id"]] = state_before
+                        state_manager._live_audit_command_before = audit_before_states
                         bug_reporter.log_command(
-                            full_command, state_before=_audit_state_snapshot(game_state)
+                            full_command, state_before=state_before
                         )
                     
                     # Track tested commands in QA mode
@@ -1417,12 +2189,50 @@ def process_responses(responses, game_conn, state_manager, bug_reporter, bandit_
         if request_id:
             sent_command = state_manager.get_pending_command(request_id)
 
+            # A disconnect or timeout removes the pending request, but a
+            # server may still return the original idempotent result. Rebuild
+            # only the exact uncertain mutation when its response type is
+            # structurally valid; unrelated late replies remain ignored.
+            if sent_command is None:
+                late_data = response.get("data") or {}
+                uncertain_trade = state_manager.get("uncertain_trade") or {}
+                expected_trade_type = {
+                    "trade.buy": "trade.buy_receipt_v1",
+                    "trade.sell": "trade.sell_receipt_v1",
+                }.get(uncertain_trade.get("command")) if isinstance(uncertain_trade, dict) else None
+                uncertain_warp = state_manager.get("uncertain_warp") or {}
+                if (isinstance(uncertain_trade, dict)
+                        and uncertain_trade.get("request_id") == request_id
+                        and response.get("status") == "ok"
+                        and response.get("type") == expected_trade_type
+                        and isinstance(late_data, dict)
+                        and late_data.get("lines")
+                        and late_data.get("credits_remaining") is not None):
+                    sent_command = {
+                        "command": uncertain_trade["command"],
+                        "data": {"port_id": late_data.get("port_id")},
+                    }
+                elif (isinstance(uncertain_warp, dict)
+                      and uncertain_warp.get("request_id") == request_id
+                      and response.get("status") == "ok"
+                      and response.get("type") == "move.result"
+                      and isinstance(late_data, dict)
+                      and str(late_data.get("to_sector_id")) == str(uncertain_warp.get("to_sector_id"))):
+                    sent_command = {
+                        "command": "move.warp",
+                        "data": {"to_sector_id": late_data.get("to_sector_id")},
+                    }
+
             # Ignore replies to expired or previous-session requests. Schema
             # bootstrap requests are separately correlated in their own map.
             schema_request_ids = set((state_manager.get("pending_schema_requests", {}) or {}).values())
             if sent_command is None and request_id not in schema_request_ids:
                 logger.warning("Ignoring late or uncorrelated reply %s (%s).", request_id, response.get("type"))
                 continue
+
+        audit_before_states = getattr(state_manager, "_live_audit_command_before", {})
+        command_state_before = audit_before_states.pop(request_id, None) if request_id else None
+        state_manager._live_audit_command_before = audit_before_states
 
         command_name = "unknown"
         if sent_command:
@@ -1433,6 +2243,16 @@ def process_responses(responses, game_conn, state_manager, bug_reporter, bandit_
         if not isinstance(response_data, dict):
             logger.warning("Expected object payload in %s reply; ignoring malformed payload.", response_type)
             response_data = {}
+        if command_name == "system.hello" and response_type != "system.welcome":
+            # Compatibility with pre-V3 servers: one failed hello must not
+            # prevent the legacy authenticated flow from starting.
+            state_manager.set("handshake_complete", True)
+            logger.info("Server did not return system.welcome; continuing with legacy protocol compatibility.")
+        if request_id and response.get("status") == "refused" and hasattr(state_manager, "resolve_uncertain_mutation"):
+            # A server refusal is an authoritative non-mutation outcome; a
+            # timeout or success remains durable until its readback contract
+            # has been reconciled.
+            state_manager.resolve_uncertain_mutation(request_id)
         
         if config.get("qa_mode"):
             bug_reporter.log_response(response)
@@ -1441,7 +2261,8 @@ def process_responses(responses, game_conn, state_manager, bug_reporter, bandit_
                    or command_name in ("player.my_info", "ship.info"))):
             bug_reporter.log_response(
                 response, command=sent_command,
-                state_before=_audit_state_snapshot(game_state_before),
+                state_before=(command_state_before
+                              or _audit_state_snapshot(game_state_before)),
             )
 
         # Diagnostic log for trade results
@@ -1479,7 +2300,10 @@ def process_responses(responses, game_conn, state_manager, bug_reporter, bandit_
                     credits_remaining = response_data.get("credits_remaining")
                     profit = 0
                     if port_id:
-                        profit = state_manager.update_cargo_after_sell(sold_items, port_id, credits_remaining=credits_remaining)
+                        profit = state_manager.update_cargo_after_sell(
+                            sold_items, port_id, credits_remaining=credits_remaining,
+                            fees=response_data.get("fees"),
+                        )
                         reward = profit / 1000.0 # Normalize profit for the reward
                         state_manager.record_ai_metric("trade_profit_credits", profit)
                     state_manager.record_ai_metric("trade_sales")
@@ -1502,13 +2326,17 @@ def process_responses(responses, game_conn, state_manager, bug_reporter, bandit_
                     port_id = sent_command.get("data", {}).get("port_id") if sent_command else None
                     credits_remaining = response_data.get("credits_remaining")
                     if port_id:
-                        state_manager.update_cargo_after_buy(bought_items, port_id, credits_remaining=credits_remaining)
+                        state_manager.update_cargo_after_buy(
+                            bought_items, port_id, credits_remaining=credits_remaining,
+                            fees=response_data.get("fees"),
+                        )
                     state_manager.set("trade_successful", True)
                     logger.info("Ship cargo state updated after successful trade.buy.")
                 
                 # Give feedback for the last action that led to this success
                 if last_action and last_context:
                     bandit_policy.give_feedback(last_action, last_context, reward)
+                    state_manager.record_learning_outcome(last_action, last_context, reward, True)
 
                 # --- Handle Schema Responses ---
                 if response_type == "system.schema":
@@ -1522,37 +2350,44 @@ def process_responses(responses, game_conn, state_manager, bug_reporter, bandit_
                     })
                     continue
 
+                if response_type in ("system.welcome", "system.capabilities"):
+                    if response_data:
+                        state_manager.set("server_capabilities", response_data)
+                    if response_type == "system.welcome":
+                        state_manager.set("handshake_complete", True)
+                    state_manager.set(
+                        "capability_snapshot",
+                        capability_snapshot(
+                            state_manager.get("ordinary_player_commands", []),
+                            state_manager.get("command_schemas", {}),
+                        ),
+                    )
+                    continue
+
                 if response_type == "system.cmd_list":
-                    commands_to_fetch = [cmd.get("cmd") for cmd in response_data.get("commands", [])]
-                    logger.info(f"Received command list from server: {commands_to_fetch}")
-                    state_manager.set("server_commands", commands_to_fetch)
-                    
-                    commands_to_ignore = [
-                        "system.hello", "system.capabilities", "system.describe_schema", "system.cmd_list", "system.schema_list", "player.list_online"
-                    ]
-
-                    for command_name_to_fetch in commands_to_fetch:
-                        if command_name_to_fetch in commands_to_ignore:
-                            continue
+                    commands = cache_server_command_catalogue(response_data, state_manager)
+                    for command_name_to_fetch in schema_commands_to_fetch(
+                        commands,
+                        state_manager.get("command_schemas", {}),
+                        include_all=bool(config.get("schema_bootstrap_all_commands", config.get("qa_mode", False))),
+                    ):
                         if command_name_to_fetch in state_manager.get("schema_blacklist", []):
-                            logger.debug(f"Skipping schema request for blacklisted command: {command_name_to_fetch}")
                             continue
-
                         idempotency_key = str(uuid.uuid4())
                         request_id_new = f"c-{idempotency_key[:8]}"
                         schema_request = {
-                            "id": request_id_new, "command": "system.describe_schema",
+                            "id": request_id_new,
+                            "command": "system.describe_schema",
                             "data": {"type": "command", "name": command_name_to_fetch},
                             "meta": {
                                 "client_version": config.get("client_version"),
                                 "idempotency_key": idempotency_key,
-                                "session_token": state_manager.get("session_id")
-                            }
+                                "session_token": state_manager.get("session_id"),
+                            },
                         }
-                        logger.debug(f"Requesting schema for command: {command_name_to_fetch}")
-                        game_conn.send_command(schema_request)
-                        state_manager.record_ai_metric("commands_sent")
-                        state_manager.state["pending_schema_requests"][command_name_to_fetch] = request_id_new
+                        if game_conn.send_command(schema_request):
+                            state_manager.record_ai_metric("commands_sent")
+                            state_manager.state["pending_schema_requests"][command_name_to_fetch] = request_id_new
                         time.sleep(0.1)
                     continue
 
@@ -1560,6 +2395,15 @@ def process_responses(responses, game_conn, state_manager, bug_reporter, bandit_
                     # Fix: Use session_token, not session (server returns session_token)
                     session_token = response_data.get("session_token") or response_data.get("session")
                     state_manager.set("session_id", session_token)
+                    if config.get("register_if_missing"):
+                        state_manager.set("registration_attempted", True)
+
+                    # A saved player snapshot may be older than the server
+                    # state after an interrupted action. Re-fetch the public
+                    # player record before allowing a restored plan to act.
+                    state_manager.set("player_info", None)
+                    state_manager.set("player_location_sector", None)
+                    state_manager.set("current_path", [])
                     
                     # Clear cached ship_info to force resync from server.
                     # This prevents stale cargo from persisting if items were deleted from the DB.
@@ -1568,6 +2412,12 @@ def process_responses(responses, game_conn, state_manager, bug_reporter, bandit_
                     
                     # Wrap in 'player' key if it looks like player info but is missing the wrapper
                     p_info = response_data if "player" in response_data else {"player": response_data}
+
+                    # The session token is needed in memory for public commands,
+                    # but must never be copied into the persistent player snapshot.
+                    p_info = {"player": dict(p_info.get("player") or {})}
+                    p_info["player"].pop("session_token", None)
+                    p_info["player"].pop("session", None)
                     
                     # Ensure player_id is present in the player object for downstream logic
                     if "player_id" in response_data and "id" not in p_info["player"]:
@@ -1580,18 +2430,112 @@ def process_responses(responses, game_conn, state_manager, bug_reporter, bandit_
                         # Server might return flat data, wrap it if so
                         response_data = {"player": response_data}
                     state_manager.update_player_info(response_data)
+                    if config.get("population_mode") and not config.get("qa_mode"):
+                        state_manager.set("population_turns_unverified", False)
                 
                 elif response_type in ("ship.info", "ship.status", "ship.claimed"):
                     ship_obj = response_data.get("ship", response_data)
                     # update_player_info expects {"ship": {...}} 
                     state_manager.update_player_info({"ship": ship_obj})
+                    if isinstance(ship_obj, dict):
+                        state_manager.record_fleet_snapshot([ship_obj])
                     if response_type == "ship.claimed":
                         logger.info(f"Bootstrap: Successfully claimed ship {ship_obj.get('id', '?')}")
+
+                elif response_type == "ship.repair":
+                    # The repair receipt is authoritative for hull, but not
+                    # sufficient for credits or the complete ship snapshot.
+                    if isinstance(response_data.get("hull"), int):
+                        ship = dict(state_manager.get("ship_info") or {})
+                        ship["hull"] = response_data["hull"]
+                        state_manager.update_player_info({"ship": ship})
+                    for refresh_name in ("player.my_info", "ship.status"):
+                        refresh_id = str(uuid.uuid4())
+                        refresh = {
+                            "id": f"c-repair-refresh-{refresh_id[:8]}",
+                            "command": refresh_name,
+                            "data": {},
+                            "meta": {
+                                "client_version": config.get("client_version"),
+                                "idempotency_key": refresh_id,
+                                "session_token": state_manager.get("session_id"),
+                            },
+                        }
+                        if game_conn.send_command(refresh):
+                            state_manager.add_pending_command(refresh["id"], refresh)
+                            state_manager.record_ai_metric("commands_sent")
+
+                elif response_type in ("deploy.fighters.list", "deploy.mines.list"):
+                    recall_name = "fighters.recall" if response_type == "deploy.fighters.list" else "mines.recall"
+                    entries = response_data.get("items", response_data.get("assets", []))
+                    if isinstance(entries, list):
+                        deployed = state_manager.get("deployed_assets", {})
+                        deployed[recall_name] = entries
+                        state_manager.set("deployed_assets", deployed)
+
+                elif response_type in ("combat.fighters.deployed", "combat.mines.recalled"):
+                    # Recall handlers have legacy response names; refresh the
+                    # authoritative sector and ship views before planning on
+                    # the returned asset counts.
+                    for refresh_name in ("sector.info", "ship.status"):
+                        refresh_id = str(uuid.uuid4())
+                        refresh = {
+                            "id": f"c-asset-refresh-{refresh_id[:8]}",
+                            "command": refresh_name,
+                            "data": ({"sector_id": int(state_manager.get("player_location_sector"))}
+                                     if refresh_name == "sector.info"
+                                     and state_manager.get("player_location_sector") is not None else {}),
+                            "meta": {
+                                "client_version": config.get("client_version"),
+                                "idempotency_key": refresh_id,
+                                "session_token": state_manager.get("session_id"),
+                            },
+                        }
+                        if game_conn.send_command(refresh):
+                            state_manager.add_pending_command(refresh["id"], refresh)
+                            state_manager.record_ai_metric("commands_sent")
+
+                elif response_type == "notice.list":
+                    entries = response_data.get("items", response_data.get("notices", []))
+                    if isinstance(entries, list):
+                        state_manager.set("notices", entries)
                 
                 if response_type == "move.result":
                     if response.get("status") == "ok":
                         new_sector = response_data.get("to_sector_id")
                         if new_sector:
+                            hazards = response_data.get("hazards") or []
+                            if isinstance(hazards, list) and hazards and hasattr(state_manager, "record_sector_danger"):
+                                hazard_types = [
+                                    item.get("hazard_type", item.get("type"))
+                                    for item in hazards if isinstance(item, dict)
+                                ]
+                                severity = sum(
+                                    max(1, int(item.get("hull_lost", 0) or 0)
+                                        + int(item.get("fighters_lost", 0) or 0)
+                                        + int(item.get("shields_lost", 0) or 0))
+                                    for item in hazards if isinstance(item, dict)
+                                )
+                                previous_danger = (state_manager.get("sector_danger", {}) or {}).get(str(new_sector))
+                                state_manager.record_sector_danger(new_sector, hazard_types, severity or 1)
+                                if (config.get("persist_dangerous_sectors", True)
+                                        and not previous_danger
+                                        and "nav.avoid.add" in game_state_before.get("server_commands", [])
+                                        and game_conn is not None):
+                                    avoid_id = str(uuid.uuid4())
+                                    avoid_cmd = {
+                                        "id": f"c-avoid-{avoid_id[:8]}",
+                                        "command": "nav.avoid.add",
+                                        "data": {"sector_id": int(new_sector)},
+                                        "meta": {
+                                            "client_version": config.get("client_version"),
+                                            "idempotency_key": avoid_id,
+                                            "session_token": state_manager.get("session_id"),
+                                        },
+                                    }
+                                    if game_conn.send_command(avoid_cmd):
+                                        state_manager.add_pending_command(avoid_cmd["id"], avoid_cmd)
+                                        state_manager.record_ai_metric("commands_sent")
                             state_manager.record_ai_metric("completed_warps")
                             state_manager.set("player_location_sector", new_sector)
                             current_path = game_state_before.get("current_path", [])
@@ -1653,12 +2597,16 @@ def process_responses(responses, game_conn, state_manager, bug_reporter, bandit_
                         # Add refresh timestamp so planner can detect stale data
                         response_data["_last_refreshed"] = time.time()
                         state_manager.update_sector_data(str(sector_id), response_data)
+                        public_players = response_data.get("players", response_data.get("ships_present", []))
+                        if isinstance(public_players, list):
+                            state_manager.record_opponent_observation(public_players, sector_id=sector_id)
                 
                 elif response_type == "shipyard.list":
                     # Store available ships for bootstrap ship claiming
                     ships = response_data.get("ships", [])
                     if ships:
                         state_manager.set("shipyard_list", ships)
+                        state_manager.record_fleet_snapshot(ships)
                         logger.info(f"Bootstrap: Received shipyard list with {len(ships)} available ships.")
                 
                 elif response_type == "trade.port_info":
@@ -1691,6 +2639,24 @@ def process_responses(responses, game_conn, state_manager, bug_reporter, bandit_
                 elif response_type == "bank.balance":
                     state_manager.set("bank_balance", response_data.get("balance", 0))
 
+                # Victory status is intentionally copied only from an
+                # authoritative server response; local estimates cannot claim
+                # a win.  Combat receipts likewise feed recovery and opponent
+                # threat memory without storing private credentials.
+                if isinstance(response_data, dict):
+                    victory = response_data.get("victory") or response_data.get("game_status")
+                    if isinstance(victory, dict):
+                        state_manager.set("victory_status", victory)
+                    if response_type.startswith("combat.") or response_type.startswith("player.attack"):
+                        state_manager.record_combat_outcome(response_data)
+                        target = response_data.get("target_player_id") or response_data.get("player_id")
+                        if target is not None:
+                            state_manager.record_opponent_observation([{
+                                "player_id": target,
+                                "sector_id": state_manager.get("player_location_sector"),
+                                "hostile": True,
+                            }])
+
                 game_state_after = state_manager.get_all() 
                 strategy_plan = game_state_after.get("strategy_plan", [])
                 
@@ -1701,9 +2667,10 @@ def process_responses(responses, game_conn, state_manager, bug_reporter, bandit_
                     current_goal = strategy_plan[0]
                     if is_goal_complete(current_goal, game_state_after, response_data, response_type):
                         logger.info(f"Strategic goal '{current_goal}' is complete. Removing from plan.")
+                        state_manager.record_ai_metric("goals_completed")
                         strategy_plan.pop(0)
                         state_manager.set("strategy_plan", strategy_plan)
-                
+
             else: # Error or refused
                 if sent_command:
                     state_manager.record_ai_metric("commands_refused")
@@ -1754,6 +2721,7 @@ def process_responses(responses, game_conn, state_manager, bug_reporter, bandit_
                 last_context = game_state_before.get("last_context_key")
                 if last_action and last_context:
                     bandit_policy.give_feedback(last_action, last_context, -1.0) # Negative reward for failure
+                    state_manager.record_learning_outcome(last_action, last_context, -1.0, False)
                 
                 if response_type == "error" and error_code == 1104 and command_name != "unknown":
                     state_manager.add_to_schema_blacklist(command_name)
@@ -1894,15 +2862,126 @@ def process_responses(responses, game_conn, state_manager, bug_reporter, bandit_
                         state_manager.record_ai_metric("commands_sent")
                 # --------------------------------------------------------------------
 
-                if config.get("qa_mode"):
+                if config.get("qa_mode") and classify_protocol_outcome(response, config) != "expected_refusal":
                     bug_reporter.triage_protocol_error(command_name, response, game_state_before, error_code, error_msg)
                 if command_name == "auth.register" and error_code == 1000:
                     # Database outages are transient; permit one later public
                     # registration attempt after the command backoff expires.
-                    state_manager._registration_attempted = False
+                    state_manager.set("registration_attempted", False)
+
+            if (config.get("population_mode") and not config.get("qa_mode") and sent_command
+                    and population_turn_readback_required(command_name, config)):
+                # Fail closed until an authoritative player.my_info confirms
+                # the server's current turn balance, including after refusals.
+                state_manager.set("population_turns_unverified", True)
+                audit_already_reads_player = (
+                    config.get("live_gameplay_audit")
+                    and command_name in ("move.warp", "trade.buy", "trade.sell")
+                    and response.get("status") == "ok"
+                )
+                if not audit_already_reads_player:
+                    idempotency_key = str(uuid.uuid4())
+                    refresh = {
+                        "id": f"c-pop-turns-{idempotency_key[:8]}",
+                        "command": "player.my_info",
+                        "data": {},
+                        "meta": {
+                            "client_version": config.get("client_version"),
+                            "idempotency_key": idempotency_key,
+                            "session_token": state_manager.get("session_id"),
+                        },
+                    }
+                    if game_conn.send_command(refresh):
+                        state_manager.add_pending_command(refresh["id"], refresh)
+                        state_manager.record_ai_metric("commands_sent")
+
+                elif response_type == "planet.info":
+                    # V3 returns the planet fields at the top level, while
+                    # older servers sometimes wrap them in `planet`.
+                    planet = response_data.get("planet", response_data)
+                    if isinstance(planet, dict):
+                        state_manager.set("planet_info", planet)
+
+                elif response_type in ("planet.genesis_created_v1", "planet.create.success"):
+                    # Creation changes both the local sector's planet flag and
+                    # the player's available resources; force authoritative
+                    # reads before planning the next empire milestone.
+                    state_manager.set("planet_info", response_data.get("planet", response_data))
+                    for refresh_name in ("sector.info", "player.my_info"):
+                        refresh_id = f"c-solo-{uuid.uuid4().hex[:8]}"
+                        refresh = {
+                            "id": refresh_id,
+                            "command": refresh_name,
+                            "data": {"sector_id": state_manager.get("player_location_sector")} if refresh_name == "sector.info" else {},
+                            "meta": {
+                                "client_version": config.get("client_version"),
+                                "idempotency_key": str(uuid.uuid4()),
+                                "session_token": state_manager.get("session_id"),
+                            },
+                        }
+                        if game_conn.send_command(refresh):
+                            state_manager.add_pending_command(refresh_id, refresh)
+                            state_manager.record_ai_metric("commands_sent")
+
+                elif response_type == "citadel.upgrade_started":
+                    state_manager.set("planet_info", None)
+                    refresh_id = f"c-solo-{uuid.uuid4().hex[:8]}"
+                    refresh = {
+                        "id": refresh_id,
+                        "command": "planet.info",
+                        "data": {"planet_id": (sent_command or {}).get("data", {}).get("planet_id")},
+                        "meta": {
+                            "client_version": config.get("client_version"),
+                            "idempotency_key": str(uuid.uuid4()),
+                            "session_token": state_manager.get("session_id"),
+                        },
+                    }
+                    if refresh["data"]["planet_id"] is not None and game_conn.send_command(refresh):
+                        state_manager.add_pending_command(refresh_id, refresh)
+                        state_manager.record_ai_metric("commands_sent")
+
+                elif response_type in ("planet.colonists.allocate", "planet.fighters.transferred_v1"):
+                    planet_id = response_data.get("planet_id")
+                    if response_type == "planet.colonists.allocate":
+                        state_manager.set("planet_info", {
+                            **(state_manager.get("planet_info") or {}),
+                            **response_data,
+                        })
+                    refresh_id = f"c-planet-refresh-{uuid.uuid4().hex[:8]}"
+                    refresh = {
+                        "id": refresh_id,
+                        "command": "planet.info",
+                        "data": {"planet_id": planet_id},
+                        "meta": {
+                            "client_version": config.get("client_version"),
+                            "idempotency_key": str(uuid.uuid4()),
+                            "session_token": state_manager.get("session_id"),
+                        },
+                    }
+                    if planet_id is not None and game_conn.send_command(refresh):
+                        state_manager.add_pending_command(refresh_id, refresh)
+                        state_manager.record_ai_metric("commands_sent")
+                    else:
+                        logger.warning("Population turn-budget player.my_info refresh could not be sent.")
 
         except Exception as e:
             logger.error("Critical error in process_responses: %s", e, exc_info=True)
+        else:
+            uncertain = state_manager.get("uncertain_trade") or {}
+            expected_receipt = {"trade.buy": "trade.buy_receipt_v1",
+                                "trade.sell": "trade.sell_receipt_v1"}.get(command_name)
+            if (expected_receipt and isinstance(uncertain, dict) and uncertain.get("request_id") == request_id
+                    and ((response.get("status") == "ok" and response_type == expected_receipt
+                          and response_data.get("lines") and response_data.get("credits_remaining") is not None)
+                         or response.get("status") == "refused")):
+                state_manager.set("uncertain_trade", None)
+            warp = state_manager.get("uncertain_warp") or {}
+            if (command_name == "move.warp" and isinstance(warp, dict) and warp.get("request_id") == request_id
+                    and ((response.get("status") == "ok" and response_type == "move.result"
+                          and response_data.get("to_sector_id") is not None
+                          and str(response_data["to_sector_id"]) == str(warp.get("to_sector_id")))
+                         or response.get("status") == "refused")):
+                state_manager.set("uncertain_warp", None)
 
         # In live audit mode, verify every successful movement/trade against
         # fresh public player and ship reads. Refusals are logged as refusals
@@ -1927,7 +3006,8 @@ def process_responses(responses, game_conn, state_manager, bug_reporter, bandit_
                             events=state_manager.get("server_events", []),
                             state_after_source=("readback unavailable" if context["failed_readbacks"]
                                                 else "player.my_info + ship.info readback"),
-                            verification_complete=not context["failed_readbacks"],
+                            verification_complete=(not context["failed_readbacks"]
+                                                   and context.get("before_verified", False)),
                         )
                         if context["failed_readbacks"]:
                             logger.warning("Live gameplay readback incomplete for %s.", action_id)
@@ -1939,7 +3019,9 @@ def process_responses(responses, game_conn, state_manager, bug_reporter, bandit_
                 context = {
                     "command": sent_command,
                     "response": response,
-                    "state_before": _audit_state_snapshot(game_state_before),
+                    "state_before": (command_state_before
+                                     or _audit_state_snapshot(game_state_before)),
+                    "before_verified": command_state_before is not None,
                     "required": {"player.my_info", "ship.info"},
                     "received": set(),
                     "failed_readbacks": [],

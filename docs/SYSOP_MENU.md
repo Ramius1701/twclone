@@ -21,6 +21,7 @@ Only the following keys are exposed via `sysop.config.*` commands.
 *   `turnsperday`
 *   `neutral_band`
 *   `illegal_allowed_neutral`
+*   `illegal_min_experience`
 *   `max_cloak_duration`
 *   `limpet_ttl_days`
 *   `bank_min_balance_for_interest`
@@ -30,11 +31,22 @@ Only the following keys are exposed via `sysop.config.*` commands.
 *   `bank_alert_threshold_corp`
 *   `shipyard_enabled`
 *   `shipyard_trade_in_factor_bp`
+*   `shipyard_sale_factor_bp` (integer, 0–10000; default 6000; standalone sale only)
 *   `shipyard_require_cargo_fit`
 *   `shipyard_require_fighters_fit`
 *   `shipyard_require_shields_fit`
 *   `shipyard_require_hardware_compat`
 *   `shipyard_tax_bp`
+*   `planet.slave_unrest_interval_days` (days; 0 means unset/disabled)
+*   `planet.slave_unrest_stoppage_cycles` (production cycles; 0 means unset/disabled)
+*   `planet.slave_unrest_population_loss` (fixed population units; 0 means unset/disabled)
+*   `galactic_exchange_liquidity_credits` (nonnegative CRD liquidity target; default 0; explicit engine injections are recorded as `SYSTEM_LIQUIDITY`; zero means no system liquidity injection)
+*   `shipyard_used_resale_factor_bp` (integer 0–10000 basis points; default 8000; used-hull purchase price only)
+
+Slave-unrest values default to zero (unset). A daily persisted evaluator is
+scheduled, but production stoppages and population loss remain inactive until
+the recurrence, duration and loss values are all configured. Losses use the
+approved deterministic proportional integer allocation across assignments.
 
 ## 3. Command Allow-List
 

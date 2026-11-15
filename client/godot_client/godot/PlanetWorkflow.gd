@@ -9,6 +9,7 @@ signal command_requested(command: String, data: Dictionary, label: String, mutat
 var _planet_id := 0
 var _sector_id := 0
 var _citadel_level := -1
+var _surface_identity_confirmed := false
 var _busy := false
 var _pickup_limit := 0
 var _dropoff_limit := 0
@@ -35,8 +36,13 @@ var _labor_status: Label
 var _labor_ore: SpinBox
 var _labor_organics: SpinBox
 var _labor_equipment: SpinBox
+var _labor_weapons: SpinBox
 var _labor_save: Button
-var _labor_max := {"ore": 0, "organics": 0, "equipment": 0}
+var _fighter_quantity: SpinBox
+var _fighter_to_planet: Button
+var _fighter_to_ship: Button
+var _management_controls: Array[Control] = []
+var _labor_max := {"ore": 0, "organics": 0, "equipment": 0, "weapons": 0}
 var _dim: ColorRect
 
 func _ready() -> void:
@@ -151,6 +157,7 @@ func _ready() -> void:
 	_dropoff.pressed.connect(_confirm_transfer.bind("dropoff"))
 	transfer_row.add_child(_dropoff)
 	_build_management_controls(column)
+	_apply_terra_surface_policy()
 	resized.connect(_update_responsive_layout)
 	call_deferred("_update_responsive_layout")
 
@@ -176,6 +183,9 @@ func _update_responsive_layout() -> void:
 	_transfer_row.vertical = compact
 	_transfer_row.add_theme_constant_override("separation", 6 if compact else 10)
 	_quantity.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_fighter_quantity.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_fighter_to_planet.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_fighter_to_ship.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_pickup.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_dropoff.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_stock_commodity.size_flags_horizontal = Control.SIZE_EXPAND_FILL
@@ -185,10 +195,20 @@ func _update_responsive_layout() -> void:
 	_stock_row_layout(compact)
 	_labor_row_layout(compact)
 
-func open_planet(planet_id: int) -> void:
-	if planet_id <= 0:
+func open_planet(planet_id: Variant) -> void:
+	# Planet IDs are server-owned JSON integers. Keep malformed metadata from
+	# being coerced into a valid target before the first surface read.
+	if typeof(planet_id) != TYPE_INT or int(planet_id) <= 0:
+		# A stale surface must not remain actionable when a later selection loses
+		# its authoritative identity. Hide the existing workflow and retire its
+		# local identity before returning; no request is sent for malformed data.
+		_planet_id = 0
+		_surface_identity_confirmed = false
+		visible = false
 		return
-	_planet_id = planet_id
+	_planet_id = int(planet_id)
+	_apply_terra_surface_policy()
+	_surface_identity_confirmed = false
 	_sector_id = 0
 	_citadel_level = -1
 	visible = true
@@ -210,19 +230,50 @@ func _request_details() -> void:
 	command_requested.emit("planet.colonists.get", {"planet_id": _planet_id}, "Colony and cargo information", false)
 
 func set_planet_info(data: Dictionary) -> void:
-	_sector_id = int(data.get("sector_id", _sector_id))
-	_citadel_level = int(data.get("citadel_level", data.get("level", -1)))
+	var reported_planet_id := _authoritative_planet_id(data)
+	if reported_planet_id != _planet_id:
+		_set_surface_identity_confirmed(false)
+		_info_label.text = "Planet information was not applied because the server response did not identify the confirmed planet."
+		_development_status.text = "Planet development records are unavailable until the confirmed planet is refreshed."
+		return
+	# A disclosed sector is also server-owned identity. The authoritative
+	# planet.info record includes it; omission is a partial refresh and must not
+	# leave a stale surface actionable after landing or reconnect.
+	if not data.has("sector_id"):
+		_set_surface_identity_confirmed(false)
+		_info_label.text = "Planet information was not applied because the server did not identify its sector."
+		_development_status.text = "Planet development records are unavailable until the confirmed planet is refreshed."
+		return
+	var reported_sector_id: Variant = data.get("sector_id")
+	var sector_id_valid: bool = (typeof(reported_sector_id) == TYPE_INT and int(reported_sector_id) > 0) \
+		or (typeof(reported_sector_id) == TYPE_FLOAT and is_finite(reported_sector_id) and reported_sector_id > 0.0 and reported_sector_id == floor(reported_sector_id))
+	if not sector_id_valid:
+		_set_surface_identity_confirmed(false)
+		_info_label.text = "Planet information was not applied because the server returned an invalid sector ID."
+		_development_status.text = "Planet development records are unavailable until the confirmed planet is refreshed."
+		return
+	_sector_id = int(reported_sector_id)
+	_set_surface_identity_confirmed(true)
+	_apply_terra_surface_policy()
+	# Development actions must remain unavailable unless the server supplied a
+	# real non-negative integer level.  Coercing strings/bools here could enable
+	# a build/upgrade against stale or schema-mismatched state.
+	var raw_citadel_level: Variant = data.get("citadel_level", data.get("level", null))
+	var confirmed_citadel_level: Variant = _authoritative_nonnegative_int(raw_citadel_level)
+	_citadel_level = int(confirmed_citadel_level) if confirmed_citadel_level != null else -1
 	var lines: Array[String] = []
-	for key in ["name", "planet_name", "class", "type_name", "type_description", "owner", "owner_name", "owner_id", "sector_id", "citadel_level", "citadel"]:
+	for key in ["name", "planet_name", "class", "type_name", "type_description", "owner", "owner_name", "owner_id", "owner_type", "sector_id", "population", "population_type", "morale_status", "fighters", "citadel_level", "citadel"]:
 		if data.has(key):
 			lines.append("%s: %s" % [key.replace("_", " ").capitalize(), str(data[key])])
-	_labor_max = {"ore": int(data.get("max_colonists_ore", 0)), "organics": int(data.get("max_colonists_organics", 0)), "equipment": int(data.get("max_colonists_equipment", 0))}
+	_labor_max = {"ore": int(data.get("max_colonists_ore", 0)), "organics": int(data.get("max_colonists_organics", 0)), "equipment": int(data.get("max_colonists_equipment", 0)), "weapons": int(data.get("population", 0))}
 	_labor_ore.max_value = int(_labor_max["ore"])
 	_labor_organics.max_value = int(_labor_max["organics"])
 	_labor_equipment.max_value = int(_labor_max["equipment"])
+	_labor_weapons.max_value = int(_labor_max["weapons"])
 	_labor_ore.value = int(data.get("colonists_ore", 0))
 	_labor_organics.value = int(data.get("colonists_org", 0))
 	_labor_equipment.value = int(data.get("colonists_eq", 0))
+	_labor_weapons.value = int(data.get("colonists_weapons", 0))
 	_update_labor_limits(data)
 	_update_labor_summary(data)
 	_update_goods(data.get("goods", []))
@@ -264,9 +315,14 @@ func _update_goods(goods: Variant) -> void:
 	_update_development_controls()
 
 func set_colonist_state(data: Dictionary) -> void:
-	var planet_count: Variant = data.get("planet_colonists", null)
-	var ship_count: Variant = data.get("ship_colonists", null)
-	var holds: Variant = data.get("ship_holds_available", null)
+	var reported_planet_id := _authoritative_planet_id(data)
+	if reported_planet_id != _planet_id:
+		_set_surface_identity_confirmed(false)
+		_colonist_label.text = "Colony records were not applied because the server response did not identify the confirmed planet."
+		return
+	var planet_count: Variant = _authoritative_nonnegative_int(data.get("planet_colonists", null))
+	var ship_count: Variant = _authoritative_nonnegative_int(data.get("ship_colonists", null))
+	var holds: Variant = _authoritative_nonnegative_int(data.get("ship_holds_available", null))
 	_colonist_label.text = "Planet unassigned: %s   ·   Aboard ship: %s   ·   Free holds: %s" % [_display(planet_count), _display(ship_count), _display(holds)]
 	var pickup_max := 0
 	if planet_count != null and holds != null:
@@ -279,6 +335,39 @@ func set_colonist_state(data: Dictionary) -> void:
 	_quantity.value = 1
 	_update_labor_limits(data)
 
+func _authoritative_planet_id(data: Dictionary) -> int:
+	# Explicit identity fields take precedence. If one is present but malformed,
+	# fail closed instead of falling through to a legacy alias or another object.
+	for key in ["planet_id", "id"]:
+		if data.has(key):
+			var value: Variant = data.get(key)
+			if typeof(value) == TYPE_INT and int(value) > 0:
+				return int(value)
+			if typeof(value) == TYPE_FLOAT and is_finite(value) and value > 0.0 and value == floor(value):
+				return int(value)
+			return 0
+	var nested: Variant = data.get("planet", null)
+	if nested is Dictionary:
+		for key in ["planet_id", "id"]:
+			if nested.has(key):
+				var nested_value: Variant = nested.get(key)
+				if typeof(nested_value) == TYPE_INT and int(nested_value) > 0:
+					return int(nested_value)
+				if typeof(nested_value) == TYPE_FLOAT and is_finite(nested_value) and nested_value > 0.0 and nested_value == floor(nested_value):
+					return int(nested_value)
+				return 0
+	return 0
+
+func _authoritative_nonnegative_int(value: Variant) -> Variant:
+	# JSON booleans, strings, floats and negative values are not authoritative
+	# integer measurements. Integral JSON floats are valid because the server's
+	# JSON encoder commonly emits database numeric values that way.
+	if typeof(value) == TYPE_INT and int(value) >= 0:
+		return int(value)
+	if typeof(value) == TYPE_FLOAT and is_finite(value) and value >= 0.0 and value == floor(value):
+		return int(value)
+	return null
+
 func set_busy(busy: bool) -> void:
 	_busy = busy
 	_quantity.editable = not busy
@@ -286,17 +375,21 @@ func set_busy(busy: bool) -> void:
 	_labor_ore.editable = not busy
 	_labor_organics.editable = not busy
 	_labor_equipment.editable = not busy
+	_labor_weapons.editable = not busy
 	_stock_commodity.disabled = busy
-	_rename_button.disabled = busy
+	_fighter_quantity.editable = not busy
+	_fighter_to_planet.disabled = busy or not _surface_identity_confirmed or _planet_id <= 0
+	_fighter_to_ship.disabled = busy or not _surface_identity_confirmed or _planet_id <= 0
+	_rename_button.disabled = busy or not _surface_identity_confirmed or _planet_id <= 0
 	_update_transfer_buttons()
 	_update_development_controls()
 
 func _update_transfer_buttons() -> void:
-	_pickup.disabled = _busy or _pickup_limit <= 0
-	_dropoff.disabled = _busy or _dropoff_limit <= 0
+	_pickup.disabled = _busy or not _surface_identity_confirmed or _pickup_limit <= 0
+	_dropoff.disabled = _is_terra() or _busy or not _surface_identity_confirmed or _dropoff_limit <= 0
 
 func _confirm_transfer(action: String) -> void:
-	if _planet_id <= 0 or _busy or _quantity.value < 1:
+	if _planet_id <= 0 or not _surface_identity_confirmed or _busy or _quantity.value < 1:
 		return
 	var maximum := _pickup_limit if action == "pickup" else _dropoff_limit
 	if maximum <= 0:
@@ -316,10 +409,11 @@ func _confirm_transfer(action: String) -> void:
 	DialogLayout.popup(dialog, Vector2i(500, 210))
 
 func _launch_now() -> void:
-	if not _busy and _planet_id > 0:
+	if not _busy and _surface_identity_confirmed and _planet_id > 0:
 		command_requested.emit("planet.launch", {}, "Launch from planet", true)
 
 func _build_management_controls(column: VBoxContainer) -> void:
+	var management_start := column.get_child_count()
 	var separator := HSeparator.new()
 	column.add_child(separator)
 	var title := Label.new()
@@ -370,6 +464,8 @@ func _build_management_controls(column: VBoxContainer) -> void:
 	labor_row.add_child(_labor_organics)
 	_labor_equipment = _labor_spinbox("Equipment workers")
 	labor_row.add_child(_labor_equipment)
+	_labor_weapons = _labor_spinbox("Weapons / fighter workers")
+	labor_row.add_child(_labor_weapons)
 	_labor_save = Button.new()
 	_labor_save.text = "ASSIGN WORKERS"
 	_labor_save.disabled = true
@@ -377,10 +473,41 @@ func _build_management_controls(column: VBoxContainer) -> void:
 	_labor_save.pressed.connect(_save_labor_assignments)
 	column.add_child(_labor_save)
 	var labor_hint := Label.new()
-	labor_hint.text = "Production runs on the server's planet growth tick (about every 10 minutes). Unassigned colonists remain available for later jobs or citadel construction."
+	labor_hint.text = "Production runs on the server's planet growth tick (about every 10 minutes). Weapons workers produce fighters only when the server's citadel, equipment and capacity requirements are met. Unassigned colonists remain available for later jobs or citadel construction."
 	labor_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	labor_hint.add_theme_color_override("font_color", Color(0.66, 0.74, 0.76))
 	column.add_child(labor_hint)
+	var fighter_title := Label.new()
+	fighter_title.text = "PLANET FIGHTER TRANSFER"
+	fighter_title.add_theme_color_override("font_color", Color(0.48, 0.86, 0.84))
+	column.add_child(fighter_title)
+	var fighter_row := BoxContainer.new()
+	fighter_row.add_theme_constant_override("separation", 8)
+	column.add_child(fighter_row)
+	_fighter_quantity = SpinBox.new()
+	_fighter_quantity.min_value = 1
+	_fighter_quantity.max_value = 1000000
+	_fighter_quantity.step = 1
+	_fighter_quantity.value = 1
+	_fighter_quantity.prefix = "Fighters: "
+	_fighter_quantity.focus_mode = Control.FOCUS_ALL
+	_fighter_quantity.get_line_edit().select_all_on_focus = true
+	fighter_row.add_child(_fighter_quantity)
+	_fighter_to_planet = Button.new()
+	_fighter_to_planet.text = "SHIP → PLANET"
+	_apply_button_style(_fighter_to_planet, false)
+	_fighter_to_planet.pressed.connect(_confirm_fighter_transfer.bind("ship_to_planet"))
+	fighter_row.add_child(_fighter_to_planet)
+	_fighter_to_ship = Button.new()
+	_fighter_to_ship.text = "PLANET → SHIP"
+	_apply_button_style(_fighter_to_ship, false)
+	_fighter_to_ship.pressed.connect(_confirm_fighter_transfer.bind("planet_to_ship"))
+	fighter_row.add_child(_fighter_to_ship)
+	var fighter_hint := Label.new()
+	fighter_hint.text = "The server verifies planet ownership, landing, available fighters and ship capacity."
+	fighter_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	fighter_hint.add_theme_color_override("font_color", Color(0.66, 0.74, 0.76))
+	column.add_child(fighter_hint)
 	var stock_row := BoxContainer.new()
 	stock_row.add_theme_constant_override("separation", 10)
 	column.add_child(stock_row)
@@ -419,6 +546,20 @@ func _build_management_controls(column: VBoxContainer) -> void:
 	note.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	note.add_theme_color_override("font_color", Color(0.59, 0.68, 0.7))
 	column.add_child(note)
+	for index in range(management_start, column.get_child_count()):
+		_management_controls.append(column.get_child(index))
+
+func _is_terra() -> bool:
+	return _planet_id == 1
+
+func _apply_terra_surface_policy() -> void:
+	var terra := _is_terra()
+	for control in _management_controls:
+		if is_instance_valid(control):
+			control.visible = not terra
+	if is_instance_valid(_dropoff):
+		_dropoff.visible = not terra
+		_dropoff.disabled = terra or _busy or not _surface_identity_confirmed or _dropoff_limit <= 0
 
 func _stock_row_layout(compact: bool) -> void:
 	if not is_instance_valid(_stock_commodity):
@@ -451,19 +592,20 @@ func _labor_row_layout(compact: bool) -> void:
 	if row:
 		row.vertical = compact
 		row.add_theme_constant_override("separation", 5 if compact else 8)
-	for spin in [_labor_ore, _labor_organics, _labor_equipment]:
+	for spin in [_labor_ore, _labor_organics, _labor_equipment, _labor_weapons]:
 		spin.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 
 func _update_labor_limits(data: Dictionary) -> void:
 	if not is_instance_valid(_labor_ore):
 		return
 	var unassigned := int(data.get("colonists_unassigned", data.get("planet_colonists", 0)))
-	var assigned := int(_labor_ore.value) + int(_labor_organics.value) + int(_labor_equipment.value)
+	var assigned := int(_labor_ore.value) + int(_labor_organics.value) + int(_labor_equipment.value) + int(_labor_weapons.value)
 	var available_population := maxi(0, unassigned + assigned)
 	for entry in [
 		{"field": "ore", "spin": _labor_ore},
 		{"field": "organics", "spin": _labor_organics},
 		{"field": "equipment", "spin": _labor_equipment},
+		{"field": "weapons", "spin": _labor_weapons},
 	]:
 		var class_limit := int(_labor_max[entry["field"]])
 		var population_limit := maxi(available_population, int(entry["spin"].value))
@@ -476,9 +618,10 @@ func _update_labor_summary(data: Dictionary) -> void:
 	var ore_rate := int(data.get("colonists_ore", 0))
 	var org_rate := int(data.get("colonists_org", 0)) * int(data.get("organics_production_per_worker", 0))
 	var equipment_rate := int(data.get("colonists_eq", 0)) * int(data.get("equipment_production_per_worker", 0))
-	_labor_status.text = "Unassigned: %s · Workers — ore %s, organics %s, equipment %s\nEstimated per growth tick: ore %s, organics %s, equipment %s" % [
+	_labor_status.text = "Unassigned: %s · Workers — ore %s, organics %s, equipment %s, weapons %s\nEstimated per growth tick: ore %s, organics %s, equipment %s. Fighter output also depends on citadel level, EQU stock and planet capacity." % [
 		_format_count(unassigned), _format_count(int(data.get("colonists_ore", 0))),
 		_format_count(int(data.get("colonists_org", 0))), _format_count(int(data.get("colonists_eq", 0))),
+		_format_count(int(data.get("colonists_weapons", 0))),
 		_format_count(ore_rate), _format_count(org_rate), _format_count(equipment_rate)
 	]
 	_labor_save.disabled = _busy or _planet_id <= 0
@@ -493,7 +636,8 @@ func _save_labor_assignments() -> void:
 		"planet_id": _planet_id,
 		"ore": int(_labor_ore.value),
 		"organics": int(_labor_organics.value),
-		"equipment": int(_labor_equipment.value)
+		"equipment": int(_labor_equipment.value),
+		"weapons": int(_labor_weapons.value)
 	}, "Assign planet workers", true)
 
 func _update_development_controls() -> void:
@@ -502,7 +646,7 @@ func _update_development_controls() -> void:
 	var at_maximum := _citadel_level >= 6
 	var has_state := _citadel_level >= 0
 	_citadel_button.text = "BUILD CITADEL" if _citadel_level <= 0 else "UPGRADE CITADEL · LEVEL %d" % (_citadel_level + 1)
-	_citadel_button.disabled = _busy or not has_state or at_maximum
+	_citadel_button.disabled = _busy or not _surface_identity_confirmed or not has_state or at_maximum
 	if at_maximum:
 		_development_status.text = "Citadel level 6 · maximum level reached."
 	elif has_state:
@@ -512,16 +656,27 @@ func _update_development_controls() -> void:
 	var credits_selected := str(_stock_commodity.get_item_metadata(_stock_commodity.selected)) == "CREDITS"
 	var stock_code := str(_stock_commodity.get_item_metadata(_stock_commodity.selected))
 	var treasury_locked := credits_selected and _citadel_level < 1
-	_stock_deposit.disabled = _busy or treasury_locked or stock_code.is_empty()
-	_stock_withdraw.disabled = _busy or treasury_locked or stock_code.is_empty()
+	_stock_deposit.disabled = _busy or not _surface_identity_confirmed or treasury_locked or stock_code.is_empty()
+	_stock_withdraw.disabled = _busy or not _surface_identity_confirmed or treasury_locked or stock_code.is_empty()
 	if treasury_locked:
 		_stock_deposit.tooltip_text = "A citadel is required for planet credits storage."
 		_stock_withdraw.tooltip_text = "A citadel is required for treasury withdrawals."
 	else:
 		_stock_deposit.tooltip_text = "The server validates ownership, cargo, and accepted commodities."
 		_stock_withdraw.tooltip_text = "The server validates planet stock and available ship holds."
-	_rename_button.disabled = _busy or _planet_id <= 0
-	_labor_save.disabled = _busy or _planet_id <= 0
+	_rename_button.disabled = _busy or not _surface_identity_confirmed or _planet_id <= 0
+	_labor_save.disabled = _busy or not _surface_identity_confirmed or _planet_id <= 0
+
+func _set_surface_identity_confirmed(confirmed: bool) -> void:
+	_surface_identity_confirmed = confirmed
+	if not confirmed:
+		_pickup_limit = 0
+		_dropoff_limit = 0
+	_update_transfer_buttons()
+	_update_development_controls()
+	if is_instance_valid(_fighter_to_planet):
+		_fighter_to_planet.disabled = _busy or not confirmed or _planet_id <= 0
+		_fighter_to_ship.disabled = _busy or not confirmed or _planet_id <= 0
 
 func _confirm_citadel_construction() -> void:
 	if _busy or _planet_id <= 0 or _citadel_level < 0 or _citadel_level >= 6:
@@ -552,6 +707,27 @@ func _send_stock_transfer(command: String) -> void:
 		"commodity": commodity,
 		"quantity": int(_stock_quantity.value),
 	}, "Deposit %s" % commodity if command == "planet.deposit" else "Withdraw %s" % commodity, true)
+
+func _confirm_fighter_transfer(direction: String) -> void:
+	if _busy or _planet_id <= 0 or int(_fighter_quantity.value) < 1:
+		return
+	var quantity := int(_fighter_quantity.value)
+	var direction_label := "ship to planet" if direction == "ship_to_planet" else "planet to ship"
+	var dialog := ConfirmationDialog.new()
+	dialog.title = "Transfer fighters"
+	dialog.dialog_text = "Transfer %d fighters (%s)? The server checks your ownership, landing, stock and ship capacity." % [quantity, direction_label]
+	dialog.ok_button_text = "CONFIRM TRANSFER"
+	add_child(dialog)
+	dialog.confirmed.connect(func() -> void:
+		command_requested.emit("planet.fighters.transfer", {
+			"planet_id": _planet_id,
+			"direction": direction,
+			"quantity": quantity,
+		}, "Planet fighter transfer", true)
+		dialog.queue_free()
+	)
+	dialog.canceled.connect(dialog.queue_free)
+	DialogLayout.popup(dialog, Vector2i(560, 230))
 
 func _open_rename_dialog() -> void:
 	if _busy or _planet_id <= 0:

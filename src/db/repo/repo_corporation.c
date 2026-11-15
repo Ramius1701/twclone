@@ -61,8 +61,10 @@ int repo_corp_get_bank_account_id(db_t *db, int corp_id) {
     db_res_t *res = NULL;
     db_error_t err;
     int account_id = -1;
-    /* SQL_VERBATIM: Q4 */
-    const char *q4 = "SELECT bank_accounts_id FROM bank_accounts WHERE owner_type = 'corp' AND owner_id = {1};";
+    const char *id_column = sql_bank_account_id_column(db);
+    if (!id_column) return ERR_NOT_IMPLEMENTED;
+    char q4[256];
+    snprintf(q4, sizeof(q4), "SELECT %s FROM bank_accounts WHERE owner_type = 'corp' AND owner_id = {1};", id_column);
     char sql[512]; sql_build(db, q4, sql, sizeof(sql));
     if (db_query(db, sql, (db_bind_t[]){ db_bind_i64(corp_id) }, 1, &res, &err) && db_res_step(res, &err)) {
         account_id = db_res_col_i32(res, 0, &err);
@@ -137,9 +139,22 @@ int repo_corp_add_shares(db_t *db, int player_id, int equity_id, int quantity_ch
     const char *q_ins = "INSERT INTO corp_shareholders (player_id, corp_id, shares) VALUES ({1}, (SELECT corp_id FROM stocks WHERE id = {2}), {3});";
     char sql_ins[512]; sql_build(db, q_ins, sql_ins, sizeof(sql_ins));
     if (!db_exec(db, sql_ins, (db_bind_t[]){ db_bind_i64(player_id), db_bind_i64(equity_id), db_bind_i64(quantity_change) }, 3, &err)) {
-        if (err.code == ERR_DB_CONSTRAINT) {
-            /* Race condition: retry update */
-            return repo_corp_add_shares(db, player_id, equity_id, quantity_change);
+        if (err.category == DB_ERR_CAT_CONSTRAINT) {
+            /* A unique/check conflict can be the concurrent update race.
+             * Foreign-key failures are permanent data errors and must be
+             * returned to the caller; retrying them recursively can exhaust
+             * the server stack. */
+            db_error_t retry_err;
+            int64_t retry_rows = 0;
+            if (db_exec_rows_affected(db, sql_upd,
+                                      (db_bind_t[]){
+                                        db_bind_i64(quantity_change),
+                                        db_bind_i64(player_id),
+                                        db_bind_i64(equity_id)
+                                      }, 3, &retry_rows, &retry_err)
+                && retry_rows > 0)
+                return 0;
+            return retry_err.code ? retry_err.code : err.code;
         }
         return err.code;
     }
@@ -183,6 +198,292 @@ int repo_corp_check_member_role(db_t *db, int corp_id, int player_id, char *role
     if (res) db_res_finalize(res);
     role_buffer[0] = '\0';
     return ERR_DB_NOT_FOUND;
+}
+
+int repo_corp_lock_member_role(db_t *db, int corp_id, int player_id,
+                               char *role_buffer, size_t buffer_size) {
+    if (!db || corp_id <= 0 || player_id <= 0 || !role_buffer
+        || buffer_size == 0 || db->tx_nest_level <= 0)
+        return ERR_INVALID_ARG;
+    role_buffer[0] = '\0';
+    db_res_t *res = NULL;
+    db_error_t err = {0};
+    const char *query = "SELECT role FROM corp_members WHERE corporation_id = {1} AND player_id = {2} FOR UPDATE;";
+    char sql[512];
+    if (sql_build(db, query, sql, sizeof(sql)) != 0)
+        return ERR_DB_QUERY_FAILED;
+    if (!db_query(db, sql,
+                  (db_bind_t[]){ db_bind_i64(corp_id), db_bind_i64(player_id) },
+                  2, &res, &err))
+        return err.code ? err.code : ERR_DB_QUERY_FAILED;
+    if (!db_res_step(res, &err)) {
+        db_res_finalize(res);
+        return err.code ? err.code : ERR_DB_NOT_FOUND;
+    }
+    const char *role = db_res_col_text(res, 0, &err);
+    if (role) {
+        strncpy(role_buffer, role, buffer_size - 1);
+        role_buffer[buffer_size - 1] = '\0';
+    }
+    db_res_finalize(res);
+    return err.code;
+}
+
+repo_corp_transfer_result_t
+repo_corp_transfer_member_asset (db_t *db, int sender_id, int recipient_id,
+                                const char *asset, int64_t quantity,
+                                int64_t *sender_remaining,
+                                int64_t *recipient_total)
+{
+    if (!db || sender_id <= 0 || recipient_id <= 0
+        || sender_id == recipient_id || !asset || quantity <= 0)
+        return REPO_CORP_TRANSFER_INVALID;
+    bool is_credits = strcmp (asset, "credits") == 0;
+    bool is_fighters = strcmp (asset, "fighters") == 0;
+    bool is_mines = strcmp (asset, "mines") == 0;
+    bool is_shields = strcmp (asset, "shields") == 0;
+    if (!is_credits && !is_fighters && !is_mines && !is_shields)
+        return REPO_CORP_TRANSFER_INVALID;
+
+    db_error_t err = {0};
+    if (!db_tx_begin (db, DB_TX_DEFAULT, &err))
+        return REPO_CORP_TRANSFER_DATABASE;
+    repo_corp_transfer_result_t result = REPO_CORP_TRANSFER_DATABASE;
+    int player_sector[2] = {0, 0}, player_ship[2] = {0, 0};
+    int64_t player_credits[2] = {0, 0};
+    int corp_ids[2] = {0, 0};
+    int ship_sector[2] = {0, 0}, ship_owner[2] = {0, 0};
+    int destroyed[2] = {1, 1};
+    int64_t fighters[2] = {0, 0}, mines[2] = {0, 0};
+    int64_t shields[2] = {0, 0}, installed_shields[2] = {0, 0};
+    int64_t max_fighters[2] = {0, 0}, max_mines[2] = {0, 0};
+    int64_t max_shields[2] = {0, 0};
+    int64_t rows = 0;
+    db_res_t *res = NULL;
+    char sql[1536], qtemplate[1536];
+    const char *for_update = sql_for_update (db);
+    if (!for_update)
+        goto rollback;
+
+    /* Lock players in a stable order before membership and ship rows. */
+    const char *players_query =
+      "SELECT player_id, COALESCE(sector_id,0), COALESCE(ship_id,0), "
+      "COALESCE(credits,0) FROM players WHERE player_id IN ({1},{2}) "
+      "ORDER BY player_id";
+    if (snprintf (qtemplate, sizeof qtemplate, "%s%s", players_query, for_update)
+        >= (int) sizeof qtemplate || sql_build (db, qtemplate, sql, sizeof sql) != 0)
+        goto rollback;
+    if (!db_query (db, sql,
+                   (db_bind_t[]){db_bind_i64 (sender_id),
+                                 db_bind_i64 (recipient_id)},
+                   2, &res, &err))
+        goto rollback;
+    int player_count = 0;
+    while (db_res_step (res, &err))
+      {
+        int id = db_res_col_i32 (res, 0, &err);
+        int ix = id == sender_id ? 0 : id == recipient_id ? 1 : -1;
+        if (ix < 0 || player_count >= 2)
+          {
+            db_res_finalize (res);
+            res = NULL;
+            goto rollback;
+          }
+        player_sector[ix] = db_res_col_i32 (res, 1, &err);
+        player_ship[ix] = db_res_col_i32 (res, 2, &err);
+        player_credits[ix] = db_res_col_i64 (res, 3, &err);
+        player_count++;
+      }
+    db_res_finalize (res);
+    res = NULL;
+    if (err.code || player_count != 2)
+      {
+        result = err.code ? REPO_CORP_TRANSFER_DATABASE
+                          : REPO_CORP_TRANSFER_INVALID;
+        goto rollback;
+      }
+    if (player_sector[0] <= 0 || player_sector[0] != player_sector[1])
+      {
+        result = REPO_CORP_TRANSFER_INVALID;
+        goto rollback;
+      }
+
+    const char *members_query =
+      "SELECT player_id, corporation_id FROM corp_members "
+      "WHERE player_id IN ({1},{2}) ORDER BY player_id";
+    if (snprintf (qtemplate, sizeof qtemplate, "%s%s", members_query, for_update)
+        >= (int) sizeof qtemplate || sql_build (db, qtemplate, sql, sizeof sql) != 0)
+        goto rollback;
+    if (!db_query (db, sql,
+                   (db_bind_t[]){db_bind_i64 (sender_id),
+                                 db_bind_i64 (recipient_id)},
+                   2, &res, &err))
+        goto rollback;
+    int member_count = 0;
+    while (db_res_step (res, &err))
+      {
+        int id = db_res_col_i32 (res, 0, &err);
+        int ix = id == sender_id ? 0 : id == recipient_id ? 1 : -1;
+        if (ix < 0 || member_count >= 2)
+          {
+            db_res_finalize (res);
+            res = NULL;
+            goto rollback;
+          }
+        corp_ids[ix] = db_res_col_i32 (res, 1, &err);
+        member_count++;
+      }
+    db_res_finalize (res);
+    res = NULL;
+    if (err.code || member_count != 2 || corp_ids[0] <= 0
+        || corp_ids[0] != corp_ids[1])
+      {
+        result = err.code ? REPO_CORP_TRANSFER_DATABASE
+                          : REPO_CORP_TRANSFER_INVALID;
+        goto rollback;
+      }
+
+    if (!is_credits)
+      {
+        const char *ships_query =
+          "SELECT s.ship_id, s.sector_id, op.player_id, s.destroyed, "
+          "COALESCE(s.fighters,0), COALESCE(s.mines,0), "
+          "COALESCE(s.shields,0), COALESCE(s.installed_shields,0), "
+          "COALESCE(st.maxfighters,0), COALESCE(st.maxmines,0), "
+          "COALESCE(st.maxshields,0) FROM ships s "
+          "JOIN shiptypes st ON st.shiptypes_id=s.type_id "
+          "JOIN ship_ownership op ON op.ship_id=s.ship_id AND op.role_id=1 "
+          "AND op.is_primary=TRUE WHERE s.ship_id IN ({1},{2}) "
+          "ORDER BY s.ship_id";
+        if (snprintf (qtemplate, sizeof qtemplate, "%s%s", ships_query, for_update)
+            >= (int) sizeof qtemplate || sql_build (db, qtemplate, sql, sizeof sql) != 0)
+          goto rollback;
+        if (!db_query (db, sql,
+                       (db_bind_t[]){db_bind_i64 (player_ship[0]),
+                                     db_bind_i64 (player_ship[1])},
+                       2, &res, &err))
+          goto rollback;
+        int ship_count = 0;
+        while (db_res_step (res, &err))
+          {
+            int id = db_res_col_i32 (res, 0, &err);
+            int ix = id == player_ship[0] ? 0 : id == player_ship[1] ? 1 : -1;
+            if (ix < 0 || ship_count >= 2)
+              {
+                db_res_finalize (res);
+                res = NULL;
+                goto rollback;
+              }
+            ship_sector[ix] = db_res_col_i32 (res, 1, &err);
+            ship_owner[ix] = db_res_col_i32 (res, 2, &err);
+            destroyed[ix] = db_res_col_i32 (res, 3, &err);
+            fighters[ix] = db_res_col_i64 (res, 4, &err);
+            mines[ix] = db_res_col_i64 (res, 5, &err);
+            shields[ix] = db_res_col_i64 (res, 6, &err);
+            installed_shields[ix] = db_res_col_i64 (res, 7, &err);
+            max_fighters[ix] = db_res_col_i64 (res, 8, &err);
+            max_mines[ix] = db_res_col_i64 (res, 9, &err);
+            max_shields[ix] = db_res_col_i64 (res, 10, &err);
+            ship_count++;
+          }
+        db_res_finalize (res);
+        res = NULL;
+        if (err.code || ship_count != 2)
+          {
+            result = err.code ? REPO_CORP_TRANSFER_DATABASE
+                              : REPO_CORP_TRANSFER_INVALID;
+            goto rollback;
+          }
+        for (int i = 0; i < 2; ++i)
+          if (player_ship[i] <= 0 || destroyed[i]
+              || ship_owner[i] != (i == 0 ? sender_id : recipient_id)
+              || ship_sector[i] != player_sector[i])
+            {
+              result = REPO_CORP_TRANSFER_INVALID;
+              goto rollback;
+            }
+      }
+
+    const char *sender_sql = NULL, *recipient_sql = NULL;
+    db_bind_t sender_params[3], recipient_params[3];
+    size_t sender_n = 0, recipient_n = 0;
+    int64_t from_value = 0, to_value = 0, to_limit = 0;
+    if (is_credits)
+      {
+        from_value = player_credits[0];
+        to_value = player_credits[1];
+        if (to_value > INT64_MAX - quantity)
+          {
+            result = REPO_CORP_TRANSFER_CAPACITY;
+            goto rollback;
+          }
+        sender_sql = "UPDATE players SET credits=credits-{1} WHERE player_id={2} AND credits >= {1}";
+        recipient_sql = "UPDATE players SET credits=credits+{1} WHERE player_id={2}";
+        sender_params[0]=db_bind_i64(quantity); sender_params[1]=db_bind_i64(sender_id); sender_n=2;
+        recipient_params[0]=db_bind_i64(quantity); recipient_params[1]=db_bind_i64(recipient_id); recipient_n=2;
+      }
+    else
+      {
+        const char *field = is_fighters ? "fighters" : is_mines ? "mines" : "shields";
+        from_value = is_fighters ? fighters[0] : is_mines ? mines[0] : shields[0];
+        to_value = is_fighters ? fighters[1] : is_mines ? mines[1] : shields[1];
+        to_limit = is_fighters ? max_fighters[1] : is_mines ? max_mines[1]
+          : (installed_shields[1] < max_shields[1]
+             ? installed_shields[1] : max_shields[1]);
+        if (quantity > INT32_MAX || to_value > to_limit
+            || quantity > to_limit - to_value)
+          {
+            result = REPO_CORP_TRANSFER_CAPACITY;
+            goto rollback;
+          }
+        snprintf (qtemplate, sizeof qtemplate,
+                  "UPDATE ships SET %s=%s-{1} WHERE ship_id={2} AND %s >= {1}",
+                  field, field, field);
+        sender_sql = qtemplate;
+        sender_params[0]=db_bind_i64(quantity); sender_params[1]=db_bind_i64(player_ship[0]); sender_n=2;
+        /* Build destination statement separately after source update. */
+        if (from_value < quantity)
+          {
+            result = REPO_CORP_TRANSFER_INSUFFICIENT;
+            goto rollback;
+          }
+      }
+    if (from_value < quantity)
+      {
+        result = REPO_CORP_TRANSFER_INSUFFICIENT;
+        goto rollback;
+      }
+    if (sql_build (db, sender_sql, sql, sizeof sql) != 0
+        || !db_exec_rows_affected (db, sql, sender_params, sender_n,
+                                   &rows, &err) || rows != 1)
+      goto rollback;
+    if (!is_credits)
+      {
+        const char *field = is_fighters ? "fighters" : is_mines ? "mines" : "shields";
+        snprintf (qtemplate, sizeof qtemplate,
+                  "UPDATE ships SET %s=%s+{1} WHERE ship_id={2}",
+                  field, field);
+        recipient_sql = qtemplate;
+        recipient_params[0]=db_bind_i64(quantity); recipient_params[1]=db_bind_i64(player_ship[1]); recipient_n=2;
+      }
+    if (sql_build (db, recipient_sql, sql, sizeof sql) != 0
+        || !db_exec_rows_affected (db, sql, recipient_params, recipient_n,
+                                   &rows, &err) || rows != 1)
+      goto rollback;
+
+    if (!db_tx_commit (db, &err))
+      {
+        db_tx_rollback (db, NULL);
+        return REPO_CORP_TRANSFER_DATABASE;
+      }
+    if (sender_remaining) *sender_remaining = from_value - quantity;
+    if (recipient_total) *recipient_total = to_value + quantity;
+    return REPO_CORP_TRANSFER_OK;
+
+rollback:
+    if (res) db_res_finalize (res);
+    db_tx_rollback (db, NULL);
+    return result;
 }
 
 int repo_corp_get_player_ship_type_name(db_t *db, int player_id, char *name_buffer, size_t buffer_size) {
@@ -302,7 +603,7 @@ int repo_corp_get_invite_expiry(db_t *db, int corp_id, int player_id, long long 
     db_res_t *res = NULL;
     db_error_t err;
     /* SQL_VERBATIM: Q21 */
-    const char *q21 = "SELECT expires_at FROM corp_invites WHERE corporation_id = {1} AND player_id = {2};";
+    const char *q21 = "SELECT EXTRACT(EPOCH FROM expires_at)::bigint FROM corp_invites WHERE corp_id = {1} AND player_id = {2};";
     char sql[512]; sql_build(db, q21, sql, sizeof(sql));
     if (db_query(db, sql, (db_bind_t[]){ db_bind_i64(corp_id), db_bind_i64(player_id) }, 2, &res, &err) && db_res_step(res, &err)) {
         if (expires_at) *expires_at = db_res_col_i64(res, 0, &err);
@@ -326,7 +627,7 @@ int repo_corp_insert_member_basic(db_t *db, int corp_id, int player_id, const ch
 int repo_corp_delete_invite(db_t *db, int corp_id, int player_id) {
     db_error_t err;
     /* SQL_VERBATIM: Q23 */
-    const char *q23 = "DELETE FROM corp_invites WHERE corporation_id = {1} AND player_id = {2};";
+    const char *q23 = "DELETE FROM corp_invites WHERE corp_id = {1} AND player_id = {2};";
     char sql[512]; sql_build(db, q23, sql, sizeof(sql));
     if (!db_exec(db, sql, (db_bind_t[]){ db_bind_i64(corp_id), db_bind_i64(player_id) }, 2, &err)) return err.code;
     return 0;

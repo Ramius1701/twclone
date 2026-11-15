@@ -86,7 +86,8 @@ repo_cargo_get_total (db_t *db, int32_t ship_id, int64_t *total_out)
   db_res_t *res = NULL;
   db_error_t err;
   char sql_converted[512];
-  sql_build (db, sql, sql_converted, sizeof (sql_converted));
+  if (sql_build (db, sql, sql_converted, sizeof (sql_converted)) != 0)
+    return ERR_DB_QUERY_FAILED;
 
   if (!db_query (db, sql_converted, params, 1, &res, &err))
     {
@@ -113,6 +114,8 @@ repo_cargo_get (db_t *db, int32_t ship_id, const char *commodity_code, int64_t *
 {
   if (!db || ship_id <= 0 || !commodity_code || !quantity_out)
     return ERR_DB_MISUSE;
+  if (!is_valid_commodity_code (commodity_code))
+    return ERR_INVALID_ARG;
 
   *quantity_out = 0;
 
@@ -133,7 +136,8 @@ repo_cargo_get (db_t *db, int32_t ship_id, const char *commodity_code, int64_t *
   db_res_t *res = NULL;
   db_error_t err;
   char sql_converted[512];
-  sql_build (db, sql, sql_converted, sizeof (sql_converted));
+  if (sql_build (db, sql, sql_converted, sizeof (sql_converted)) != 0)
+    return ERR_DB_QUERY_FAILED;
 
   if (!db_query (db, sql_converted, params, 2, &res, &err))
     {
@@ -155,8 +159,9 @@ repo_cargo_get (db_t *db, int32_t ship_id, const char *commodity_code, int64_t *
   return 0;
 }
 
-int
-repo_cargo_add (db_t *db, int32_t ship_id, const char *commodity_code, int64_t delta, int64_t *new_quantity_out)
+static int
+repo_cargo_add_unlocked (db_t *db, int32_t ship_id, const char *commodity_code,
+                         int64_t delta, int64_t *new_quantity_out)
 {
   if (!db || ship_id <= 0 || !commodity_code)
     return ERR_DB_MISUSE;
@@ -177,7 +182,8 @@ repo_cargo_add (db_t *db, int32_t ship_id, const char *commodity_code, int64_t d
     db_bind_t params[] = {db_bind_i32 (ship_id)};
     db_res_t *res = NULL;
     char sql_converted[256];
-    sql_build (db, sql, sql_converted, sizeof (sql_converted));
+    if (sql_build (db, sql, sql_converted, sizeof (sql_converted)) != 0)
+      return ERR_DB_QUERY_FAILED;
 
     if (!db_query (db, sql_converted, params, 1, &res, &err))
       return err.code;
@@ -200,10 +206,13 @@ repo_cargo_add (db_t *db, int32_t ship_id, const char *commodity_code, int64_t d
 
   /* Get current cargo quantities */
   int64_t current_qty = 0;
-  if (repo_cargo_get (db, ship_id, code_upper, &current_qty) != 0)
-    return ERR_DB_MISUSE;
+  int cargo_rc = repo_cargo_get (db, ship_id, code_upper, &current_qty);
+  if (cargo_rc != 0)
+    return cargo_rc;
 
-  int64_t new_qty = current_qty + delta;
+  int64_t new_qty = 0;
+  if (__builtin_add_overflow (current_qty, delta, &new_qty))
+    return ERR_INVALID_ARG;
 
   /* Validate: new quantity must be non-negative */
   if (new_qty < 0)
@@ -222,7 +231,8 @@ repo_cargo_add (db_t *db, int32_t ship_id, const char *commodity_code, int64_t d
     db_bind_t params[] = {db_bind_i32 (ship_id), db_bind_text (code_upper)};
     db_res_t *res = NULL;
     char sql_converted[512];
-    sql_build (db, sql, sql_converted, sizeof (sql_converted));
+    if (sql_build (db, sql, sql_converted, sizeof (sql_converted)) != 0)
+      return ERR_DB_QUERY_FAILED;
 
     if (!db_query (db, sql_converted, params, 2, &res, &err))
       return err.code;
@@ -240,7 +250,9 @@ repo_cargo_add (db_t *db, int32_t ship_id, const char *commodity_code, int64_t d
       db_res_finalize (res);
   }
 
-  int64_t total_after = total_other + new_qty;
+  int64_t total_after = 0;
+  if (__builtin_add_overflow (total_other, new_qty, &total_after))
+    return ERR_HOLD_FULL;
 
   /* Enforce holds capacity */
   if (total_after > (int64_t) holds)
@@ -266,7 +278,9 @@ repo_cargo_add (db_t *db, int32_t ship_id, const char *commodity_code, int64_t d
       };
       char sql_converted[512];
       int64_t rows_updated = 0;
-      sql_build (db, update_sql, sql_converted, sizeof (sql_converted));
+      if (sql_build (db, update_sql, sql_converted,
+                     sizeof (sql_converted)) != 0)
+        return ERR_DB_QUERY_FAILED;
       if (!db_exec_rows_affected (db, sql_converted, update_params, 3,
                                   &rows_updated, &err))
         {
@@ -282,7 +296,9 @@ repo_cargo_add (db_t *db, int32_t ship_id, const char *commodity_code, int64_t d
               db_bind_text (code_upper),
               db_bind_i64 (new_qty),
           };
-          sql_build (db, insert_sql, sql_converted, sizeof (sql_converted));
+          if (sql_build (db, insert_sql, sql_converted,
+                         sizeof (sql_converted)) != 0)
+            return ERR_DB_QUERY_FAILED;
           if (!db_exec (db, sql_converted, insert_params, 3, &err))
             return err.code;
         }
@@ -303,7 +319,8 @@ repo_cargo_add (db_t *db, int32_t ship_id, const char *commodity_code, int64_t d
           };
 
           char sql_converted[512];
-          sql_build (db, sql, sql_converted, sizeof (sql_converted));
+          if (sql_build (db, sql, sql_converted, sizeof (sql_converted)) != 0)
+            return ERR_DB_QUERY_FAILED;
 
           if (!db_exec (db, sql_converted, params, 2, &err))
             {
@@ -326,7 +343,8 @@ repo_cargo_add (db_t *db, int32_t ship_id, const char *commodity_code, int64_t d
           };
 
           char sql_converted[512];
-          sql_build (db, sql, sql_converted, sizeof (sql_converted));
+          if (sql_build (db, sql, sql_converted, sizeof (sql_converted)) != 0)
+            return ERR_DB_QUERY_FAILED;
 
           if (!db_exec (db, sql_converted, params, 3, &err))
             {
@@ -352,7 +370,9 @@ repo_cargo_add (db_t *db, int32_t ship_id, const char *commodity_code, int64_t d
         };
 
         char sql_converted[512];
-        sql_build (db, sql_buf, sql_converted, sizeof (sql_converted));
+        if (sql_build (db, sql_buf, sql_converted,
+                       sizeof (sql_converted)) != 0)
+          return ERR_DB_QUERY_FAILED;
 
         if (!db_exec (db, sql_converted, params, 2, &err))
           {
@@ -364,6 +384,81 @@ repo_cargo_add (db_t *db, int32_t ship_id, const char *commodity_code, int64_t d
   if (new_quantity_out)
     *new_quantity_out = new_qty;
 
+  return 0;
+}
+
+int
+repo_cargo_consume_locked (db_t *db, int32_t ship_id,
+                           const char *commodity_code, int64_t quantity)
+{
+  if (!db || db->tx_nest_level <= 0 || ship_id <= 0 || !commodity_code
+      || quantity < 0)
+    return ERR_INVALID_ARG;
+  if (quantity == 0)
+    return 0;
+  return repo_cargo_add_unlocked (db, ship_id, commodity_code, -quantity, NULL);
+}
+
+static int
+repo_cargo_lock_ship_for_update (db_t *db, int32_t ship_id)
+{
+  const char *query = "SELECT ship_id FROM ships WHERE ship_id = {1} FOR UPDATE;";
+  char sql[256];
+  if (sql_build (db, query, sql, sizeof sql) != 0)
+    return ERR_DB_QUERY_FAILED;
+  db_res_t *res = NULL;
+  db_error_t err = {0};
+  if (!db_query (db, sql, (db_bind_t[]){db_bind_i32 (ship_id)}, 1,
+                 &res, &err))
+    return err.code ? err.code : ERR_DB_QUERY_FAILED;
+  if (!db_res_step (res, &err))
+    {
+      db_res_finalize (res);
+      return err.code ? err.code : ERR_SHIP_NOT_FOUND;
+    }
+  int locked_id = db_res_col_i32 (res, 0, &err);
+  db_res_finalize (res);
+  return err.code ? err.code : (locked_id == ship_id ? 0 : ERR_SHIP_NOT_FOUND);
+}
+
+int
+repo_cargo_lock_ships_for_update (db_t *db, int32_t first_ship_id,
+                                  int32_t second_ship_id)
+{
+  if (!db || first_ship_id <= 0 || second_ship_id <= 0
+      || db->tx_nest_level <= 0)
+    return ERR_INVALID_ARG;
+  int32_t low = first_ship_id < second_ship_id ? first_ship_id : second_ship_id;
+  int32_t high = first_ship_id < second_ship_id ? second_ship_id : first_ship_id;
+  int rc = repo_cargo_lock_ship_for_update (db, low);
+  if (rc != 0)
+    return rc;
+  return low == high ? 0 : repo_cargo_lock_ship_for_update (db, high);
+}
+
+int
+repo_cargo_add (db_t *db, int32_t ship_id, const char *commodity_code,
+                int64_t delta, int64_t *new_quantity_out)
+{
+  if (!db || ship_id <= 0)
+    return ERR_DB_MISUSE;
+  db_error_t txerr = {0};
+  if (!db_tx_begin (db, DB_TX_DEFAULT, &txerr))
+    return txerr.code ? txerr.code : ERR_DB_TX;
+  int rc = repo_cargo_lock_ship_for_update (db, ship_id);
+  if (rc == 0)
+    rc = repo_cargo_add_unlocked (db, ship_id, commodity_code, delta,
+                                  new_quantity_out);
+  if (rc != 0)
+    {
+      db_tx_rollback (db, NULL);
+      return rc;
+    }
+  if (!db_tx_commit (db, &txerr))
+    {
+      db_tx_rollback (db, NULL);
+      return txerr.code ? txerr.code : ERR_DB_TX;
+    }
   return 0;
 }
 
@@ -382,7 +477,8 @@ repo_cargo_sync_legacy_columns (db_t *db, int32_t ship_id)
     db_bind_t params[] = {db_bind_i32 (ship_id)};
     db_res_t *res = NULL;
     char sql_converted[256];
-    sql_build (db, sql, sql_converted, sizeof (sql_converted));
+    if (sql_build (db, sql, sql_converted, sizeof (sql_converted)) != 0)
+      return ERR_DB_QUERY_FAILED;
 
     if (!db_query (db, sql_converted, params, 1, &res, &err))
       return err.code;
@@ -418,7 +514,9 @@ repo_cargo_sync_legacy_columns (db_t *db, int32_t ship_id)
       };
 
       char sql_converted[512];
-      sql_build (db, sql_buf, sql_converted, sizeof (sql_converted));
+      if (sql_build (db, sql_buf, sql_converted,
+                     sizeof (sql_converted)) != 0)
+        return ERR_DB_QUERY_FAILED;
 
       if (!db_exec (db, sql_converted, params, 2, &err))
         {

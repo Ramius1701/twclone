@@ -53,6 +53,8 @@ def load_scenarios(directory: Path = SCENARIO_DIR) -> list[dict[str, Any]]:
     for path in sorted(directory.glob("*.json")):
         with path.open(encoding="utf-8") as scenario_file:
             scenario = json.load(scenario_file)
+        if scenario.get("simulation_fixture") is False:
+            continue
         scenario["_source"] = path.name
         scenarios.append(scenario)
     return scenarios
@@ -262,6 +264,40 @@ def run_suite(scenarios: list[dict[str, Any]], profiles: list[str], runs: int = 
             "combat_success_rate": None,
         }
     return {"episodes": episodes, "summary": summary}
+
+
+def run_competition(scenarios: list[dict[str, Any]], profiles: list[str], rounds: int = 3,
+                    seed: int = 1) -> dict[str, Any]:
+    """Run deterministic head-to-head policy episodes and rank winners.
+
+    The offline world gives every player the same market/map fixture. This is
+    intentionally a policy gate rather than a fake server: it catches a
+    profile that cannot earn, survive hazards, or complete a route before a
+    live multi-player acceptance run is attempted.
+    """
+    episodes = []
+    for round_number in range(max(1, int(rounds))):
+        for profile in profiles:
+            for scenario in scenarios:
+                episodes.append(run_scenario(scenario, profile, seed + round_number))
+
+    leaderboard = {}
+    for profile in profiles:
+        rows = [row for row in episodes if row["profile"] == profile]
+        score = sum(
+            row["credits_final"] + (10000 if row["survived"] else 0)
+            - row["failed_actions"] * 1000
+            for row in rows
+        )
+        leaderboard[profile] = {
+            "episodes": len(rows),
+            "score": round(score, 2),
+            "survival_rate": round(sum(row["survived"] for row in rows) / len(rows), 3) if rows else 0,
+            "profit_credits": round(sum(row["profit_credits"] for row in rows), 2),
+        }
+    ranking = sorted(leaderboard, key=lambda profile: (-leaderboard[profile]["score"], profile))
+    return {"winner": ranking[0] if ranking else None, "ranking": ranking, "leaderboard": leaderboard,
+            "episodes": episodes}
 
 
 def main() -> None:

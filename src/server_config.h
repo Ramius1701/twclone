@@ -58,11 +58,16 @@ extern "C"
     /* Shipyard Configuration */
     int shipyard_enabled;
     int shipyard_trade_in_factor_bp;
+    int shipyard_sale_factor_bp;
+    int64_t galactic_exchange_liquidity_credits;
+    int shipyard_used_resale_factor_bp;
     int shipyard_require_cargo_fit;
     int shipyard_require_fighters_fit;
     int shipyard_require_shields_fit;
     int shipyard_require_hardware_compat;
     int shipyard_tax_bp;
+    int planet_market_buy_order_expiry_seconds;
+    int illegal_min_experience;
     /* Phase 4: Ship Types Configuration */
     char starter_shiptype_name[128];
   };
@@ -89,7 +94,20 @@ extern "C"
     int max_name_length;
     int planet_type_count;
     int server_port;
+    char server_bind_address[64];
+    int server_max_connections;
+    int server_max_request_bytes;
+    int server_request_timeout_ms;
+    int server_requests_per_minute;
     char pg_conn_str[512];
+    /* Bootstrap-only database selection. PostgreSQL remains the default. */
+    char db_backend[16];
+    char mysql_host[256];
+    char mysql_user[128];
+    char mysql_password[256];
+    char mysql_database[128];
+    char mysql_unix_socket[256];
+    unsigned int mysql_port;
 
 
     struct
@@ -203,13 +221,22 @@ extern "C"
     /* Shipyard Config */
     int shipyard_enabled;
     int shipyard_trade_in_factor_bp;
+    int shipyard_sale_factor_bp;
     int shipyard_require_cargo_fit;
     int shipyard_require_fighters_fit;
     int shipyard_require_shields_fit;
     int shipyard_require_hardware_compat;
     int shipyard_tax_bp;
+    int planet_market_buy_order_expiry_seconds;
+    /* Zero means unrest policy has not been configured; effects stay dormant. */
+    int64_t planet_slave_unrest_interval_days;
+    int64_t planet_slave_unrest_stoppage_cycles;
+    int64_t planet_slave_unrest_population_loss;
+    int64_t galactic_exchange_liquidity_credits;
+    int shipyard_used_resale_factor_bp;
     /* Misc */
     int illegal_allowed_neutral;
+    int illegal_min_experience;
     int max_ship_name_length;	/* Used in stardock */
     int num_sectors;		/* Added to match DB config */
     int density;		/* Added to match bigbang.json */

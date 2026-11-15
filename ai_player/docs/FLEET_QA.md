@@ -1,0 +1,80 @@
+# Bounded AI QA cohorts
+
+`fleet.py` runs the existing `main.py` controller once per already-provisioned
+ordinary player. Each source file is a normal `ai_player/config.json`-shaped
+configuration. The runner does not register accounts, equip ships, connect to a
+database, or grant privileges. Prepare one config per authorised player with a
+distinct username and credential; the runner rejects duplicates.
+Usernames used for fleet runs must be 1–64 ASCII letters, digits, underscores,
+or hyphens, beginning with a letter or digit, so each runtime directory stays
+within the run root.
+
+Example for a disposable isolated test server:
+
+```sh
+python3 ai_player/fleet.py \
+  --config-dir /secure/qa-player-configs \
+  --count 20 \
+  --max-concurrent 5 \
+  --duration-seconds 1800 \
+  --run-root /tmp/twclone-ai-qa
+```
+
+Before starting anything, validate a five-player set without creating runtime
+directories or contacting the game server:
+
+```sh
+python3 ai_player/fleet.py --config-dir /secure/qa-player-configs \
+  --count 5 --dry-run
+```
+
+The manifest lists only identities, strategy modes, and uniqueness checks. A
+successful preflight is configuration evidence, not live acceptance evidence.
+
+The offline five-player protocol fixture is run with:
+
+```sh
+PYTHONPATH=ai_player python3 -m pytest -q ai_player/tests/test_offline_acceptance.py
+```
+
+It uses five isolated state files and in-memory protocol peers, exercises buy,
+warp and sell receipts, and includes one refused movement plus one interrupted
+trade reconciliation. Its results are deterministic fixture evidence and do
+not qualify live multi-player acceptance.
+
+The selected configs are copied into a new private run directory. Each player
+gets its own `config.json`, state file, log, QA report directory and process
+group. The runner caps a cohort at 50 players and defaults to five concurrent
+sessions and a 30 minute activity window. `summary.json` contains identity,
+exit status and existing numeric AI metrics; it never includes credentials or
+session tokens.
+
+Press Ctrl-C for graceful shutdown. The runner sends SIGINT only to process
+groups it created, allowing `main.py` to disconnect and persist state. To resume
+the same cohort and its saved state:
+
+```sh
+python3 ai_player/fleet.py --resume-run /tmp/twclone-ai-qa/fleet-YYYYMMDD-HHMMSS-XXXXXXXX
+```
+
+The usual controller performs login again on startup and loads that player's
+persisted planner, exploration and bandit state. Use this only against a
+disposable QA universe; this tool does not establish that the target endpoint
+is isolated.
+
+Each existing player config may also select a `behavior_profile` and opt in to
+intermittent population pacing with `population_mode: true`. Available profiles
+include `trader`, `explorer`, `cautious`, and `opportunist`; configure UTC daily
+hours, active/inactive minutes, and a maximum observed turn budget in that same
+config. The details and defaults are in `V3_AI_SIMULATION.md`. These settings
+reuse the normal planner and Ollama strategy layer; no separate population
+controller is started.
+
+Set `"strategy_mode": "deterministic"` in each player config to use the local
+trade and navigation planner without issuing strategy inference requests. Set
+it to `"ollama"` to enable optional LLM strategy with the existing local
+fallback; configs without the setting retain the Ollama behavior. This setting
+does not establish server availability or validate a live acceptance run.
+
+`spawn.py` remains a legacy provisioning utility. It performs direct database
+equipment changes after public registration and is not used by this runner.

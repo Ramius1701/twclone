@@ -45,10 +45,232 @@ extern pthread_mutex_t g_clients_mu;
 int
 cmd_player_list_online (client_ctx_t *ctx, json_t *root)
 {
-  send_response_error (ctx,
-		       root,
-		       ERR_NOT_IMPLEMENTED,
-		       "Not implemented: cmd_player_list_online");
+  if (!ctx || ctx->player_id <= 0)
+    {
+      send_response_error (ctx, root, ERR_NOT_AUTHENTICATED,
+                           "Authentication required");
+      return 0;
+    }
+  db_t *db = game_db_get_handle ();
+  if (!db)
+    {
+      send_response_error (ctx, root, ERR_SERVICE_UNAVAILABLE,
+                           "Database unavailable");
+      return 0;
+    }
+
+  json_t *data = json_object_get (root, "data");
+  int64_t page = 1;
+  int limit = 50;
+  json_t *j_page = json_is_object (data)
+    ? json_object_get (data, "page") : NULL;
+  json_t *j_limit = json_is_object (data)
+    ? json_object_get (data, "limit") : NULL;
+  if (j_page)
+    {
+      if (!json_is_integer (j_page) || json_integer_value (j_page) < 1)
+        {
+          send_response_error (ctx, root, ERR_INVALID_ARG,
+                               "page must be a positive integer");
+          return 0;
+        }
+      page = json_integer_value (j_page);
+    }
+  if (j_limit)
+    {
+      if (!json_is_integer (j_limit) || json_integer_value (j_limit) < 1
+          || json_integer_value (j_limit) > 1000)
+        {
+          send_response_error (ctx, root, ERR_INVALID_ARG,
+                               "limit must be between 1 and 1000");
+          return 0;
+        }
+      limit = (int) json_integer_value (j_limit);
+    }
+
+  if (page - 1 > INT64_MAX / limit)
+    {
+      send_response_error (ctx, root, ERR_INVALID_ARG,
+                           "page and limit produce an unsupported offset");
+      return 0;
+    }
+  int64_t offset = (page - 1) * limit;
+
+  /* Snapshot currently authenticated sockets, deduplicating multi-session
+   * players. Profile data is fetched only after releasing the registry lock. */
+  size_t capacity = 16, online_count = 0;
+  int *online_ids = calloc (capacity, sizeof (*online_ids));
+  if (!online_ids)
+    {
+      send_response_error (ctx, root, ERR_SERVER_ERROR,
+                           "Unable to allocate online-player snapshot");
+      return 0;
+    }
+  pthread_mutex_lock (&g_clients_mu);
+  for (client_node_t *node = g_clients; node; node = node->next)
+    {
+      int player_id = node->ctx ? node->ctx->player_id : 0;
+      if (player_id <= 0)
+        continue;
+      bool duplicate = false;
+      for (size_t i = 0; i < online_count; i++)
+        if (online_ids[i] == player_id)
+          {
+            duplicate = true;
+            break;
+          }
+      if (duplicate)
+        continue;
+      if (online_count == capacity)
+        {
+          size_t next_capacity = capacity * 2;
+          int *next = realloc (online_ids, next_capacity * sizeof (*next));
+          if (!next)
+            {
+              pthread_mutex_unlock (&g_clients_mu);
+              free (online_ids);
+              send_response_error (ctx, root, ERR_SERVER_ERROR,
+                                   "Unable to grow online-player snapshot");
+              return 0;
+            }
+          online_ids = next;
+          capacity = next_capacity;
+        }
+      online_ids[online_count++] = player_id;
+    }
+  pthread_mutex_unlock (&g_clients_mu);
+  for (size_t i = 1; i < online_count; i++)
+    {
+      int value = online_ids[i];
+      size_t j = i;
+      while (j > 0 && online_ids[j - 1] > value)
+        {
+          online_ids[j] = online_ids[j - 1];
+          j--;
+        }
+      online_ids[j] = value;
+    }
+
+  json_t *players = json_array ();
+  if (!players)
+    {
+      free (online_ids);
+      send_response_error (ctx, root, ERR_SERVER_ERROR,
+                           "Unable to allocate online-player response");
+      return 0;
+    }
+  for (size_t i = 0; i < online_count; i++)
+    {
+      if ((int64_t) i < offset || (int64_t) json_array_size (players) >= limit)
+        continue;
+      char sql[256];
+      if (sql_build (db,
+                     "SELECT p.name, c.name, p.alignment FROM players p "
+                     "LEFT JOIN corp_members cm ON cm.player_id = p.player_id "
+                     "LEFT JOIN corporations c ON c.corporation_id = cm.corporation_id "
+                     "WHERE p.player_id={1} ORDER BY cm.corporation_id LIMIT 1",
+                     sql, sizeof sql) != 0)
+        {
+          json_decref (players);
+          free (online_ids);
+          send_response_error (ctx, root, ERR_DB_QUERY_FAILED,
+                               "Unable to build online-player query");
+          return 0;
+        }
+      db_res_t *res = NULL;
+      db_error_t err = {0};
+      if (!db_query (db, sql, (db_bind_t[]){db_bind_i32 (online_ids[i])},
+                     1, &res, &err))
+        {
+          json_decref (players);
+          free (online_ids);
+          send_response_error (ctx, root, ERR_DB_QUERY_FAILED,
+                               "Unable to read online-player identity");
+          return 0;
+        }
+      if (!db_res_step (res, &err))
+        {
+          db_res_finalize (res);
+          json_decref (players);
+          free (online_ids);
+          send_response_error (ctx, root, ERR_DB_QUERY_FAILED,
+                               "Online player record is unavailable");
+          return 0;
+        }
+      const char *username = db_res_col_text (res, 0, &err);
+      const char *corporation = db_res_col_text (res, 1, &err);
+      int alignment = db_res_col_i32 (res, 2, &err);
+      json_t *player = json_object ();
+      bool allocation_ok = player && username
+        && json_object_set_new (player, "player_id",
+                                json_integer (online_ids[i])) == 0
+        && json_object_set_new (player, "username",
+                                json_string (username)) == 0
+        && (corporation
+            ? json_object_set_new (player, "corporation",
+                                   json_string (corporation)) == 0
+            : json_object_set_new (player, "corporation", json_null ()) == 0)
+        && json_object_set_new (player, "alignment",
+                                json_integer (alignment)) == 0;
+      db_res_finalize (res);
+      if (!allocation_ok)
+        {
+          if (player)
+            json_decref (player);
+          json_decref (players);
+          free (online_ids);
+          send_response_error (ctx, root, ERR_SERVER_ERROR,
+                               "Unable to construct online-player response");
+          return 0;
+        }
+      /* The _new API consumes player even on failure. */
+      if (json_array_append_new (players, player) != 0)
+        {
+          json_decref (players);
+          free (online_ids);
+          send_response_error (ctx, root, ERR_SERVER_ERROR,
+                               "Unable to construct online-player response");
+          return 0;
+        }
+    }
+  free (online_ids);
+
+  json_t *payload = json_object ();
+  if (!payload)
+    {
+      json_decref (players);
+      send_response_error (ctx, root, ERR_SERVER_ERROR,
+                           "Unable to construct online-player response");
+      return 0;
+    }
+  bool payload_ok =
+    json_object_set_new (payload, "total_online",
+                         json_integer ((json_int_t) online_count)) == 0
+    && json_object_set_new (payload, "returned_count",
+                            json_integer ((json_int_t) json_array_size (players))) == 0
+    && json_object_set_new (payload, "page",
+                            json_integer ((json_int_t) page)) == 0
+    && json_object_set_new (payload, "limit", json_integer (limit)) == 0;
+  if (!payload_ok)
+    {
+      json_decref (payload);
+      json_decref (players);
+      send_response_error (ctx, root, ERR_SERVER_ERROR,
+                           "Unable to construct online-player response");
+      return 0;
+    }
+  /* Use the reference-counting form here so players remains owned locally
+   * until the attachment succeeds. */
+  if (json_object_set (payload, "players", players) != 0)
+    {
+      json_decref (payload);
+      json_decref (players);
+      send_response_error (ctx, root, ERR_SERVER_ERROR,
+                           "Unable to construct online-player response");
+      return 0;
+    }
+  json_decref (players);
+  send_response_ok_take (ctx, root, "player.list_online", &payload);
   return 0;
 }
 
@@ -56,8 +278,69 @@ cmd_player_list_online (client_ctx_t *ctx, json_t *root)
 int
 cmd_player_rankings (client_ctx_t *ctx, json_t *root)
 {
+  if (!ctx || ctx->player_id <= 0)
+    {
+      send_response_error (ctx, root, ERR_NOT_AUTHENTICATED,
+                           "Authentication required");
+      return 0;
+    }
+
+  json_t *data = json_object_get (root, "data");
+  int limit = 10;
+  if (data && json_is_object (data))
+    {
+      json_t *limit_value = json_object_get (data, "limit");
+      if (json_is_integer (limit_value))
+        limit = (int) json_integer_value (limit_value);
+    }
+  if (limit < 1 || limit > 100)
+    {
+      send_response_error (ctx, root, ERR_INVALID_ARG,
+                           "limit must be between 1 and 100");
+      return 0;
+    }
+
+  db_t *db = game_db_get_handle ();
+  db_res_t *res = NULL;
+  db_error_t err;
+  char sql[256];
+  sql_build (db,
+             "SELECT player_id, name, experience, alignment FROM players "
+             "ORDER BY experience DESC, player_id ASC LIMIT {1};",
+             sql, sizeof (sql));
+  if (!db_query (db, sql, (db_bind_t[]){ db_bind_i64 (limit) }, 1, &res,
+                 &err))
+    {
+      send_response_error (ctx, root, ERR_DB, "Unable to load rankings");
+      return 0;
+    }
+
   json_t *payload = json_object ();
-  json_object_set_new (payload, "rankings", json_array ());
+  json_t *rankings = json_array ();
+  if (!payload || !rankings)
+    {
+      if (res) db_res_finalize (res);
+      json_decref (payload);
+      json_decref (rankings);
+      send_response_error (ctx, root, ERR_DB, "Unable to allocate rankings");
+      return 0;
+    }
+  while (db_res_step (res, &err))
+    {
+      json_t *entry = json_object ();
+      const char *name = db_res_col_text (res, 1, &err);
+      json_object_set_new (entry, "player_id",
+                           json_integer (db_res_col_i32 (res, 0, &err)));
+      json_object_set_new (entry, "name",
+                           json_string (name ? name : ""));
+      json_object_set_new (entry, "experience",
+                           json_integer (db_res_col_i64 (res, 2, &err)));
+      json_object_set_new (entry, "alignment",
+                           json_integer (db_res_col_i32 (res, 3, &err)));
+      json_array_append_new (rankings, entry);
+    }
+  db_res_finalize (res);
+  json_object_set_new (payload, "rankings", rankings);
   send_response_ok_take (ctx, root, "player.rankings.response", &payload);
   return 0;
 }
@@ -1420,7 +1703,13 @@ h_player_is_npc (db_t *db, int player_id)
 int
 spawn_starter_ship (db_t *db, int player_id, int sector_id)
 {
-  if (!db)
+  if (!db || player_id <= 0 || sector_id <= 0)
+    {
+      return -1;
+    }
+
+  db_error_t tx_err = {0};
+  if (!db_tx_begin (db, DB_TX_IMMEDIATE, &tx_err))
     {
       return -1;
     }
@@ -1429,6 +1718,7 @@ spawn_starter_ship (db_t *db, int player_id, int sector_id)
   struct twconfig *cfg = config_load ();
   if (!cfg)
     {
+      db_tx_rollback (db, &tx_err);
       return -1;
     }
 
@@ -1437,6 +1727,7 @@ spawn_starter_ship (db_t *db, int player_id, int sector_id)
       (db, cfg->starter_shiptype_name, &ship_type_id, &holds, &fighters, &shields) != 0)
     {
       free (cfg);
+      db_tx_rollback (db, &tx_err);
       return -1;
     }
 
@@ -1446,12 +1737,14 @@ spawn_starter_ship (db_t *db, int player_id, int sector_id)
        &ship_id) != 0)
     {
       free (cfg);
+      db_tx_rollback (db, &tx_err);
       return -1;
     }
 
   if (repo_players_set_ship_ownership (db, ship_id, player_id) != 0)
     {
       free (cfg);
+      db_tx_rollback (db, &tx_err);
       return -1;
     }
 
@@ -1459,16 +1752,25 @@ spawn_starter_ship (db_t *db, int player_id, int sector_id)
       != 0)
     {
       free (cfg);
+      db_tx_rollback (db, &tx_err);
       return -1;
     }
 
   if (repo_players_update_podded_status (db, player_id, "alive") != 0)
     {
       free (cfg);
+      db_tx_rollback (db, &tx_err);
       return -1;
     }
 
   free (cfg);
+
+  if (!db_tx_commit (db, &tx_err))
+    {
+      db_tx_rollback (db, &tx_err);
+      return -1;
+    }
+
   return 0;
 }
 

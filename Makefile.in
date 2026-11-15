@@ -176,9 +176,8 @@ am__define_uniq_tagged_files = \
   done | $(am__uniquify_input)`
 DIST_SUBDIRS = $(SUBDIRS)
 am__DIST_COMMON = $(srcdir)/Makefile.in $(srcdir)/autoconf.h.in \
-	AUTHORS COPYING ChangeLog INSTALL NEWS README.md THANKS TODO \
-	ar-lib compile config.guess config.sub depcomp install-sh \
-	missing
+	AUTHORS COPYING ChangeLog INSTALL NEWS README.md TODO ar-lib \
+	compile config.guess config.sub depcomp install-sh missing
 DISTFILES = $(DIST_COMMON) $(DIST_SOURCES) $(TEXINFOS) $(EXTRA_DIST)
 distdir = $(PACKAGE)-$(VERSION)
 top_distdir = $(distdir)
@@ -680,6 +679,7 @@ distcleancheck: distclean
 	       $(distcleancheck_listfiles) ; \
 	       exit 1; } >&2
 check-am: all-am
+	$(MAKE) $(AM_MAKEFLAGS) check-local
 check: check-recursive
 all-am: Makefile autoconf.h
 installdirs: installdirs-recursive
@@ -783,29 +783,47 @@ ps-am:
 
 uninstall-am:
 
-.MAKE: $(am__recursive_targets) all install-am install-strip
+.MAKE: $(am__recursive_targets) all check-am install-am install-strip
 
 .PHONY: $(am__recursive_targets) CTAGS GTAGS TAGS all all-am \
-	am--refresh check check-am clean clean-cscope clean-generic \
-	cscope cscopelist-am ctags ctags-am dist dist-all dist-bzip2 \
-	dist-gzip dist-lzip dist-shar dist-tarZ dist-xz dist-zip \
-	dist-zstd distcheck distclean distclean-generic distclean-hdr \
-	distclean-tags distcleancheck distdir distuninstallcheck dvi \
-	dvi-am html html-am info info-am install install-am \
-	install-data install-data-am install-dvi install-dvi-am \
-	install-exec install-exec-am install-html install-html-am \
-	install-info install-info-am install-man install-pdf \
-	install-pdf-am install-ps install-ps-am install-strip \
-	installcheck installcheck-am installdirs installdirs-am \
-	maintainer-clean maintainer-clean-generic mostlyclean \
-	mostlyclean-generic pdf pdf-am ps ps-am tags tags-am uninstall \
-	uninstall-am
+	am--refresh check check-am check-local clean clean-cscope \
+	clean-generic cscope cscopelist-am ctags ctags-am dist \
+	dist-all dist-bzip2 dist-gzip dist-lzip dist-shar dist-tarZ \
+	dist-xz dist-zip dist-zstd distcheck distclean \
+	distclean-generic distclean-hdr distclean-tags distcleancheck \
+	distdir distuninstallcheck dvi dvi-am html html-am info \
+	info-am install install-am install-data install-data-am \
+	install-dvi install-dvi-am install-exec install-exec-am \
+	install-html install-html-am install-info install-info-am \
+	install-man install-pdf install-pdf-am install-ps \
+	install-ps-am install-strip installcheck installcheck-am \
+	installdirs installdirs-am maintainer-clean \
+	maintainer-clean-generic mostlyclean mostlyclean-generic pdf \
+	pdf-am ps ps-am tags tags-am uninstall uninstall-am
 
 .PRECIOUS: Makefile
 
 
 db-gates:
 	@$(top_srcdir)/tools/db_gates.sh
+
+.PHONY: architecture-check
+architecture-check:
+	@python3 $(top_srcdir)/tools/check_architecture_boundaries.py
+
+.PHONY: regression-static regression-full
+regression-static:
+	@python3 -m pytest -q \
+		tests.v2/test_qa_runner_config.py \
+		tests.v2/test_bigbang_sql_selection.py \
+		tests.v2/test_server_visibility_contract.py \
+		tests.v2/test_ship_transfer_error_contract.py \
+		tests.v2/test_issue_490_ship02_contract.py
+
+regression-full:
+	@python3 tests.v2/run_regression_instance.py --pg-port "$${QA_PGPORT:-55438}" --report tests.v2/regression_report.json
+
+check-local: architecture-check regression-static
 
 # Tell versions [3.59,3.63) of GNU make to not export all variables.
 # Otherwise a system limit (for SysV at least) may be exceeded.

@@ -173,21 +173,89 @@ def test_offline_warp_cycle_tracks_planned_vs_completed_hops(tmp_path):
 def test_trade_receipt_updates_realized_performance_metrics(tmp_path):
     manager = StateManager(str(tmp_path / "state.json"), {})
     manager.state["price_cache"] = {"202": {"sell": {"ORE": 150}}}
-    manager.state["ship_info"] = {
-        "cargo": [{"commodity": "ORE", "quantity": 2, "purchase_price": 100}]
-    }
+    manager.state["player_info"] = {"player": {"credits": "1000.00"}}
+    manager.state["ship_info"] = {"id": 1, "cargo": []}
+    manager.add_pending_command("buy-1", {
+        "command": "trade.buy", "data": {"port_id": 101}
+    })
+    process_responses(
+        [{"reply_to": "buy-1", "status": "ok", "type": "trade.buy_receipt_v1",
+          "data": {"lines": [{"commodity": "ORE", "quantity": 2,
+                               "unit_price": 100, "value": "200.00"}],
+                   "fees": "2.00", "credits_remaining": "798.00"}}],
+        None, manager, QuietReporter(), QuietBandit(), {}, None,
+    )
+
     manager.add_pending_command("sell-1", {
         "command": "trade.sell", "data": {"port_id": 202}
     })
 
     process_responses(
         [{"reply_to": "sell-1", "status": "ok", "type": "trade.sell_receipt_v1",
-          "data": {"lines": [{"commodity": "ORE", "quantity": 2}],
-                   "credits_remaining": 300}}],
+          "data": {"lines": [{"commodity": "ORE", "quantity": 2,
+                               "unit_price": 120, "value": "240.00"}],
+                   "fees": "2.40", "credits_remaining": "1035.60"}}],
         None, manager, QuietReporter(), QuietBandit(), {}, None,
     )
 
     metrics = manager.get("ai_metrics")
-    assert metrics["trade_profit_credits"] == 100
+    assert metrics["trade_profit_credits"] == 35.6
     assert metrics["trade_sales"] == 1
     assert manager.get("ship_info")["cargo"] == []
+    assert manager.get("player_info")["player"]["credits"] == "1035.60"
+
+
+def test_offline_public_protocol_trade_journey_and_receipt_readbacks(tmp_path, monkeypatch):
+    """A scripted server fixture exercises player envelopes, not a live server."""
+    connection = GameConnection("unused", 0)
+    sock = FakeStreamSocket()
+    connection.sock = sock
+    monkeypatch.setattr("main.select.select", lambda _r, w, _e, _t: ([], w, []))
+    manager = StateManager(str(tmp_path / "state.json"), {})
+    manager.state["player_info"] = {"player": {"credits": "1000.00"}}
+    manager.state["ship_info"] = {"id": 1, "holds": 10, "cargo": []}
+    manager.state["player_location_sector"] = 1
+    manager.state["price_cache"] = {"202": {"sell": {"ORE": 113}}}
+
+    def exchange(request, response_type, data):
+        assert connection.send_command(request)
+        frame = json.loads(bytes(sock.outgoing).decode())
+        sock.outgoing.clear()
+        assert frame == request
+        manager.add_pending_command(request["id"], request)
+        sock.incoming.extend((json.dumps({"reply_to": request["id"], "status": "ok",
+                                          "type": response_type, "data": data}) + "\n").encode())
+        process_responses(connection.receive_responses(), connection, manager,
+                          QuietReporter(), QuietBandit(), {}, None)
+
+    exchange({"id": "buy", "command": "trade.buy", "data": {"port_id": 101,
+              "items": [{"commodity": "ORE", "quantity": 1}], "idempotency_key": "buy-key"},
+              "meta": {"idempotency_key": "buy-key"}}, "trade.buy_receipt_v1",
+             {"lines": [{"commodity": "ORE", "quantity": 1, "unit_price": 100, "value": "100.00"}],
+              "fees": "0.00", "credits_remaining": "900.00"})
+    assert manager.get("player_info")["player"]["credits"] == "900.00"
+    assert manager.get("ship_info")["cargo"][0]["quantity"] == 1
+    exchange({"id": "warp", "command": "move.warp", "data": {"to_sector_id": 2}, "meta": {}},
+             "move.result", {"to_sector_id": 2})
+    assert manager.get("player_location_sector") == 2
+    sector_read = json.loads(bytes(sock.outgoing).decode())
+    sock.outgoing.clear()
+    assert sector_read["command"] == "sector.info"
+    process_responses([{"reply_to": sector_read["id"], "status": "ok", "type": "sector.info",
+                        "data": {"sector_id": 2}}], connection, manager,
+                      QuietReporter(), QuietBandit(), {}, None)
+    exchange({"id": "sell", "command": "trade.sell", "data": {"port_id": 202,
+              "items": [{"commodity": "ORE", "quantity": 1}], "idempotency_key": "sell-key"},
+              "meta": {"idempotency_key": "sell-key"}}, "trade.sell_receipt_v1",
+             {"lines": [{"commodity": "ORE", "quantity": 1, "unit_price": 113, "value": "113.00"}],
+              "fees": "0.00", "credits_remaining": "1013.00"})
+    assert manager.get("ship_info")["cargo"] == []
+    assert manager.get("player_info")["player"]["credits"] == "1013.00"
+    assert manager.get("ai_metrics")["trade_profit_credits"] == 13
+    exchange({"id": "player-read", "command": "player.my_info", "data": {}, "meta": {}},
+             "player.my_info", {"player": {"credits": "1013.00"}})
+    exchange({"id": "ship-read", "command": "ship.info", "data": {}, "meta": {}},
+             "ship.info", {"id": 1, "holds": 10, "cargo": []})
+    assert manager.get("player_info")["player"]["credits"] == "1013.00"
+    assert manager.get("ship_info")["cargo"] == []
+    assert manager.get("player_location_sector") == 2

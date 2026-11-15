@@ -158,12 +158,20 @@ int h_add_credits_unlocked (db_t *db,
                             const char *tx_type,
                             const char *tx_group_id,
                             long long *new_balance_out);
+int h_add_credits_unlocked_with_transaction_id (db_t *db, int account_id,
+                            long long amount, const char *tx_type,
+                            const char *tx_group_id, long long *new_balance_out,
+                            int64_t *transaction_id_out);
 int h_deduct_credits_unlocked (db_t *db,
                                int account_id,
                                long long amount,
                                const char *tx_type,
                                const char *tx_group_id,
                                long long *new_balance);
+int h_deduct_credits_unlocked_with_transaction_id (db_t *db, int account_id,
+                               long long amount, const char *tx_type,
+                               const char *tx_group_id, long long *new_balance,
+                               int64_t *transaction_id_out);
 long long h_get_config_int_unlocked (db_t *db,
                                      const char *key,
                                      long long default_value);
@@ -327,6 +335,12 @@ int db_port_add_bust_record (int port_id,
                              const char *bust_type);
 int db_port_is_busted (int port_id, int player_id);
 int db_player_update_commission (db_t *db, int player_id);
+int db_player_apply_progress_event (db_t *db, int player_id,
+                                    const char *source_type,
+                                    const char *source_key,
+                                    long long xp_delta,
+                                    int alignment_delta,
+                                    int formula_version);
 int h_get_cluster_id_for_sector (db_t *db, int sector_id, int *out_cluster_id);
 int h_get_cluster_alignment (db_t *db, int sector_id, int *out_alignment);
 int h_get_cluster_alignment_band (db_t *db, int sector_id, int *out_band_id);

@@ -7,18 +7,22 @@
 #include <string.h>
 #include <strings.h>
 #include <errno.h>
+#include <limits.h>
 #include <signal.h>
 #include <unistd.h>
 #include <poll.h>
 #include <time.h>
 #include <pthread.h>
 #include <sys/types.h>
+#include <sys/time.h>
 #include <sys/socket.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include "db/repo/repo_database.h"
+#include "db/repo/repo_ships.h"
 #include "db/repo/repo_communication.h"
 #include <jansson.h>
 #include <stdbool.h>
@@ -78,6 +82,7 @@ __thread client_ctx_t *g_ctx_for_send = NULL;
 
 /* TLS context (global, thread-safe) */
 static SSL_CTX *g_ssl_ctx = NULL;
+static atomic_int g_active_client_connections = 0;
 
 /* forward declaration to avoid implicit extern */
 void send_all_json (int fd, json_t * obj);
@@ -108,6 +113,7 @@ extern int cmd_equity_dividend_set (client_ctx_t * ctx, json_t * root);
 extern int cmd_trade_accept (client_ctx_t * ctx, json_t * root);
 extern int cmd_trade_cancel (client_ctx_t * ctx, json_t * root);
 extern int cmd_trade_offer (client_ctx_t * ctx, json_t * root);
+extern int cmd_trade_offers (client_ctx_t * ctx, json_t * root);
 extern int cmd_ferengi_traders (client_ctx_t *ctx, json_t *root);
 extern int cmd_ferengi_deal_accept (client_ctx_t *ctx, json_t *root);
 extern int cmd_ferengi_deal_reject (client_ctx_t *ctx, json_t *root);
@@ -137,15 +143,81 @@ monotonic_millis (void)
   return (uint64_t) ts.tv_sec * 1000ULL + (uint64_t) ts.tv_nsec / 1000000ULL;
 }
 
-/* --------------------------------------------------------------------------
-   Stubs for later work.
-   -------------------------------------------------------------------------- */
+/* Insurance settlement operations live in the shared C repository so both
+   PostgreSQL and MySQL use the same lock and ledger semantics. */
+
+static int
+insurance_subject_owned (db_t *db, const char *subject_type, int64_t subject_id,
+                         int64_t player_id)
+{
+  const char *query = NULL;
+  if (strcmp (subject_type, "ship") == 0 || strcmp (subject_type, "cargo") == 0)
+    query = "SELECT 1 FROM ship_ownership WHERE ship_id = {1} AND player_id = {2} AND is_primary = {3} LIMIT 1;";
+  else if (strcmp (subject_type, "planet") == 0)
+    query = "SELECT 1 FROM planets WHERE planet_id = {1} AND owner_id = {2} LIMIT 1;";
+  else
+    return 0;
+  char sql[512]; sql_build (db, query, sql, sizeof sql);
+  db_res_t *res = NULL; db_error_t err = {0};
+  db_bind_t binds[3] = {db_bind_i64 (subject_id), db_bind_i64 (player_id), db_bind_bool (true)};
+  int count = strcmp (subject_type, "planet") == 0 ? 2 : 3;
+  if (!db_query (db, sql, binds, count, &res, &err)) return -1;
+  int owned = db_res_step (res, &err) ? 1 : 0;
+  db_res_finalize (res);
+  return owned;
+}
+
+static int
+insurance_claim_owned (db_t *db, int64_t claim_id, int64_t player_id)
+{
+  const char *query = "SELECT 1 FROM insurance_claims c JOIN insurance_policies p ON p.insurance_policies_id = c.policy_id WHERE c.insurance_claims_id = {1} AND p.holder_type = {2} AND p.holder_id = {3} LIMIT 1;";
+  char sql[512]; sql_build (db, query, sql, sizeof sql);
+  db_res_t *res = NULL; db_error_t err = {0};
+  if (!db_query (db, sql, (db_bind_t[]){db_bind_i64 (claim_id), db_bind_text ("player"), db_bind_i64 (player_id)}, 3, &res, &err)) return -1;
+  int owned = db_res_step (res, &err) ? 1 : 0;
+  db_res_finalize (res);
+  return owned;
+}
 
 int
 cmd_insurance_policies_list (client_ctx_t *ctx, json_t *root)
 {
+  if (!ctx || ctx->player_id <= 0)
+    {
+      send_response_error (ctx, root, ERR_NOT_AUTHENTICATED,
+                           "Authentication required");
+      return 0;
+    }
+  db_t *db = game_db_get_handle ();
+  db_res_t *res = NULL;
+  db_error_t err = {0};
+  char sql[512];
+  sql_build (db, "SELECT insurance_policies_id, subject_type, subject_id, premium, payout, start_ts, expiry_ts, active FROM insurance_policies WHERE holder_type = {1} AND holder_id = {2} ORDER BY insurance_policies_id DESC;", sql, sizeof sql);
+  if (!db_query (db, sql, (db_bind_t[]){db_bind_text ("player"), db_bind_i64 (ctx->player_id)}, 2, &res, &err))
+    {
+      send_response_error (ctx, root, ERR_DB_QUERY_FAILED, "Unable to list insurance policies");
+      return 0;
+    }
   json_t *payload = json_object ();
-  json_object_set_new (payload, "policies", json_array ());
+  json_t *policies = json_array ();
+  while (db_res_step (res, &err))
+    {
+      json_t *policy = json_object ();
+      const char *subject = db_res_col_text (res, 1, &err);
+      const char *start = db_res_col_text (res, 5, &err);
+      const char *expiry = db_res_col_text (res, 6, &err);
+      json_object_set_new (policy, "policy_id", json_integer (db_res_col_i64 (res, 0, &err)));
+      json_object_set_new (policy, "subject_type", json_string (subject ? subject : ""));
+      json_object_set_new (policy, "subject_id", json_integer (db_res_col_i64 (res, 2, &err)));
+      json_object_set_new (policy, "premium", json_integer (db_res_col_i64 (res, 3, &err)));
+      json_object_set_new (policy, "payout", json_integer (db_res_col_i64 (res, 4, &err)));
+      json_object_set_new (policy, "start_ts", json_string (start ? start : ""));
+      if (expiry) json_object_set_new (policy, "expiry_ts", json_string (expiry));
+      json_object_set_new (policy, "active", json_boolean (db_res_col_int (res, 7, &err)));
+      json_array_append_new (policies, policy);
+    }
+  db_res_finalize (res);
+  json_object_set_new (payload, "policies", policies);
   send_response_ok_take (ctx, root, "insurance.policies.list.response",
 			 &payload);
   return 0;
@@ -154,20 +226,69 @@ cmd_insurance_policies_list (client_ctx_t *ctx, json_t *root)
 int
 cmd_insurance_policies_buy (client_ctx_t *ctx, json_t *root)
 {
-  json_t *payload = json_object ();
-  json_object_set_new (payload, "status", json_string ("Policy purchased"));
-  send_response_ok_take (ctx, root, "insurance.policies.buy.response",
-			 &payload);
+  if (!ctx || ctx->player_id <= 0)
+    {
+      send_response_error (ctx, root, ERR_NOT_AUTHENTICATED, "Authentication required");
+      return 0;
+    }
+  json_t *data = json_object_get (root, "data");
+  const char *subject_type = json_string_value (json_object_get (data, "subject_type"));
+  int64_t subject_id = json_integer_value (json_object_get (data, "subject_id"));
+  int64_t premium = json_integer_value (json_object_get (data, "premium"));
+  int64_t payout = json_integer_value (json_object_get (data, "payout"));
+  int64_t fund_id = json_integer_value (json_object_get (data, "fund_id"));
+  int duration = (int) json_integer_value (json_object_get (data, "duration"));
+  if (!subject_type || strcmp (subject_type, "ship") != 0
+      || subject_id <= 0 || premium < 0 || payout < 0 || fund_id <= 0
+      || duration <= 0)
+    {
+      send_response_error (ctx, root, ERR_INVALID_ARG,
+                           "A ship subject, premium, payout, fund_id and duration are required");
+      return 0;
+    }
+  db_t *db = game_db_get_handle ();
+  int owned = insurance_subject_owned (db, subject_type, subject_id, ctx->player_id);
+  if (owned < 0)
+    { send_response_error (ctx, root, ERR_DB_QUERY_FAILED, "Unable to validate insured subject"); return 0; }
+  if (!owned)
+    { send_response_error (ctx, root, ERR_PERMISSION_DENIED, "Insured subject is not owned by the player"); return 0; }
+  char start_ts[32], expiry_ts[32];
+  time_t now = time (NULL);
+  snprintf (start_ts, sizeof start_ts, "%lld", (long long) now);
+  snprintf (expiry_ts, sizeof expiry_ts, "%lld", (long long) now + duration);
+  int64_t policy_id = 0;
+  int purchase_rc = repo_ships_insurance_buy_policy
+    (db, ctx->player_id, subject_type, subject_id, premium, payout, fund_id,
+     start_ts, expiry_ts, &policy_id);
+  if (purchase_rc != 0)
+    { send_response_error (ctx, root, purchase_rc, "Insurance purchase refused"); return 0; }
+  json_t *payload = json_pack ("{s:I,s:s}", "policy_id", (json_int_t) policy_id, "status", "purchased");
+  send_response_ok_take (ctx, root, "insurance.policies.buy.response", &payload);
   return 0;
 }
 
 int
 cmd_insurance_claim_file (client_ctx_t *ctx, json_t *root)
 {
-  json_t *payload = json_object ();
-  json_object_set_new (payload, "claim_id", json_integer (12345));
-  send_response_ok_take (ctx, root, "insurance.claim.file.response",
-			 &payload);
+  if (!ctx || ctx->player_id <= 0)
+    { send_response_error (ctx, root, ERR_NOT_AUTHENTICATED, "Authentication required"); return 0; }
+  json_t *data = json_object_get (root, "data");
+  int64_t claim_id = json_integer_value (json_object_get (data, "claim_id"));
+  int64_t amount = json_integer_value (json_object_get (data, "amount"));
+  const char *event_id = json_string_value (json_object_get (data, "event_id"));
+  if (claim_id <= 0 || amount < 0 || !event_id || !*event_id)
+    { send_response_error (ctx, root, ERR_INVALID_ARG, "claim_id, event_id and amount are required"); return 0; }
+  db_t *db = game_db_get_handle ();
+  int owned = insurance_claim_owned (db, claim_id, ctx->player_id);
+  if (owned < 0) { send_response_error (ctx, root, ERR_DB_QUERY_FAILED, "Unable to validate claim ownership"); return 0; }
+  if (!owned) { send_response_error (ctx, root, ERR_PERMISSION_DENIED, "Claim is not owned by the player"); return 0; }
+  int64_t settled_id = 0;
+  int claim_rc = repo_ships_insurance_settle_claim
+    (db, ctx->player_id, claim_id, event_id, amount, &settled_id);
+  if (claim_rc != 0)
+    { send_response_error (ctx, root, claim_rc, "Insurance claim refused"); return 0; }
+  json_t *payload = json_pack ("{s:I,s:s}", "claim_id", (json_int_t) settled_id, "status", "settled");
+  send_response_ok_take (ctx, root, "insurance.claim.file.response", &payload);
   return 0;
 }
 
@@ -276,6 +397,12 @@ static const command_entry_t k_command_registry[] = {
    0, false, NULL},
   {"bank.leaderboard", cmd_bank_leaderboard, "Get bank leaderboard",
    schema_bank_leaderboard, 0, false, NULL},
+  {"bank.orders.create", cmd_bank_orders_create, "Create recurring bank payment",
+   schema_bank_orders_create, 0, false, NULL},
+  {"bank.orders.list", cmd_bank_orders_list, "List recurring bank payments",
+   schema_bank_orders_list, 0, false, NULL},
+  {"bank.orders.cancel", cmd_bank_orders_cancel, "Cancel recurring bank payment",
+   schema_bank_orders_cancel, 0, false, NULL},
   {"bank.transfer", cmd_bank_transfer, "Transfer credits between players",
    schema_bank_transfer, 0, false, NULL},
   {"bank.withdraw", cmd_bank_withdraw, "Withdraw credits from bank",
@@ -352,6 +479,9 @@ static const command_entry_t k_command_registry[] = {
    schema_corp_no_args, 0, false, NULL},
   {"corp.transfer_ceo", cmd_corp_transfer_ceo,
    "Transfer corporation CEO role", schema_corp_target_player, 0, false, NULL},
+  {"corp.member.transfer", cmd_corp_member_transfer,
+   "Transfer an asset to a corporation member", schema_corp_member_transfer,
+   0, false, NULL},
   {"corp.withdraw", cmd_corp_withdraw, "Withdraw from corporation",
    schema_corp_amount, 0, false, NULL},
   {"dock.status", cmd_dock_status,
@@ -413,14 +543,24 @@ static const command_entry_t k_command_registry[] = {
    schema_planet_genesis_create, 0, false, NULL},
   {"planet.deposit", cmd_planet_deposit, "Deposit to a planet",
    schema_planet_deposit, 0, false, NULL},
+  {"planet.emancipate", cmd_planet_emancipate,
+   "Emancipate all slaves on a planet", schema_planet_emancipate, 0, false, NULL},
   {"planet.genesis", cmd_planet_genesis_create, "Create a planet",
    schema_planet_genesis, 0, false, NULL},
   {"planet.genesis_create", cmd_planet_genesis_create,
    "Create a genesis planet", schema_planet_genesis_create, 0, false, NULL},
   {"planet.harvest", cmd_planet_harvest, "Harvest from a planet",
    schema_planet_harvest, 0, false, NULL},
+  {"planet.trade.port", cmd_planet_trade_port,
+   "Bulk-sell planetary commodities to a local port",
+   schema_planet_trade_port, 0, false, NULL},
+  {"planet.view", cmd_planet_view, "Read-only planetary overview",
+   schema_planet_info, 0, false, NULL},
   {"planet.info", cmd_planet_info, "Planet information", schema_planet_info,
    0, false, NULL},
+  {"planet.fighters.transfer", cmd_planet_fighters_transfer,
+   "Transfer fighters between a landed ship and its planet",
+   schema_planet_fighters_transfer, 0, false, NULL},
   {"planet.land", cmd_planet_land, "Land on a planet", schema_planet_land, 0, false, NULL},
   {"planet.colonists.get", cmd_planet_colonists_get, "Get colonist info for planet",
    schema_placeholder, 0, false, NULL},
@@ -433,6 +573,8 @@ static const command_entry_t k_command_registry[] = {
    schema_planet_launch, 0, false, NULL},
   {"planet.market.buy_order", cmd_planet_market_buy_order,
    "Create planet market buy order", schema_placeholder, 0, false, NULL},
+  {"planet.market.buy_order.cancel", cmd_planet_market_buy_order_cancel,
+   "Cancel planet market buy order", schema_placeholder, 0, false, NULL},
   {"planet.market.sell", cmd_planet_market_sell, "Sell to planet market",
    schema_placeholder, 0, false, NULL},
   {"planet.rename", cmd_planet_rename, "Rename a planet",
@@ -591,13 +733,13 @@ static const command_entry_t k_command_registry[] = {
    schema_ship_reregister, 0, false, NULL},
   {"ship.self_destruct", cmd_ship_self_destruct, "Self-destruct a ship",
    schema_ship_self_destruct, 0, false, NULL},
-  {"ship.sell", cmd_ship_sell, "Sell a ship", schema_placeholder, 0, false, NULL},
+  {"ship.sell", cmd_ship_sell, "Sell a ship", schema_ship_sell, 0, false, NULL},
   {"ship.status", cmd_ship_status, "Ship status", schema_ship_status, 0, false, NULL},
   {"ship.tow", cmd_ship_tow, "Engage or disengage towing",
    schema_ship_tow, 0, false, NULL},
   {"ship.tow.status", cmd_ship_tow_status, "Ship towing status",
    schema_ship_tow_status, 0, false, NULL},
-  {"ship.transfer", cmd_ship_transfer, "Transfer a ship", schema_placeholder,
+  {"ship.transfer", cmd_ship_transfer, "Transfer a ship", schema_ship_transfer,
    0, false, NULL},
   {"ship.transfer_cargo", cmd_ship_transfer_cargo, "Transfer cargo",
    schema_ship_transfer_cargo, 0, false, NULL},
@@ -605,7 +747,7 @@ static const command_entry_t k_command_registry[] = {
    0, false, NULL},
   {"shipyard.list", cmd_shipyard_list, "List available ship hulls",
    schema_nav_no_args, 0, false, NULL},
-  {"shipyard.sell", cmd_shipyard_sell, "Sell a ship hull", schema_placeholder,
+  {"shipyard.sell", cmd_shipyard_sell, "Sell a ship hull", schema_shipyard_sell,
    0, false, NULL},
     {"shipyard.upgrade", cmd_shipyard_upgrade, "Upgrade to a new ship hull",
      schema_shipyard_upgrade, 0, false, NULL},
@@ -625,6 +767,8 @@ static const command_entry_t k_command_registry[] = {
     {"stock.exchange.orders.create", cmd_equity, "Create a stock order (DEPRECATED: use equity.exchange.order.create)", schema_placeholder, 0, true, "equity.exchange.order.create"},
     {"stock.ipo.register", cmd_equity_ipo_register, "Register corporation for IPO (DEPRECATED: use equity.ipo_register)", schema_placeholder, 0, true, "equity.ipo_register"},
     {"stock.portfolio.list", cmd_equity, "List stock portfolio (DEPRECATED: use equity.portfolio.list)", schema_placeholder, 0, true, "equity.portfolio.list"},
+    {"events.resume", cmd_events_resume, "Resume the player's event stream",
+     schema_events_resume, 0, false, NULL},
     {"subscribe.add", cmd_subscribe_add, "Add a subscription",
    schema_subscribe_add, 0, false, NULL},
   {"subscribe.catalog", cmd_subscribe_catalog, "Subscription catalog",
@@ -673,6 +817,8 @@ static const command_entry_t k_command_registry[] = {
    schema_trade_jettison, 0, false, NULL},
   {"trade.offer", cmd_trade_offer, "Create a trade offer to another player",
    schema_trade_offer, 0, false, NULL},
+  {"trade.offers", cmd_trade_offers, "List the authenticated player's pending trade offers",
+   schema_trade_offers, 0, false, NULL},
   {"ferengi.traders", cmd_ferengi_traders,
    "View named Ferengi traders and their offers", schema_ferengi_traders,
    0, false, NULL},
@@ -944,20 +1090,60 @@ server_deliver_to_player_topic (int player_id, const char *topic,
   char *event_id = gen_uuid_v4 ();
   if (!event_id)
     return -1;
+
+  int replayable = 0;
+  char timestamp[32] = {0};
+  char stream_id[37] = {0};
+  int64_t sequence = 0;
+  db_t *db = game_db_get_handle ();
+  if (db)
+    {
+      char *payload = json_dumps (data, JSON_COMPACT | JSON_SORT_KEYS);
+      if (payload && repo_comm_event_append (db, player_id, event_id,
+                                              event_type, topic, payload,
+                                              stream_id, &sequence,
+                                              timestamp) == 0)
+        replayable = 1;
+      else
+        LOGE ("event journal append failed for player %d event %s; delivering live-only",
+              player_id, event_type);
+      free (payload);
+    }
+
+  char cursor[96];
+  if (replayable)
+    snprintf (cursor, sizeof cursor, "v1.%s.%" PRId64, stream_id, sequence);
+  else
+    {
+      free (event_id);
+      event_id = gen_uuid_v4 ();
+      timestamp[0] = '\0';
+      cursor[0] = '\0';
+      if (!event_id)
+        return -1;
+    }
+
   int delivered = 0;
   pthread_mutex_lock (&g_clients_mu);
-  for (client_node_t *n = g_clients; n; n = n->next)
+  for (client_node_t * n = g_clients; n; n = n->next)
     {
       client_ctx_t *c = n->ctx;
-      if (c && c->player_id == player_id && c->fd >= 0)
-        {
-          send_player_event (c, event_id, event_type, data, topic);
-          delivered++;
-        }
+
+      if (!c)
+	{
+	  continue;
+	}
+      if (c->player_id == player_id && c->fd >= 0)
+	{
+	  send_player_event (c, event_id, event_type, data,
+                             replayable ? timestamp : NULL, topic,
+                             replayable ? cursor : NULL, replayable);
+	  delivered++;
+	}
     }
   pthread_mutex_unlock (&g_clients_mu);
   free (event_id);
-  return delivered > 0 ? 0 : -1;
+  return (delivered > 0) ? 0 : -1;
 }
 
 int
@@ -1016,7 +1202,7 @@ set_reuseaddr (int fd)
 }
 
 static int
-make_listen_socket (uint16_t port)
+make_listen_socket (uint16_t port, const char *bind_address)
 {
   int fd = socket (AF_INET, SOCK_STREAM, 0);
   if (fd < 0)
@@ -1034,7 +1220,12 @@ make_listen_socket (uint16_t port)
 
   memset (&sa, 0, sizeof (sa));
   sa.sin_family = AF_INET;
-  sa.sin_addr.s_addr = htonl (INADDR_ANY);
+  if (!bind_address || inet_pton (AF_INET, bind_address, &sa.sin_addr) != 1)
+    {
+      close (fd);
+      errno = EINVAL;
+      return -1;
+    }
   sa.sin_port = htons (port);
   if (bind (fd, (struct sockaddr *) &sa, sizeof (sa)) < 0)
     {
@@ -1074,6 +1265,23 @@ rl_tick (client_ctx_t *ctx)
       ctx->rl_count = 0;
     }
   ctx->rl_count++;
+}
+
+static int
+request_rate_allow (client_ctx_t *ctx)
+{
+  time_t now = time (NULL);
+  if (ctx->request_window_start == 0)
+    ctx->request_window_start = now;
+  if (now - ctx->request_window_start >= 60)
+    {
+      ctx->request_window_start = now;
+      ctx->request_count = 0;
+    }
+  if (ctx->request_count >= ctx->rl_limit)
+    return 0;
+  ctx->request_count++;
+  return 1;
 }
 
 static json_t *
@@ -1146,6 +1354,19 @@ server_dispatch_command (client_ctx_t *ctx, json_t *root)
 	    }
 #endif
 
+	  /* AUTH GATE — SINGLE SOURCE OF TRUTH */
+	  if (!(k_command_registry[i].flags & CMD_FLAG_AUTH_FREE))
+	    {
+	      if (ctx->player_id <= 0)
+		{
+		  send_response_error (ctx,
+				       root,
+				       ERR_NOT_AUTHENTICATED,
+				       "Not authenticated");
+		return -1;
+		}
+	    }
+
 	  /* SCHEMA VALIDATION */
 	  json_t *data = json_object_get (root, "data");
 	  char *why = NULL;
@@ -1161,19 +1382,6 @@ server_dispatch_command (client_ctx_t *ctx, json_t *root)
 	      send_response_error (ctx, root, err_code, why ? why : "Invalid request schema");
 	      free (why);
 	      return 0;		/* Error handled */
-	    }
-
-	  /* AUTH GATE — SINGLE SOURCE OF TRUTH */
-	  if (!(k_command_registry[i].flags & CMD_FLAG_AUTH_FREE))
-	    {
-	      if (ctx->player_id <= 0)
-		{
-		  send_response_error (ctx,
-				       root,
-				       ERR_NOT_AUTHENTICATED,
-				       "Not authenticated");
-		  return -1;
-		}
 	    }
 
 	  return k_command_registry[i].handler (ctx, root);
@@ -1276,11 +1484,6 @@ process_message (client_ctx_t *ctx, json_t *root)
 			   ERR_INVALID_SCHEMA, "Invalid request schema");
       return;
     }
-  ctx->rl_limit = 60;
-  ctx->rl_window_sec = 60;
-  ctx->rl_window_start = time (NULL);
-  ctx->rl_count = 0;
-
   if (server_dispatch_command (ctx, root) == -1)
     {
       if (ctx->responses_sent == 0)
@@ -1291,134 +1494,197 @@ process_message (client_ctx_t *ctx, json_t *root)
     }
 }
 
-/* TLS helper: read a line from SSL connection (buffered for partial reads) */
-static ssize_t
-ssl_readline (SSL *ssl, unsigned char *buf, size_t buf_len,
-	      unsigned char *read_buf, size_t *read_pos, size_t *read_used)
+static int
+wait_for_socket (int fd, short events, uint64_t deadline_ms)
 {
-  size_t line_len = 0;
-
-  while (line_len < buf_len - 1)
+  for (;;)
     {
-      /* Check if we have data in buffer */
-      if (*read_pos < *read_used)
-	{
-	  unsigned char ch = read_buf[(*read_pos)++];
-	  buf[line_len++] = ch;
-	  if (ch == '\n')
-	    {
-	      buf[line_len] = '\0';
-	      return (ssize_t) line_len;
-	    }
-	}
-      else
-	{
-	  /* Buffer empty, read more */
-	  int n = SSL_read (ssl, read_buf, 8192);
-	  if (n > 0)
-	    {
-	      *read_used = (size_t) n;
-	      *read_pos = 0;
-	    }
-	  else if (n == 0)
-	    {
-	      /* Connection closed cleanly */
-	      if (line_len > 0)
-		{
-		  buf[line_len] = '\0';
-		  return (ssize_t) line_len;
-		}
-	      return 0;
-	    }
-	  else
-	    {
-	      /* SSL error */
-	      int err = SSL_get_error (ssl, n);
-	      if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
-		{
-		  continue;	/* Retry */
-		}
-	      LOGD ("SSL_read error: %d", err);
-	      return -1;
-	    }
-	}
+      uint64_t now = monotonic_millis ();
+      if (now >= deadline_ms)
+        return 0;
+      int remain = (deadline_ms - now > INT_MAX)
+        ? INT_MAX : (int) (deadline_ms - now);
+      struct pollfd pfd = {.fd = fd, .events = events, .revents = 0};
+      int rc = poll (&pfd, 1, remain);
+      if (rc > 0)
+        return (pfd.revents & (events | POLLERR | POLLHUP | POLLNVAL)) ? 1 : 0;
+      if (rc == 0)
+        return 0;
+      if (errno != EINTR)
+        return -1;
+    }
+}
+
+static int
+connection_tls_handshake (client_ctx_t *ctx)
+{
+  SSL *ssl = SSL_new (g_ssl_ctx);
+  if (!ssl || SSL_set_fd (ssl, ctx->fd) <= 0)
+    {
+      if (ssl) SSL_free (ssl);
+      return -1;
+    }
+  int old_flags = fcntl (ctx->fd, F_GETFL, 0);
+  if (old_flags < 0 || fcntl (ctx->fd, F_SETFL, old_flags | O_NONBLOCK) < 0)
+    {
+      SSL_free (ssl);
+      return -1;
     }
 
-  /* Line too long */
-  LOGD ("SSL readline: line exceeds max length %zu", buf_len);
-  return -1;
+  uint64_t deadline = monotonic_millis () + (uint64_t) g_cfg.server_request_timeout_ms;
+  int result = -1;
+  for (;;)
+    {
+      int rc = SSL_accept (ssl);
+      if (rc == 1)
+        {
+          result = 0;
+          break;
+        }
+      int ssl_error = SSL_get_error (ssl, rc);
+      short events = ssl_error == SSL_ERROR_WANT_WRITE ? POLLOUT : POLLIN;
+      if (ssl_error != SSL_ERROR_WANT_READ && ssl_error != SSL_ERROR_WANT_WRITE)
+        break;
+      if (wait_for_socket (ctx->fd, events, deadline) <= 0)
+        break;
+    }
+  if (fcntl (ctx->fd, F_SETFL, old_flags) < 0)
+    result = -1;
+  if (result != 0)
+    {
+      SSL_free (ssl);
+      return -1;
+    }
+  struct timeval io_timeout = {
+    .tv_sec = g_cfg.server_request_timeout_ms / 1000,
+    .tv_usec = (g_cfg.server_request_timeout_ms % 1000) * 1000
+  };
+  (void) setsockopt (ctx->fd, SOL_SOCKET, SO_RCVTIMEO, &io_timeout,
+                     sizeof io_timeout);
+  (void) setsockopt (ctx->fd, SOL_SOCKET, SO_SNDTIMEO, &io_timeout,
+                     sizeof io_timeout);
+  ctx->ssl_conn = ssl;
+  ctx->is_tls = 1;
+  return 0;
+}
+
+/* Read one newline-framed request, bounded by both bytes and an absolute
+   deadline. Returns -2 for an oversized frame and -3 for a deadline expiry. */
+static ssize_t
+client_readline (client_ctx_t *ctx, char *buf, size_t cap, int timeout_ms)
+{
+  size_t used = 0;
+  uint64_t deadline = monotonic_millis () + (uint64_t) timeout_ms;
+  while (used < cap - 1)
+    {
+      if (!(ctx->is_tls && SSL_pending ((SSL *) ctx->ssl_conn) > 0))
+        {
+          int ready = wait_for_socket (ctx->fd, POLLIN, deadline);
+          /* A partial frame is not a completed request. Do not hand it to
+             the parser and start a fresh deadline, or a slow client could
+             keep a connection alive indefinitely by dripping bytes. */
+          if (ready == 0) return -3;
+          if (ready < 0) return -1;
+        }
+      char ch;
+      ssize_t n;
+      if (ctx->is_tls)
+        {
+          int rc = SSL_read ((SSL *) ctx->ssl_conn, &ch, 1);
+          if (rc > 0) n = rc;
+          else
+            {
+              int ssl_error = SSL_get_error ((SSL *) ctx->ssl_conn, rc);
+              if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE)
+                continue;
+              if (ssl_error == SSL_ERROR_ZERO_RETURN)
+                return used ? (ssize_t) used : 0;
+              return -1;
+            }
+        }
+      else
+        {
+          n = recv (ctx->fd, &ch, 1, 0);
+          if (n == 0) return used ? (ssize_t) used : 0;
+          if (n < 0)
+            {
+              if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+                continue;
+              return -1;
+            }
+        }
+      buf[used++] = ch;
+      if (ch == '\n')
+        {
+          buf[used] = '\0';
+          return (ssize_t) used;
+        }
+    }
+  return -2;
 }
 
 void *
 connection_thread (void *arg)
 {
   client_ctx_t *ctx = (client_ctx_t *) arg;
+  g_ctx_for_send = ctx;
   int fd = ctx->fd;
-
-  char *line = NULL;
-  size_t line_len = 0;
+  char *line = malloc ((size_t) g_cfg.server_max_request_bytes + 1);
   ssize_t read_len;
 
-  if (ctx->is_tls)
+  if (line && g_cfg.tls_enabled && connection_tls_handshake (ctx) != 0)
+    goto cleanup;
+  if (!line)
+    goto cleanup;
+
+  loop_add_client (ctx);
+  ctx->rl_limit = g_cfg.server_requests_per_minute;
+  ctx->rl_window_sec = 60;
+  ctx->rl_window_start = time (NULL);
+  struct timeval io_timeout = {
+    .tv_sec = g_cfg.server_request_timeout_ms / 1000,
+    .tv_usec = (g_cfg.server_request_timeout_ms % 1000) * 1000
+  };
+  (void) setsockopt (fd, SOL_SOCKET, SO_RCVTIMEO, &io_timeout, sizeof io_timeout);
+  (void) setsockopt (fd, SOL_SOCKET, SO_SNDTIMEO, &io_timeout, sizeof io_timeout);
+
+  while ((read_len = client_readline (ctx, line,
+                                      (size_t) g_cfg.server_max_request_bytes + 1,
+                                      g_cfg.server_request_timeout_ms)) != 0)
     {
-      /* TLS path: use ssl_readline */
-      char line_buf[65536];
-      while ((read_len = ssl_readline (ctx->ssl_conn, (unsigned char *) line_buf,
-					sizeof (line_buf),
-					ctx->ssl_read_buf, &ctx->ssl_read_pos,
-					&ctx->ssl_read_used)) > 0)
-	{
-	  json_error_t jerr;
-	  json_t *root = json_loads (line_buf, 0, &jerr);
-
-	  if (!root || !json_is_object (root))
-	    {
-	      send_enveloped_error (fd, NULL, ERR_INVALID_SCHEMA,
-				    "Malformed JSON");
-	      if (root)
-		json_decref (root);
-	    }
-	  else
-	    {
-	      process_message (ctx, root);
-	      json_decref (root);
-	    }
-	}
-    }
-  else
-    {
-      /* Plaintext path: use FILE* and getline */
-      FILE *f = fdopen (fd, "r");
-      if (!f)
-	{
-	  close (fd);
-	  free (ctx);
-	  return NULL;
-	}
-
-      while (getline (&line, &line_len, f) != -1)
-	{
-	  json_error_t jerr;
-	  json_t *root = json_loads (line, 0, &jerr);
-
-	  if (!root || !json_is_object (root))
-	    {
-	      send_enveloped_error (fd, NULL, ERR_INVALID_SCHEMA,
-				    "Malformed JSON");
-	      if (root)
-		json_decref (root);
-	    }
-	  else
-	    {
-	      process_message (ctx, root);
-	      json_decref (root);
-	    }
-	}
-
-      free (line);
-      fclose (f);
+      if (read_len == -2)
+        {
+          send_response_error (ctx, NULL, ERR_BAD_REQUEST, "Request exceeds maximum frame size");
+          break;
+        }
+      if (read_len == -3)
+        {
+          send_response_error (ctx, NULL, ERR_TIMEOUT, "Request deadline exceeded");
+          break;
+        }
+      if (read_len < 0)
+        break;
+      if (!request_rate_allow (ctx))
+        {
+          send_response_error (ctx, NULL, ERR_RATE_LIMITED, "Request rate limit exceeded");
+          break;
+        }
+      json_error_t jerr;
+      json_t *root = json_loads (line, 0, &jerr);
+      if (!root || !json_is_object (root))
+        {
+          send_enveloped_error (fd, NULL, ERR_INVALID_SCHEMA, "Malformed JSON");
+          if (root) json_decref (root);
+        }
+      else
+        {
+          process_message (ctx, root);
+          json_decref (root);
+        }
     }
 
+cleanup:
+  free (line);
   /* TLS cleanup */
   if (ctx->is_tls && ctx->ssl_conn)
     {
@@ -1426,13 +1692,11 @@ connection_thread (void *arg)
       SSL_free (ctx->ssl_conn);
     }
 
-  if (ctx->is_tls)
-    {
-      close (fd);
-    }
-
   db_close_thread ();
   loop_remove_client (ctx);
+  if (ctx->connection_counted)
+    atomic_fetch_sub (&g_active_client_connections, 1);
+  close (fd);
   free (ctx);
   return NULL;
 }
@@ -1482,11 +1746,13 @@ server_loop (volatile sig_atomic_t *running)
 	}
 
       SSL_CTX_set_options (g_ssl_ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3);
+      SSL_CTX_set_min_proto_version (g_ssl_ctx, TLS1_2_VERSION);
       LOGI ("TLS initialized with cert=%s, key=%s\n",
 	    g_cfg.tls_cert_path, g_cfg.tls_key_path);
     }
 
-  int listen_fd = make_listen_socket (g_cfg.server_port);
+  int listen_fd = make_listen_socket (g_cfg.server_port,
+                                      g_cfg.server_bind_address);
 
   if (listen_fd < 0)
     {
@@ -1495,7 +1761,8 @@ server_loop (volatile sig_atomic_t *running)
 	SSL_CTX_free (g_ssl_ctx);
       return -1;
     }
-  LOGI ("Listening on 0.0.0.0:%d\n", g_cfg.server_port);
+  LOGI ("Listening on %s:%d\n", g_cfg.server_bind_address,
+        g_cfg.server_port);
   struct pollfd pfd = {.fd = listen_fd,.events = POLLIN,.revents = 0 };
   pthread_attr_t attr;
 
@@ -1508,6 +1775,7 @@ server_loop (volatile sig_atomic_t *running)
       int rc = poll (&pfd, 1, 100);
       {
 	static uint64_t last_broadcast_ms = 0;
+	static uint64_t last_event_prune_ms = 0;
 	uint64_t now_ms = monotonic_millis ();
 
 	if (now_ms - last_broadcast_ms >= 500)
@@ -1515,6 +1783,18 @@ server_loop (volatile sig_atomic_t *running)
 	    (void) broadcast_sweep_once (game_db_get_handle (), 64);
 	    last_broadcast_ms = now_ms;
 	  }
+	if (now_ms - last_event_prune_ms >= 60000)
+	  {
+	    int64_t deleted = 0;
+	    int prune_rc = repo_comm_event_prune (game_db_get_handle (), 128,
+	                                          &deleted);
+	    if (prune_rc != 0)
+	      LOGE ("player event retention cleanup failed (%d)", prune_rc);
+	    else if (deleted > 0)
+	      LOGI ("player event retention removed %" PRId64 " expired rows",
+	            deleted);
+	    last_event_prune_ms = now_ms;
+	}
       }
 
       if (rc < 0)
@@ -1552,46 +1832,15 @@ server_loop (volatile sig_atomic_t *running)
 	      perror ("accept");
 	      continue;
 	    }
-
-	  /* TLS handshake if enabled */
-	  if (g_cfg.tls_enabled && g_ssl_ctx)
+	  int previous = atomic_fetch_add (&g_active_client_connections, 1);
+	  if (previous >= g_cfg.server_max_connections)
 	    {
-	      SSL *ssl = SSL_new (g_ssl_ctx);
-	      if (!ssl)
-		{
-		  LOGE ("SSL_new failed\n");
-		  close (cfd);
-		  free (ctx);
-		  continue;
-		}
-
-	      if (SSL_set_fd (ssl, cfd) <= 0)
-		{
-		  LOGE ("SSL_set_fd failed\n");
-		  SSL_free (ssl);
-		  close (cfd);
-		  free (ctx);
-		  continue;
-		}
-
-	      int ret = SSL_accept (ssl);
-	      if (ret <= 0)
-		{
-		  int err = SSL_get_error (ssl, ret);
-		  LOGE ("SSL_accept failed: %d\n", err);
-		  SSL_free (ssl);
-		  close (cfd);
-		  free (ctx);
-		  continue;
-		}
-
-	      ctx->is_tls = 1;
-	      ctx->ssl_conn = ssl;
-	      ctx->ssl_read_pos = 0;
-	      ctx->ssl_read_used = 0;
+	      atomic_fetch_sub (&g_active_client_connections, 1);
+	      close (cfd);
+	      free (ctx);
+	      continue;
 	    }
-
-	  loop_add_client (ctx);
+	  ctx->connection_counted = 1;
 	  ctx->fd = cfd;
 	  ctx->running = (sig_atomic_t *) running;
 	  char ip[INET_ADDRSTRLEN];
@@ -1609,11 +1858,7 @@ server_loop (volatile sig_atomic_t *running)
 	  else
 	    {
 	      LOGE ("pthread_create: %s\n", strerror (prc));
-	      loop_remove_client (ctx);
-	      if (ctx->is_tls && ctx->ssl_conn)
-		{
-		  SSL_free (ctx->ssl_conn);
-		}
+	      atomic_fetch_sub (&g_active_client_connections, 1);
 	      close (cfd);
 	      free (ctx);
 	    }

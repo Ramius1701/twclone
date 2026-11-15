@@ -21,6 +21,7 @@ Field provenance (confirmed from server handlers, not draft docs):
                                 to derive locally because the server enforces the
                                 holds >= used invariant via a DB CHECK constraint.
   * fighters / shields       <- ship.status (data.ship.fighters / data.ship.shields)
+  * hull                     <- ship.status (data.ship.hull; server-authoritative)
   * unread_mail              <- mail.inbox (count of data.items lacking "read_at" in
                                 the fetched page only — an approximation bounded by
                                 pagination, NOT a verified total; mail.inbox does not
@@ -72,6 +73,7 @@ class HudState:
     cargo_total: Optional[int] = None
     fighters: Optional[int] = None
     shields: Optional[int] = None
+    hull: Optional[int] = None
     unread_mail: Optional[int] = None
     unread_notices: Optional[int] = None
     unread_news: Optional[int] = None
@@ -99,27 +101,36 @@ def extract_player_fields(resp: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def extract_ship_fields(resp: Dict[str, Any]) -> Dict[str, Any]:
-    """ship.status -> {ship_id, ship_name, fighters, shields, cargo_used, cargo_total}."""
+    """Extract ship identity, condition, defenses, and holds from ship.status."""
     if not _is_ok(resp):
         return {}
     ship = (resp.get("data") or {}).get("ship") or {}
+    # A ship snapshot is only authoritative when it identifies the ship it
+    # describes.  Do not let a schema-mismatched response refresh hull,
+    # cargo, or defensive state for the currently selected vessel.
+    ship_id = ship.get("id")
+    if type(ship_id) is not int or ship_id <= 0:
+        return {}
     out: Dict[str, Any] = {}
-    if isinstance(ship.get("id"), int):
-        out["ship_id"] = ship["id"]
+    out["ship_id"] = ship_id
     if isinstance(ship.get("name"), str):
         out["ship_name"] = ship["name"]
     if isinstance(ship.get("fighters"), int):
         out["fighters"] = ship["fighters"]
     if isinstance(ship.get("shields"), int):
         out["shields"] = ship["shields"]
+    hull = ship.get("hull")
+    if type(hull) is int and 0 <= hull <= 100:
+        out["hull"] = hull
     if isinstance(ship.get("holds"), int):
         out["cargo_total"] = ship["holds"]
     cargo = ship.get("cargo")
     if isinstance(cargo, list):
         used = 0
         for item in cargo:
-            qty = item.get("qty") if isinstance(item, dict) else None
-            if isinstance(qty, int):
+            # The server's ship cargo rows name the amount "quantity".
+            qty = (item.get("quantity", item.get("qty")) if isinstance(item, dict) else None)
+            if type(qty) is int:
                 used += qty
         out["cargo_used"] = used
     return out
@@ -270,6 +281,7 @@ def render_hud_lines(hud: HudState, connected: bool, activity: Optional[int], wi
     ]
     parts_line2 = [
         f"Holds: {cargo_text}",
+        f"Hull: {_fmt(hud.hull)}",
         f"Fighters: {_fmt(hud.fighters)}",
         f"Shields: {_fmt(hud.shields)}",
         f"Link: {link}",

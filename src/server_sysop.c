@@ -8,11 +8,13 @@
 #include "errors.h"
 #include "db/repo/repo_config.h"
 #include "db/repo/repo_sysop.h"
+#include "db/repo/repo_session.h"
 #include "db/repo/repo_communication.h"
 #include "server_communication.h"
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -40,6 +42,7 @@ static const sysop_cfg_def_t k_sysop_allowed_config[] = {
     {"turnsperday", CFG_INT, "Turns allocated per day", CFG_OFF(turnsperday)},
     {"neutral_band", CFG_INT, "Alignment band range considered neutral", CFG_OFF(combat.neutral_band)},
     {"illegal_allowed_neutral", CFG_INT, "Allow illegal acts in neutral sectors", CFG_OFF(illegal_allowed_neutral)},
+    {"illegal_min_experience", CFG_INT, "Minimum experience for illegal goods", CFG_OFF(illegal_min_experience)},
     {"max_cloak_duration", CFG_INT, "Max cloak duration in seconds", CFG_OFF(death.max_cloak_duration)},
     {"limpet_ttl_days", CFG_INT, "Limpet time-to-live in days", CFG_OFF(mines.limpet.limpet_ttl_days)},
 
@@ -48,9 +51,16 @@ static const sysop_cfg_def_t k_sysop_allowed_config[] = {
     {"planet_treasury_interest_rate_bps", CFG_INT, "Planet treasury interest (basis points)", CFG_OFF(planet_treasury_interest_rate_bps)},
     {"bank_alert_threshold_player", CFG_INT64, "Player bank alert threshold", CFG_OFF(bank_alert_threshold_player)},
     {"bank_alert_threshold_corp", CFG_INT64, "Corp bank alert threshold", CFG_OFF(bank_alert_threshold_corp)},
+    {"planet_market.buy_order_expiry_seconds", CFG_INT, "Planet buy-order lifetime in seconds (60-604800)", CFG_OFF(planet_market_buy_order_expiry_seconds)},
+    {"planet.slave_unrest_interval_days", CFG_INT64, "Slave unrest recurrence interval in days; 0 means unset/disabled", CFG_OFF(planet_slave_unrest_interval_days)},
+    {"planet.slave_unrest_stoppage_cycles", CFG_INT64, "Production cycles stopped per unrest event; 0 means unset/disabled", CFG_OFF(planet_slave_unrest_stoppage_cycles)},
+    {"planet.slave_unrest_population_loss", CFG_INT64, "Fixed slave population loss per unrest event; 0 means unset/disabled", CFG_OFF(planet_slave_unrest_population_loss)},
 
     {"shipyard_enabled", CFG_INT, "Enable shipyard features", CFG_OFF(shipyard_enabled)},
     {"shipyard_trade_in_factor_bp", CFG_INT, "Trade-in value factor (bp)", CFG_OFF(shipyard_trade_in_factor_bp)},
+    {"shipyard_sale_factor_bp", CFG_INT, "Standalone ship sale value factor in basis points (0-10000)", CFG_OFF(shipyard_sale_factor_bp)},
+    {"galactic_exchange_liquidity_credits", CFG_INT64, "Exchange liquidity target; explicit system-issued credits", CFG_OFF(galactic_exchange_liquidity_credits)},
+    {"shipyard_used_resale_factor_bp", CFG_INT, "Used ship resale price factor (basis points, default 8000)", CFG_OFF(shipyard_used_resale_factor_bp)},
     {"shipyard_require_cargo_fit", CFG_INT, "Require cargo fit check", CFG_OFF(shipyard_require_cargo_fit)},
     {"shipyard_require_fighters_fit", CFG_INT, "Require fighters fit check", CFG_OFF(shipyard_require_fighters_fit)},
     {"shipyard_require_shields_fit", CFG_INT, "Require shields fit check", CFG_OFF(shipyard_require_shields_fit)},
@@ -69,11 +79,7 @@ static const sysop_cfg_def_t* find_config_def(const char *key) {
 
 static bool check_sysop_role(client_ctx_t *ctx) {
     if (!ctx) return false;
-    /* Local console/System actor has id 0 and is always SysOp */
-    if (ctx->player_id == 0) return true;
-    if (ctx->player_id < 0) return false;
-    int type = auth_player_get_type(ctx->player_id);
-    return (type == PLAYER_TYPE_SYSOP);
+    return auth_player_is_sysop(ctx->player_id) != 0;
 }
 
 static json_t* get_config_value_json(const sysop_cfg_def_t *def) {
@@ -202,7 +208,64 @@ int cmd_sysop_config_set(client_ctx_t *ctx, json_t *root) {
         return 0;
     }
 
+    if (strcmp(key, "planet_market.buy_order_expiry_seconds") == 0) {
+        char *end = NULL;
+        long expiry = strtol(val_str, &end, 10);
+        if (end == val_str || *end != '\0' || expiry < 60 || expiry > 604800) {
+            send_response_refused(ctx, root, 1407,
+                                  "Refused: buy-order expiry must be 60-604800 seconds", NULL);
+            return 0;
+        }
+    }
+    if (strcmp(key, "shipyard_sale_factor_bp") == 0) {
+        char *end = NULL;
+        long factor = strtol(val_str, &end, 10);
+        if (end == val_str || *end != '\0' || factor < 0 || factor > 10000) {
+            send_response_refused(ctx, root, 1407,
+                                  "Refused: shipyard sale factor must be 0-10000 basis points", NULL);
+            return 0;
+        }
+    }
+    if (strcmp(key, "galactic_exchange_liquidity_credits") == 0) {
+        char *end = NULL;
+        errno = 0;
+        long long liquidity = strtoll(val_str, &end, 10);
+        if (errno == ERANGE || end == val_str || *end != '\0' || liquidity < 0) {
+            send_response_refused(ctx, root, 1407,
+                                  "Refused: Exchange liquidity must be a nonnegative credit amount", NULL);
+            return 0;
+        }
+    }
+    if (strcmp(key, "shipyard_used_resale_factor_bp") == 0) {
+        char *end = NULL;
+        long factor = strtol(val_str, &end, 10);
+        if (end == val_str || *end != '\0' || factor < 0 || factor > 10000) {
+            send_response_refused(ctx, root, 1407,
+                                  "Refused: used resale factor must be 0-10000 basis points", NULL);
+            return 0;
+        }
+    }
+    if (strcmp(key, "planet.slave_unrest_interval_days") == 0
+        || strcmp(key, "planet.slave_unrest_stoppage_cycles") == 0
+        || strcmp(key, "planet.slave_unrest_population_loss") == 0) {
+        char *end = NULL;
+        errno = 0;
+        long long value = strtoll(val_str, &end, 10);
+        if (errno == ERANGE || end == val_str || *end != '\0' || value < 0) {
+            send_response_refused(ctx, root, 1407,
+                                  "Refused: unrest policy values must be nonnegative integers; 0 disables the unset policy", NULL);
+            return 0;
+        }
+    }
+
     // Capture old value for audit
+    int old_planet_market_expiry = g_cfg.planet_market_buy_order_expiry_seconds;
+    int old_shipyard_sale_factor = g_cfg.shipyard_sale_factor_bp;
+    int64_t old_exchange_liquidity = g_cfg.galactic_exchange_liquidity_credits;
+    int old_used_resale_factor = g_cfg.shipyard_used_resale_factor_bp;
+    int64_t old_slave_unrest_interval = g_cfg.planet_slave_unrest_interval_days;
+    int64_t old_slave_unrest_stoppage = g_cfg.planet_slave_unrest_stoppage_cycles;
+    int64_t old_slave_unrest_loss = g_cfg.planet_slave_unrest_population_loss;
     char old_val_buf[128];
     json_t *j_old = get_config_value_json(def);
     char *j_old_dump = json_dumps(j_old, JSON_ENCODE_ANY);
@@ -235,6 +298,20 @@ int cmd_sysop_config_set(client_ctx_t *ctx, json_t *root) {
     // Persist to DB
     db_t *db = game_db_get_handle();
     if (repo_config_set_value(db, key, val_str) != 0) {
+        if (strcmp(key, "planet_market.buy_order_expiry_seconds") == 0)
+            g_cfg.planet_market_buy_order_expiry_seconds = old_planet_market_expiry;
+        if (strcmp(key, "shipyard_sale_factor_bp") == 0)
+            g_cfg.shipyard_sale_factor_bp = old_shipyard_sale_factor;
+        if (strcmp(key, "galactic_exchange_liquidity_credits") == 0)
+            g_cfg.galactic_exchange_liquidity_credits = old_exchange_liquidity;
+        if (strcmp(key, "shipyard_used_resale_factor_bp") == 0)
+            g_cfg.shipyard_used_resale_factor_bp = old_used_resale_factor;
+        if (strcmp(key, "planet.slave_unrest_interval_days") == 0)
+            g_cfg.planet_slave_unrest_interval_days = old_slave_unrest_interval;
+        if (strcmp(key, "planet.slave_unrest_stoppage_cycles") == 0)
+            g_cfg.planet_slave_unrest_stoppage_cycles = old_slave_unrest_stoppage;
+        if (strcmp(key, "planet.slave_unrest_population_loss") == 0)
+            g_cfg.planet_slave_unrest_population_loss = old_slave_unrest_loss;
         send_response_error(ctx, root, 1503, "Database Error: could not save config");
         return 0;
     }
@@ -387,11 +464,18 @@ int cmd_sysop_player_kick(client_ctx_t *ctx, json_t *root) {
         return 0;
     }
 
-    // Attempt kick
-    int kicked_count = server_sysop_kick_player(target_id);
-    
-    // Audit
     db_t *db = game_db_get_handle();
+    if (!db || repo_session_revoke_player_sessions(db, target_id) != 0) {
+        send_response_error(ctx, root, 1503,
+                            "Database Error: could not revoke player sessions");
+        return 0;
+    }
+
+    /* Revoke durable tokens before closing sockets. Even if a client reconnects
+     * on an already-open transport, the next request must fail authentication. */
+    int kicked_count = server_sysop_kick_player(target_id);
+
+    // Audit
     char *audit_payload = json_dumps(j_data, 0);
     repo_sysop_audit(db, ctx->player_id, "sysop.player.kick", audit_payload, NULL);
     free(audit_payload);

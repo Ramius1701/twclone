@@ -647,6 +647,9 @@ trade_offer_settle (db_t *db, const trade_offer_t *offer)
   int seller_ship = h_get_active_ship_id (db, seller_id);
   if (buyer_ship <= 0 || seller_ship <= 0 || buyer_ship == seller_ship)
     return ERR_NO_ACTIVE_SHIP;
+  int lock_rc = repo_cargo_lock_ships_for_update (db, buyer_ship, seller_ship);
+  if (lock_rc != 0)
+    return lock_rc;
 
   if (offer->quantity <= 0 || offer->unit_price < 0
       || (offer->unit_price > 0
@@ -888,6 +891,33 @@ cmd_trade_cancel (client_ctx_t *ctx, json_t *root)
   return 0;
 }
 
+int
+cmd_trade_offers (client_ctx_t *ctx, json_t *root)
+{
+  if (!trade_offer_require_auth (ctx, root))
+    return 0;
+  db_t *db = game_db_get_handle ();
+  if (!db)
+    {
+      send_response_error (ctx, root, ERR_DB_BUSY, "Database unavailable");
+      return 0;
+    }
+  trade_offer_list_t list;
+  int rc = repo_trade_offer_list_for_player (db, ctx->player_id, &list);
+  if (rc != 0)
+    {
+      send_response_error (ctx, root, rc, "Could not list player offers");
+      return 0;
+    }
+  json_t *offers = json_array ();
+  for (int i = 0; i < list.count; ++i)
+    json_array_append_new (offers, trade_offer_json (&list.items[i]));
+  json_t *payload = json_object ();
+  json_object_set_new (payload, "offers", offers);
+  send_response_ok_take (ctx, root, "trade.offers_v1", &payload);
+  return 0;
+}
+
 
 //////////////////////////////////////////////////
 // --- helpers ---------------------------------------------------------------
@@ -1049,6 +1079,23 @@ h_is_illegal_commodity (db_t *db, const char *commodity_code)
   return illegal;
 }
 
+/* Slave acquisition is narrower than generic illegal trading: neutral players
+ * may be allowed other illegal trades by configuration, but only evil players
+ * may acquire slaves under POP-02/POP-003. Fail closed if alignment cannot be
+ * authoritatively resolved. */
+static bool
+h_player_is_evil_aligned (db_t *db, int player_id)
+{
+  int alignment = 0;
+  int is_evil = 0;
+  if (!db || player_id <= 0
+      || db_player_get_alignment (db, player_id, &alignment) != 0
+      || db_alignment_band_for_value (db, alignment, NULL, NULL, NULL,
+                                      NULL, &is_evil, NULL, NULL) != 0)
+    return false;
+  return is_evil != 0;
+}
+
 
 static bool
 h_can_trade_commodity (db_t *db,
@@ -1096,6 +1143,16 @@ h_can_trade_commodity (db_t *db,
     }
 
   // From here, we know it's an illegal commodity.
+  int player_xp = db_get_player_xp (db, player_id);
+  int minimum_illegal_xp = db_get_config_int (db, "illegal_min_experience", 400);
+  if (player_xp < minimum_illegal_xp)
+    {
+      LOGI
+	("h_can_trade_commodity: Port %d, Player %d: insufficient experience (%d < %d) for illegal trade.",
+	 port_id, player_id, player_xp, minimum_illegal_xp);
+      return false;
+    }
+
   // 3. Get port's sector and its cluster alignment
   int sector_id = 0;
   if (db_ports_get_port_sector (db, port_id, &sector_id) != 0)
@@ -1177,29 +1234,30 @@ check_player_alignment:
 
   db_player_get_alignment (db, player_id, &player_alignment);	// Retrieve player's raw alignment score
   int player_align_band_id = 0;
+  int player_is_good = 0;
   int player_is_evil = 0;
 
 
   db_alignment_band_for_value (db,
 			       player_alignment,
 			       &player_align_band_id,
-			       NULL, NULL, NULL, &player_is_evil, NULL, NULL);
-  int neutral_band_value = db_get_config_int (db, "neutral_band", 75);	// Get neutral_band from config
+		       NULL, NULL, &player_is_good, &player_is_evil, NULL, NULL);
 
 
   LOGD
-    ("h_can_trade_commodity: Port %d, Player %d (Alignment %d, Band %d): player_is_evil=%d, neutral_band_value=%d",
+    ("h_can_trade_commodity: Port %d, Player %d (Alignment %d, Band %d): player_is_good=%d, player_is_evil=%d, xp=%d/%d",
      port_id,
      player_id,
      player_alignment,
-     player_align_band_id, player_is_evil, neutral_band_value);
+     player_align_band_id, player_is_good, player_is_evil,
+     player_xp, minimum_illegal_xp);
 
-  // If player is Good (alignment > neutral_band), refuse illegal trade.
-  if (player_alignment > neutral_band_value)
+  // Good alignment is blocked; neutral and evil are handled separately below.
+  if (player_is_good)
     {
       LOGI
-	("h_can_trade_commodity: Port %d, Player %d, Cmd %s: Player alignment is too good (%d). Refused illegal trade.",
-	 port_id, player_id, commodity_code, player_alignment);
+	("h_can_trade_commodity: Port %d, Player %d, Cmd %s: Player is good-aligned. Refused illegal trade.",
+	 port_id, player_id, commodity_code);
       return false;
     }
 
@@ -1236,6 +1294,22 @@ h_update_port_stock (db_t *db,
 		     int port_id,
 		     const char *commodity_code, int delta, int *new_qty_out)
 {
+
+  /* Port inventory is part of the trade settlement.  Do not let the
+   * generic entity-stock helper silently clamp an invalid settlement: that
+   * would mint cargo when a buy exceeds stock, or overfill a port when a
+   * sell exceeds capacity. */
+  int current_quantity = 0;
+  int max_capacity = 0;
+  if (db_ports_get_market_move_info (db, port_id, commodity_code,
+                                     &current_quantity, &max_capacity) != 0)
+    return ERR_DB_NOT_FOUND;
+
+  int new_quantity = 0;
+  if (__builtin_add_overflow (current_quantity, delta, &new_quantity)
+      || new_quantity < 0 || new_quantity > max_capacity)
+    return ERR_DB_CONSTRAINT;
+
   return h_update_entity_stock (db,
 				ENTITY_TYPE_PORT,
 				port_id, commodity_code, delta, new_qty_out);
@@ -1268,6 +1342,18 @@ h_market_move_port_stock (db_t *db,
     {
       return 0;
     }
+  if (quantity_delta == INT_MIN)
+    return ERR_INVALID_ARG;
+
+  /* Serialize all port capacity checks and additions on the port row. */
+  int lock_rc = db_ports_lock_for_update (db, port_id);
+  if (lock_rc != 0)
+    return lock_rc;
+
+  if (quantity_delta < 0)
+    return db_ports_decrement_stock (db, ENTITY_TYPE_PORT, port_id,
+                                     commodity_code, -quantity_delta,
+                                     (int64_t) time (NULL));
 
   /* 1. Get current quantity and port size (for max capacity) */
   int current_quantity = 0;
@@ -1289,8 +1375,11 @@ h_market_move_port_stock (db_t *db,
     }
 
 
-  new_quantity = (new_quantity < 0) ? 0 : new_quantity;
-  new_quantity = (new_quantity > max_capacity) ? max_capacity : new_quantity;
+  /* A settlement outside the port's inventory bounds is a refusal, not a
+   * clamped success.  Clamping here used to grant cargo that the port did
+   * not own when a buy raced or requested more than available stock. */
+  if (new_quantity < 0 || new_quantity > max_capacity)
+    return ERR_DB_CONSTRAINT;
 
   /* 3. Update DB */
   return h_update_entity_stock (db,
@@ -1985,13 +2074,6 @@ cmd_trade_port_info (client_ctx_t *ctx, json_t *root)
     }
   sector_id = port_sector_id;
 
-  /* Record player knowledge and visit */
-  repo_players_record_port_knowledge (db, ctx->player_id, port_id_val);
-  if (sector_id > 0)
-    {
-      repo_players_record_visit (db, ctx->player_id, sector_id);
-    }
-
   /* --- Retrieve commodities from entity_stock --- */
   {
     if (db_ports_get_commodities (db, port_id_val, &commodities_array) != 0)
@@ -2013,6 +2095,20 @@ cmd_trade_port_info (client_ctx_t *ctx, json_t *root)
       json_object_set_new (commodity_obj, "max_quantity",
 			   json_integer (port_size * 1000));
       json_object_set_new (commodity_obj, "illegal", json_boolean (illegal));
+
+      /* The stock table's `price` is a legacy single-price field.  The
+       * playable trade contract has separate player-facing prices: buying
+       * from the port uses the port sell price, while selling to the port
+       * uses the port buy price.  Publish both here so port screens do not
+       * have to display one price as both directions. */
+      int player_buy_price = h_entity_calculate_sell_price
+        (db, ENTITY_TYPE_PORT, port_id_val, commodity_code);
+      int player_sell_price = h_entity_calculate_buy_price
+        (db, ENTITY_TYPE_PORT, port_id_val, commodity_code);
+      json_object_set_new (commodity_obj, "buy_price",
+                           json_integer (player_buy_price > 0 ? player_buy_price : 0));
+      json_object_set_new (commodity_obj, "sell_price",
+                           json_integer (player_sell_price > 0 ? player_sell_price : 0));
 
       if (illegal
 	  && !h_can_trade_commodity (db, port_id_val, ctx->player_id,
@@ -2037,6 +2133,15 @@ cmd_trade_port_info (client_ctx_t *ctx, json_t *root)
 
   json_object_set_new (payload, "port", port);
   port = NULL;			/* Ownership transferred to payload */
+
+  /* Only persist knowledge after the complete response has been assembled.
+   * A refused or failed information request must not leave a visit/knowledge
+   * side effect behind. */
+  repo_players_record_port_knowledge (db, ctx->player_id, port_id_val);
+  if (sector_id > 0)
+    {
+      repo_players_record_visit (db, ctx->player_id, sector_id);
+    }
 
   send_response_ok_take (ctx, root, "trade.port_info", &payload);
   payload = NULL;		/* Ownership transferred */
@@ -2068,6 +2173,7 @@ cmd_trade_jettison (client_ctx_t *ctx, json_t *root)
   json_t *data = json_object_get (root, "data");
   json_t *payload = NULL;
   const char *commodity = NULL;
+  char commodity_code[16] = { 0 };
   int quantity = 0;
   int player_ship_id = 0;
   int rc = 0;
@@ -2091,28 +2197,55 @@ cmd_trade_jettison (client_ctx_t *ctx, json_t *root)
       return 0;
     }
 
-  h_decloak_ship (db, player_ship_id);
-  TurnConsumeResult tc = h_consume_player_turn (db, ctx, 1);
-
-
-  if (tc != TURN_CONSUME_SUCCESS)
-    {
-      return handle_turn_consumption_error (ctx, tc, "ship.jettison", root,
-					    NULL);
-    }
-
   if (!json_is_object (data))
     {
       send_response_error (ctx, root, 400, "Missing data object.");
       return 0;
     }
 
-  json_t *jcommodity = json_object_get (data, "commodity");
-
-
-  if (json_is_string (jcommodity))
+  /* ship.jettison's V3 request schema uses the canonical commodity ID,
+   * whereas the legacy trade.jettison alias uses a commodity code. Resolve
+   * the ID through the catalogue so both contracts use the same cargo path. */
+  json_t *jcommodity_id = json_object_get (data, "commodity_id");
+  if (json_is_integer (jcommodity_id))
     {
-      commodity = json_string_value (jcommodity);
+      db_res_t *commodity_res = NULL;
+      db_error_t commodity_err;
+      char commodity_sql[256];
+      if (sql_build (db,
+                     "SELECT code FROM commodities WHERE commodities_id = {1};",
+                     commodity_sql, sizeof commodity_sql) != 0
+          || !db_query (db, commodity_sql,
+                        (db_bind_t[]){ db_bind_i64 (json_integer_value (jcommodity_id)) },
+                        1, &commodity_res, &commodity_err))
+        {
+          if (commodity_res)
+            db_res_finalize (commodity_res);
+          send_response_error (ctx, root, ERR_DB,
+                               "Unable to resolve cargo commodity.");
+          return 0;
+        }
+      if (db_res_step (commodity_res, &commodity_err))
+        {
+          const char *resolved = db_res_col_text (commodity_res, 0,
+                                                   &commodity_err);
+          if (resolved)
+            snprintf (commodity_code, sizeof commodity_code, "%s", resolved);
+        }
+      db_res_finalize (commodity_res);
+      if (commodity_code[0] == '\0')
+        {
+          send_response_error (ctx, root, ERR_COMMODITY_UNKNOWN,
+                               "Unknown commodity ID.");
+          return 0;
+        }
+      commodity = commodity_code;
+    }
+  else
+    {
+      json_t *jcommodity = json_object_get (data, "commodity");
+      if (json_is_string (jcommodity))
+        commodity = json_string_value (jcommodity);
     }
 
   json_t *jquantity = json_object_get (data, "quantity");
@@ -2138,9 +2271,9 @@ cmd_trade_jettison (client_ctx_t *ctx, json_t *root)
 
 
   if (h_get_ship_cargo_and_holds (db, player_ship_id,
-				  &cur_ore, &cur_org, &cur_eq, &cur_holds,
-				  &cur_colonists,
-				  &cur_slaves, &cur_weapons, &cur_drugs) != 0)
+                                  &cur_ore, &cur_org, &cur_eq,
+				  &cur_colonists, &cur_slaves,
+				  &cur_weapons, &cur_drugs, &cur_holds) != 0)
     {
       send_response_error (ctx, root, 500, "Could not read ship cargo.");
       return 0;
@@ -2153,32 +2286,43 @@ cmd_trade_jettison (client_ctx_t *ctx, json_t *root)
       || strcasecmp (commodity, "ORE") == 0)
     {
       have = cur_ore;
+      commodity = "ORE";
     }
   else if (strcasecmp (commodity, "organics") == 0
 	   || strcasecmp (commodity, "ORG") == 0)
     {
       have = cur_org;
+      commodity = "ORG";
     }
   else if (strcasecmp (commodity, "equipment") == 0
 	   || strcasecmp (commodity, "EQU") == 0)
     {
       have = cur_eq;
+      commodity = "EQU";
     }
-  else if (strcasecmp (commodity, "colonists") == 0)
+  else if (strcasecmp (commodity, "colonists") == 0
+           || strcasecmp (commodity, "COL") == 0)
     {
       have = cur_colonists;
+      commodity = "COL";
     }
-  else if (strcasecmp (commodity, "slaves") == 0)
+  else if (strcasecmp (commodity, "slaves") == 0
+           || strcasecmp (commodity, "SLV") == 0)
     {
       have = cur_slaves;
+      commodity = "SLV";
     }
-  else if (strcasecmp (commodity, "weapons") == 0)
+  else if (strcasecmp (commodity, "weapons") == 0
+           || strcasecmp (commodity, "WPN") == 0)
     {
       have = cur_weapons;
+      commodity = "WPN";
     }
-  else if (strcasecmp (commodity, "drugs") == 0)
+  else if (strcasecmp (commodity, "drugs") == 0
+           || strcasecmp (commodity, "DRG") == 0)
     {
       have = cur_drugs;
+      commodity = "DRG";
     }
   else
     {
@@ -2199,17 +2343,73 @@ cmd_trade_jettison (client_ctx_t *ctx, json_t *root)
       return 0;
     }
 
-  /* Update ship cargo (jettisoning means negative delta) */
+  /* Validate first, then make the turn, cargo, and population-alignment
+   * changes one atomic operation. */
+  h_decloak_ship (db, player_ship_id);
+  db_error_t tx_err = { 0 };
+  if (!db_tx_begin (db, DB_TX_IMMEDIATE, &tx_err))
+    {
+      send_response_error (ctx, root, ERR_DB_BUSY, "Database busy.");
+      return 0;
+    }
+
+  TurnConsumeResult tc = h_consume_player_turn (db, ctx, 1);
+  if (tc != TURN_CONSUME_SUCCESS)
+    {
+      db_tx_rollback (db, &tx_err);
+      return handle_turn_consumption_error (ctx, tc, "ship.jettison", root,
+						    NULL);
+    }
+
+  /* Update ship cargo (jettisoning means negative delta). */
   int new_qty = 0;
 
 
-  rc = h_update_ship_cargo (db, ctx->ship_id, commodity, -quantity, &new_qty);
+  /* The session's cached ship_id can lag after a ship switch. The cargo read
+   * above uses the authoritative active ship, so the write must target that
+   * same ship or a successful jettison can mutate a different hull. */
+  rc = h_update_ship_cargo (db, player_ship_id, commodity, -quantity, &new_qty);
 
   LOGD ("cmd_trade_jettison: Ship cargo updated. new_qty=%d", new_qty);
 
   if (rc != 0)
     {
+      db_tx_rollback (db, &tx_err);
       send_response_error (ctx, root, 500, "Failed to update ship cargo.");
+      return 0;
+    }
+
+  int updated_alignment = 0;
+  bool is_population = strcasecmp (commodity, "colonists") == 0
+    || strcasecmp (commodity, "COL") == 0
+    || strcasecmp (commodity, "slaves") == 0
+    || strcasecmp (commodity, "SLV") == 0;
+  if (is_population)
+    {
+      /* Use an expression based on the locked row so concurrent jettisons
+       * cannot overwrite one another's alignment penalty. */
+      const char *alignment_sql =
+        "UPDATE players SET alignment = alignment - {1} "
+        "WHERE player_id = {2};";
+      char alignment_query[512];
+      if (sql_build (db, alignment_sql, alignment_query,
+                     sizeof alignment_query) != 0
+          || !db_exec (db, alignment_query,
+                       (db_bind_t[]){ db_bind_i64 (quantity),
+                                      db_bind_i64 (ctx->player_id) },
+                       2, &tx_err))
+        {
+          db_tx_rollback (db, &tx_err);
+          send_response_error (ctx, root, ERR_DB,
+                               "Failed to update player alignment.");
+          return 0;
+        }
+    }
+
+  if (db_player_get_alignment (db, ctx->player_id, &updated_alignment) != 0)
+    {
+      db_tx_rollback (db, &tx_err);
+      send_response_error (ctx, root, ERR_DB, "Failed to read player alignment.");
       return 0;
     }
 
@@ -2220,9 +2420,9 @@ cmd_trade_jettison (client_ctx_t *ctx, json_t *root)
 
   /* Re-fetch current cargo to ensure accurate remaining_cargo */
   if (h_get_ship_cargo_and_holds (db, player_ship_id,
-				  &cur_ore, &cur_org, &cur_eq, &cur_holds,
-				  &cur_colonists,
-				  &cur_slaves, &cur_weapons, &cur_drugs) == 0)
+                                  &cur_ore, &cur_org, &cur_eq,
+				  &cur_colonists, &cur_slaves,
+				  &cur_weapons, &cur_drugs, &cur_holds) == 0)
     {
       if (cur_ore > 0)
 	{
@@ -2286,7 +2486,16 @@ cmd_trade_jettison (client_ctx_t *ctx, json_t *root)
 	  json_object_set_new (it, "commodity", json_string ("drugs"));
 	  json_object_set_new (it, "quantity", json_integer (cur_drugs));
 	  json_array_append_new (remaining_cargo_array, it);
-	}
+      }
+    }
+
+  json_object_set_new (payload, "alignment", json_integer (updated_alignment));
+  if (!db_tx_commit (db, &tx_err))
+    {
+      db_tx_rollback (db, &tx_err);
+      json_decref (payload);
+      send_response_error (ctx, root, ERR_DB, "Jettison could not be committed.");
+      return 0;
     }
 
   json_object_set_new (payload, "remaining_cargo", remaining_cargo_array);
@@ -2399,8 +2608,9 @@ cmd_port_rob (client_ctx_t *ctx, json_t *root)
                                                   "port.rob");
           if (enforcement_rc == 1)
             {
-              send_response_error (ctx, root, ERR_PERMISSION_DENIED,
-                                   "Captain Z intervenes: aggression in FedSpace is forbidden.");
+              send_response_refused_steal (ctx, root, ERR_PERMISSION_DENIED,
+                                           "Captain Z intervenes: aggression in FedSpace is forbidden.",
+                                           NULL);
               return 0;
             }
           if (enforcement_rc < 0)
@@ -2977,7 +3187,7 @@ cmd_trade_sell (client_ctx_t *ctx, json_t *root)
     }
   data = json_object_get (root, "data");
   int account_type = db_get_player_pref_int (db, ctx->player_id,
-					     "trade.default_account",
+					     "trade.prefer_bank",
 					     0);	// Default to petty cash (0)
   json_t *jaccount = json_object_get (data, "account");
 
@@ -3015,6 +3225,16 @@ cmd_trade_sell (client_ctx_t *ctx, json_t *root)
   if (sector_id <= 0)
     {
       send_response_error (ctx, root, 400, "Invalid sector_id.");
+      return 0;
+    }
+  /* Trading is a current-location action.  Do not let a caller select a
+   * remote sector and then settle against a port there; this check must run
+   * before idempotency, turn, cargo, credit, or knowledge mutations. */
+  if (sector_id != ctx->sector_id)
+    {
+      send_response_refused_steal (ctx, root, ERR_PORT_NOT_FOUND,
+                                   "You must be in the port's sector to trade.",
+                                   NULL);
       return 0;
     }
   if (!cluster_can_trade (db, sector_id, ctx->player_id))
@@ -3086,18 +3306,6 @@ cmd_trade_sell (client_ctx_t *ctx, json_t *root)
 	goto cleanup;
       }
   }
-  /* Replays return above without consuming another turn. A new valid
-   * transaction retains the existing one-turn cost before gameplay work. */
-  TurnConsumeResult tc = h_consume_player_turn (db, ctx, 1);
-  if (tc != TURN_CONSUME_SUCCESS)
-    {
-      return handle_turn_consumption_error (ctx, tc, "trade.sell", root,
-						    NULL);
-    }
-  /* decloak */
-  int player_ship_id = h_get_active_ship_id (db, ctx->player_id);
-  h_decloak_ship (db, player_ship_id);
-
   /* resolve port from sector */
   if (requested_port_id > 0)
     {
@@ -3105,6 +3313,16 @@ cmd_trade_sell (client_ctx_t *ctx, json_t *root)
       if (db_ports_check_port_id (db, requested_port_id, &exists) == 0
 	  && exists)
 	{
+	  int port_sector_id = 0;
+	  if (db_ports_get_port_sector (db, requested_port_id,
+	                                 &port_sector_id) != 0
+	      || port_sector_id != ctx->sector_id)
+	    {
+	      send_response_refused_steal (ctx, root, ERR_PORT_NOT_FOUND,
+	                                   "You must be in the port's sector to trade.",
+	                                   NULL);
+	      return 0;
+	    }
 	  port_id = requested_port_id;
 	}
       else
@@ -3124,12 +3342,8 @@ cmd_trade_sell (client_ctx_t *ctx, json_t *root)
 	}
     }
 
-  /* Record player knowledge */
-  repo_players_record_port_knowledge (db, ctx->player_id, port_id);
-
-  player_ship_id = h_get_active_ship_id (db, ctx->player_id);
+  int player_ship_id = h_get_active_ship_id (db, ctx->player_id);
   ctx->ship_id = player_ship_id;
-  h_decloak_ship (db, player_ship_id);
   /* pre-load credits & cargo (outside tx is fine; final checks are atomic) */
   long long current_credits = 0;
 
@@ -3266,7 +3480,10 @@ cmd_trade_sell (client_ctx_t *ctx, json_t *root)
       int ore, org, eq, holds, colonists, slaves, weapons, drugs;	// Declare for new cargo types
 
 
-      if (h_get_ship_cargo_and_holds (db, player_ship_id, &ore, &org, &eq, &holds, &colonists, &slaves, &weapons, &drugs) != 0)	// Pass new cargo types
+      if (h_get_ship_cargo_and_holds (db, player_ship_id,
+                                      &ore, &org, &eq,
+                                      &colonists, &slaves,
+                                      &weapons, &drugs, &holds) != 0)	// Pass new cargo types
 	{
 	  send_response_error (ctx, root, 500, "Could not read ship cargo.");
 	  free (canonical_commodity_code);
@@ -3381,6 +3598,19 @@ cmd_trade_sell (client_ctx_t *ctx, json_t *root)
       }
     we_started_tx = 1;
   }
+
+  /* A rejected trade must not consume turns, decloak the ship, or persist
+   * port knowledge. Apply these effects only after validation, inside the
+   * same transaction as the trade so later failures roll them back. */
+  TurnConsumeResult tc = h_consume_player_turn (db, ctx, 1);
+  if (tc != TURN_CONSUME_SUCCESS)
+    {
+      handle_turn_consumption_error (ctx, tc, "trade.sell", root, NULL);
+      goto fail_tx;
+    }
+  h_decloak_ship (db, player_ship_id);
+  (void) repo_players_record_port_knowledge (db, ctx->player_id, port_id);
+
   receipt = json_object ();
   lines = json_array ();
   if (!receipt || !lines)
@@ -3813,7 +4043,7 @@ cmd_trade_buy (client_ctx_t *ctx, json_t *root)
     }
 
   int account_type = db_get_player_pref_int (db, ctx->player_id,
-					     "trade.default_account",
+					     "trade.prefer_bank",
 					     0);
 
   json_t *jaccount = json_object_get (data, "account");
@@ -3844,6 +4074,20 @@ cmd_trade_buy (client_ctx_t *ctx, json_t *root)
   if (json_is_integer (jport))
     {
       requested_port_id = (int) json_integer_value (jport);
+    }
+
+  /* A trade cannot be directed at a remote sector.  Keep the supplied
+   * sector_id as receipt metadata, but require it to identify the live
+   * player location before any settlement work begins. */
+  if (json_is_integer (json_object_get (data, "sector_id"))
+      && json_integer_value (json_object_get (data, "sector_id"))
+         != ctx->sector_id)
+    {
+      send_response_refused_steal (ctx, root, ERR_PORT_NOT_FOUND,
+                                   "You must be in the port's sector to trade.",
+                                   NULL);
+      rc = 0;
+      goto cleanup;
     }
 
   /* items */
@@ -3909,14 +4153,6 @@ cmd_trade_buy (client_ctx_t *ctx, json_t *root)
 	}
     }
 
-  /* First execution pays the normal turn cost. Matching replays returned
-   * above and therefore never reach this point. */
-  TurnConsumeResult tc = h_consume_player_turn (db, ctx, 1);
-  if (tc != TURN_CONSUME_SUCCESS)
-    {
-      return handle_turn_consumption_error (ctx, tc, "trade.buy", root, NULL);
-    }
-
   /* resolve port_id (if requested_port_id provided) */
   if (requested_port_id > 0)
     {
@@ -3924,6 +4160,16 @@ cmd_trade_buy (client_ctx_t *ctx, json_t *root)
 	{
 	  send_response_refused_steal (ctx, root, ERR_PORT_NOT_FOUND,
 				       "Port not found.", NULL);
+	  rc = 0;
+	  goto cleanup;
+	}
+      int port_sector_id = 0;
+      if (db_ports_get_port_sector (db, port_id, &port_sector_id) != 0
+          || port_sector_id != ctx->sector_id)
+	{
+	  send_response_refused_steal (ctx, root, ERR_PORT_NOT_FOUND,
+	                               "You must be in the port's sector to trade.",
+	                               NULL);
 	  rc = 0;
 	  goto cleanup;
 	}
@@ -3938,9 +4184,6 @@ cmd_trade_buy (client_ctx_t *ctx, json_t *root)
 	  goto cleanup;
 	}
     }
-
-  /* Record player knowledge */
-  repo_players_record_port_knowledge (db, ctx->player_id, port_id);
 
   /* Parse trade lines */
   rc = parse_trade_lines (jitems, &trade_lines, &n);
@@ -4026,6 +4269,18 @@ cmd_trade_buy (client_ctx_t *ctx, json_t *root)
 				       REF_PORT_OUT_OF_STOCK,
 				       "Port does not sell this commodity.",
 				       NULL);
+	  goto cleanup;
+	}
+
+      /* Neutral illegal-trade configuration must never grant slave purchase
+       * rights. Slave acquisition is explicitly evil-only; ordinary illegal
+       * commodities continue through the existing generic policy below. */
+      if (strcasecmp (commodity, "SLV") == 0
+          && !h_player_is_evil_aligned (db, ctx->player_id))
+	{
+	  send_response_refused_steal (ctx, root, ERR_ALIGNMENT_RESTRICTED,
+	                               "Only evil-aligned players may acquire slaves.",
+	                               NULL);
 	  goto cleanup;
 	}
 
@@ -4184,11 +4439,35 @@ cmd_trade_buy (client_ctx_t *ctx, json_t *root)
     }
   we_started_tx = 1;
 
+  /* Matching replays return before this transaction. Charge a turn and
+   * record the successful port interaction atomically with a new purchase,
+   * after all request, mode, stock, capacity, and credit checks have passed. */
+  TurnConsumeResult tc = h_consume_player_turn (db, ctx, 1);
+  if (tc != TURN_CONSUME_SUCCESS)
+    {
+      handle_turn_consumption_error (ctx, tc, "trade.buy", root, NULL);
+      goto fail_tx;
+    }
+  (void) repo_players_record_port_knowledge (db, ctx->player_id, port_id);
+
   /* 1) Post each line: update port inventory + ship cargo + trade log */
   for (size_t i = 0; i < n; i++)
     {
       const char *commodity = trade_lines[i].commodity;
       int qty = trade_lines[i].quantity;
+
+      /* Repeat the evil-alignment gate under the settlement transaction. The
+       * preflight check provides a clean refusal without charging a turn; this
+       * locked-time check closes an alignment-change race before any stock or
+       * cargo mutation. */
+      if (strcasecmp (commodity, "SLV") == 0
+          && !h_player_is_evil_aligned (db, ctx->player_id))
+	{
+	  send_response_refused_steal (ctx, root, ERR_ALIGNMENT_RESTRICTED,
+	                               "Only evil-aligned players may acquire slaves.",
+	                               NULL);
+	  goto fail_tx;
+	}
 
       int unit_price = h_entity_calculate_sell_price (db,
 						      ENTITY_TYPE_PORT,
@@ -4224,7 +4503,12 @@ cmd_trade_buy (client_ctx_t *ctx, json_t *root)
 	  (db, ctx->player_id, port_id, sector_id, commodity, amount,
 	   unit_price) != 0)
 	{
-	  /* we just skip log failures or if it was constraint but we continue buy path */
+	  /* The receipt, inventory movement and trade journal are one settlement.
+	   * A missing journal row makes a successful response non-replayable and
+	   * breaks the conservation/audit contract, so abort the whole transaction. */
+	  send_response_error (ctx, root, ERR_DB,
+	                       "Failed to record trade settlement.");
+	  goto fail_tx;
 	}
 
       /* receipt line */
@@ -4283,9 +4567,22 @@ cmd_trade_buy (client_ctx_t *ctx, json_t *root)
 
     if (get_account_rc == 0)
       {
-	h_add_credits_unlocked (db, port_bank_account_id,
-				total_item_cost, "TRADE_BUY", tx_group_id,
-				&new_port_balance);
+	int port_credit_rc =
+	  h_add_credits_unlocked (db, port_bank_account_id,
+				 total_item_cost, "TRADE_BUY", tx_group_id,
+				 &new_port_balance);
+	if (port_credit_rc != 0)
+	  {
+	    send_response_error (ctx, root, ERR_DB,
+				 "Failed to credit port settlement account.");
+	    goto fail_tx;
+	  }
+      }
+    else
+      {
+	send_response_error (ctx, root, ERR_DB,
+				 "Failed to resolve port settlement account.");
+	goto fail_tx;
       }
   }
 

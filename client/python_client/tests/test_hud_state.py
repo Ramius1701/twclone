@@ -8,6 +8,8 @@ Requirements covered:
 8. Refused/error responses do not mutate HUD state.
 9. Successful state-changing responses update relevant fields.
 """
+import pytest
+
 from hud import (
     HudState, hydrate_login, apply_response, merge_hud,
     extract_player_fields, extract_ship_fields, extract_mail_unread,
@@ -19,7 +21,7 @@ MY_INFO_RESP = {"status": "ok", "data": {"player": {"turns_remaining": 317, "cre
 SHIP_RESP = {
     "status": "ok",
     "data": {"ship": {
-        "id": 7, "name": "Wayfarer", "fighters": 250, "shields": 80,
+        "id": 7, "name": "Wayfarer", "fighters": 250, "shields": 80, "hull": 73,
         "holds": 40, "cargo": [{"commodity": "ORE", "qty": 10}, {"commodity": "EQUIPMENT", "qty": 8}],
     }},
 }
@@ -54,6 +56,7 @@ def test_login_hydration_populates_every_available_field():
     assert hud.ship_name == "Wayfarer"
     assert hud.fighters == 250
     assert hud.shields == 80
+    assert hud.hull == 73
     assert hud.cargo_total == 40
     assert hud.cargo_used == 18
     assert hud.sector_id == 42
@@ -72,6 +75,7 @@ def test_unknown_fields_remain_unknown_not_zero():
     assert hud.credits is None
     assert hud.fighters is None
     assert hud.shields is None
+    assert hud.hull is None
     assert hud.cargo_used is None
     assert hud.cargo_total is None
     assert hud.unread_mail is None
@@ -80,10 +84,20 @@ def test_unknown_fields_remain_unknown_not_zero():
 
 
 def test_zero_is_a_valid_distinct_value_from_unknown():
-    ship_zero_cargo = {"status": "ok", "data": {"ship": {"holds": 40, "cargo": []}}}
+    ship_zero_cargo = {"status": "ok", "data": {"ship": {"id": 7, "holds": 40, "cargo": []}}}
     fields = extract_ship_fields(ship_zero_cargo)
     assert fields["cargo_used"] == 0
     assert fields["cargo_used"] is not None
+
+
+@pytest.mark.parametrize("invalid_id", [None, 0, -1, True, 7.0, "7"])
+def test_ship_status_without_positive_authoritative_id_does_not_refresh_state(invalid_id):
+    resp = {"status": "ok", "data": {"ship": {
+        "id": invalid_id, "hull": 12, "fighters": 3,
+        "shields": 4, "holds": 20, "cargo": [],
+    }}}
+
+    assert extract_ship_fields(resp) == {}
 
 
 def test_refused_response_does_not_mutate_hud_state():
@@ -112,6 +126,7 @@ def test_successful_response_updates_relevant_fields_via_apply_response():
 
     new_hud2 = apply_response(new_hud, "ship.status", SHIP_RESP)
     assert new_hud2.fighters == 250
+    assert new_hud2.hull == 73
     assert new_hud2.cargo_used == 18
     # Fields not touched by ship.status are preserved from the prior merge.
     assert new_hud2.turns_remaining == 317
@@ -128,6 +143,12 @@ def test_malformed_credits_leaves_credits_unknown_not_a_traceback():
     fields = extract_player_fields(resp)
     assert "credits" not in fields
     assert fields["turns_remaining"] == 5
+
+
+def test_invalid_hull_values_remain_unavailable():
+    for hull in (True, -1, 101, "73"):
+        fields = extract_ship_fields({"status": "ok", "data": {"ship": {"hull": hull}}})
+        assert "hull" not in fields
 
 
 def test_connection_label_online_stale_offline():

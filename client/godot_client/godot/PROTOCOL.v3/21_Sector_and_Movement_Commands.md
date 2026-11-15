@@ -23,6 +23,17 @@ Get detailed info about the current or specified sector.
 `sector.scan`: Detailed scan (objects, resources).
 `sector.scan.density`: Density scan of surrounding sectors.
 
+`sector.scan` accepts `{ "mode": "holographic" }` to request detailed
+contents for directly adjacent sectors. The active ship must have a
+long-range scanner; the server verifies this and charges one turn only after
+successfully building the scan. The response type is
+`sector.holographic.scan`. Omitting `mode` preserves the existing detailed
+current-sector scan.
+
+The Godot client exposes density scanning normally. When `ship.status` reports
+`has_long_range_scanner: true`, Sector and Navigation also expose holographic
+scanning; the shortcuts are Alt+S for density and Alt+H for holographic.
+
 ### `sector.search`
 Search for objects/players.
 **Args**: `{ "q": "name", "type": "player|ship|...", "limit": 10 }`
@@ -41,7 +52,20 @@ Move to an adjacent sector.
 
 ### `move.transwarp`
 Long-range jump (requires equipment).
-**Args**: `{ "sector_id": 50 }`
+**Args**: `{ "to_sector_id": 50 }`
+**Response**: `move.transwarp`
+```json
+{
+  "sector_id": 50,
+  "status": "transwarp_complete",
+  "hazards": []
+}
+```
+
+The client must treat the response as the authoritative outcome. It must not
+infer fuel, interdiction, turn, hazard, or destination state locally; refused,
+error, timeout, and terminal-hazard responses require an authoritative state
+refresh before another movement action.
 
 ### `move.pathfind`
 Calculate route.

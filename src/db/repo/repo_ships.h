@@ -18,6 +18,19 @@ int repo_ships_handle_destruction(db_t *db,
                                   int32_t *result_code_out);
 
 int repo_ships_get_active_id(db_t *db, int32_t player_id, int32_t *ship_id_out);
+/* Lock the player row and return its current active ship within a transaction. */
+int repo_ships_get_active_id_for_update(db_t *db, int32_t player_id,
+                                        int32_t *ship_id_out);
+
+int repo_ships_rename_active(db_t *db, int32_t player_id, int32_t ship_id,
+                             const char *name, int64_t *rows_out);
+
+/* Transfer the primary ownership row when the source ship is not active.
+ * The caller owns the surrounding transaction and must commit/rollback it. */
+int repo_ships_transfer_primary(db_t *db, int32_t ship_id,
+                                int32_t source_player_id,
+                                int32_t target_player_id,
+                                int64_t *rows_out);
 
 int repo_ships_get_towing_id(db_t *db, int32_t ship_id, int32_t *towing_id_out);
 
@@ -45,5 +58,21 @@ int repo_ships_get_cargo_and_holds(db_t *db,
                                    int *holds);
 
 int repo_ships_update_cargo_column(db_t *db, int32_t ship_id, const char *col_name, int32_t new_qty);
+
+/* Clear a ship's active cloak marker. The caller controls transaction scope. */
+int repo_ships_decloak(db_t *db, int32_t ship_id);
+
+/* Portable transactional equivalents of the insurance policy/claim
+ * operations. The server remains responsible for protocol validation. */
+int repo_ships_insurance_buy_policy(db_t *db, int32_t player_id,
+                                    const char *subject_type,
+                                    int64_t subject_id, int64_t premium,
+                                    int64_t payout, int64_t fund_id,
+                                    const char *start_ts,
+                                    const char *expiry_ts,
+                                    int64_t *policy_id_out);
+int repo_ships_insurance_settle_claim(db_t *db, int32_t player_id,
+                                      int64_t claim_id, const char *event_id,
+                                      int64_t amount, int64_t *claim_id_out);
 
 #endif

@@ -64,6 +64,12 @@ config_set_defaults (void)
   g_cfg.max_name_length = 50;
   g_cfg.planet_type_count = 8;
   g_cfg.server_port = 1234;
+  snprintf (g_cfg.server_bind_address, sizeof g_cfg.server_bind_address,
+            "127.0.0.1");
+  g_cfg.server_max_connections = 128;
+  g_cfg.server_max_request_bytes = 65536;
+  g_cfg.server_request_timeout_ms = 10000;
+  g_cfg.server_requests_per_minute = 200;
   g_cfg.s2s.tcp_port = 4321;
   g_cfg.bank_alert_threshold_player = 1000000;
   g_cfg.bank_alert_threshold_corp = 5000000;
@@ -79,12 +85,18 @@ config_set_defaults (void)
   g_cfg.genesis_class_weight_U = 5;
   g_cfg.shipyard_enabled = 1;
   g_cfg.shipyard_trade_in_factor_bp = 5000;
+  g_cfg.shipyard_sale_factor_bp = 6000;
+  g_cfg.shipyard_used_resale_factor_bp = 8000;
+  /* System liquidity is injected only when explicitly configured. */
+  g_cfg.galactic_exchange_liquidity_credits = 0;
   g_cfg.shipyard_require_cargo_fit = 1;
   g_cfg.shipyard_require_fighters_fit = 1;
   g_cfg.shipyard_require_shields_fit = 1;
   g_cfg.shipyard_require_hardware_compat = 1;
   g_cfg.shipyard_tax_bp = 1000;
-  g_cfg.illegal_allowed_neutral = 0;
+  g_cfg.planet_market_buy_order_expiry_seconds = 86400;
+  g_cfg.illegal_allowed_neutral = 1;
+  g_cfg.illegal_min_experience = 400;
   /* --- Internal / Other defaults --- */
   g_cfg.engine.tick_ms = 50;
   g_cfg.engine.daily_align_sec = 0;
@@ -260,6 +272,30 @@ validate_cfg (void)
     {
       LOGE ("ERROR config: s2s.frame_size_limit exceeds 8 MiB (%d)\n",
 	    g_cfg.s2s.frame_size_limit);
+      return 0;
+    }
+  struct in_addr bind_addr;
+  if (inet_pton (AF_INET, g_cfg.server_bind_address, &bind_addr) != 1)
+    {
+      LOGE ("ERROR config: server_bind_address must be a valid IPv4 address.\n");
+      return 0;
+    }
+  if (g_cfg.server_port < 1 || g_cfg.server_port > 65535
+      || g_cfg.server_max_connections < 1
+      || g_cfg.server_max_connections > 10000
+      || g_cfg.server_max_request_bytes < 256
+      || g_cfg.server_max_request_bytes > 1048576
+      || g_cfg.server_request_timeout_ms < 100
+      || g_cfg.server_request_timeout_ms > 3600000
+      || g_cfg.server_requests_per_minute < 1
+      || g_cfg.server_requests_per_minute > 100000)
+    {
+      LOGE ("ERROR config: invalid network security limits.\n");
+      return 0;
+    }
+  if (g_cfg.tls_required && !g_cfg.tls_enabled)
+    {
+      LOGE ("ERROR config: tls_required needs tls_enabled.\n");
       return 0;
     }
   return 1;
@@ -515,6 +551,27 @@ apply_db (db_t *db)
 	    {
 	      cfg_parse_int (val, type, &g_cfg.server_port);
 	    }
+	  else if (strcmp (key, "server_bind_address") == 0)
+	    {
+	      snprintf (g_cfg.server_bind_address,
+	                sizeof g_cfg.server_bind_address, "%s", val);
+	    }
+	  else if (strcmp (key, "server_max_connections") == 0)
+	    {
+	      cfg_parse_int (val, type, &g_cfg.server_max_connections);
+	    }
+	  else if (strcmp (key, "server_max_request_bytes") == 0)
+	    {
+	      cfg_parse_int (val, type, &g_cfg.server_max_request_bytes);
+	    }
+	  else if (strcmp (key, "server_request_timeout_ms") == 0)
+	    {
+	      cfg_parse_int (val, type, &g_cfg.server_request_timeout_ms);
+	    }
+	  else if (strcmp (key, "server_requests_per_minute") == 0)
+	    {
+	      cfg_parse_int (val, type, &g_cfg.server_requests_per_minute);
+	    }
 	  else if (strcmp (key, "s2s_port") == 0)
 	    {
 	      cfg_parse_int (val, type, &g_cfg.s2s.tcp_port);
@@ -577,10 +634,37 @@ apply_db (db_t *db)
 	    {
 	      cfg_parse_int (val, type, &g_cfg.shipyard_enabled);
 	    }
-	  else if (strcmp (key, "shipyard_trade_in_factor_bp") == 0)
+          else if (strcmp (key, "shipyard_trade_in_factor_bp") == 0)
 	    {
 	      cfg_parse_int (val, type, &g_cfg.shipyard_trade_in_factor_bp);
 	    }
+          else if (strcmp (key, "shipyard_sale_factor_bp") == 0)
+	    {
+	      int sale_factor = 6000;
+	      cfg_parse_int (val, type, &sale_factor);
+	      if (sale_factor >= 0 && sale_factor <= 10000)
+	        g_cfg.shipyard_sale_factor_bp = sale_factor;
+	      else
+	        LOGW ("[config] Invalid shipyard sale factor; using 6000 basis points.");
+	    }
+          else if (strcmp (key, "galactic_exchange_liquidity_credits") == 0)
+            {
+              int64_t liquidity = 0;
+              cfg_parse_int64 (val, type, &liquidity);
+              if (liquidity >= 0)
+                g_cfg.galactic_exchange_liquidity_credits = liquidity;
+              else
+                LOGW ("[config] Invalid Exchange liquidity; using zero.");
+            }
+          else if (strcmp (key, "shipyard_used_resale_factor_bp") == 0)
+            {
+              int factor = 8000;
+              cfg_parse_int (val, type, &factor);
+              if (factor >= 0 && factor <= 10000)
+                g_cfg.shipyard_used_resale_factor_bp = factor;
+              else
+                LOGW ("[config] Invalid used hull resale factor; using 8000 basis points.");
+            }
 	  else if (strcmp (key, "shipyard_require_cargo_fit") == 0)
 	    {
 	      cfg_parse_int (val, type, &g_cfg.shipyard_require_cargo_fit);
@@ -602,9 +686,22 @@ apply_db (db_t *db)
 	    {
 	      cfg_parse_int (val, type, &g_cfg.shipyard_tax_bp);
 	    }
+	  else if (strcmp (key, "planet_market.buy_order_expiry_seconds") == 0)
+	    {
+	      int expiry = 86400;
+	      cfg_parse_int (val, type, &expiry);
+	      if (expiry >= 60 && expiry <= 604800)
+	        g_cfg.planet_market_buy_order_expiry_seconds = expiry;
+	      else
+	        LOGW ("[config] Invalid planet market buy order expiry; using 86400 seconds.");
+	    }
 	  else if (strcmp (key, "illegal_allowed_neutral") == 0)
 	    {
 	      cfg_parse_int (val, type, &g_cfg.illegal_allowed_neutral);
+	    }
+	  else if (strcmp (key, "illegal_min_experience") == 0)
+	    {
+	      cfg_parse_int (val, type, &g_cfg.illegal_min_experience);
 	    }
 	  else if (strcmp (key, "max_cloak_duration") == 0)
 	    {
@@ -674,6 +771,24 @@ apply_db (db_t *db)
 	      cfg_parse_int64 (val, type,
 			       &g_cfg.bank_max_daily_interest_per_account);
 	    }
+	  else if (strcmp (key, "planet.slave_unrest_interval_days") == 0)
+	    {
+	      int64_t setting = 0;
+	      if (cfg_parse_int64 (val, type, &setting) == 0 && setting >= 0)
+		g_cfg.planet_slave_unrest_interval_days = setting;
+	    }
+	  else if (strcmp (key, "planet.slave_unrest_stoppage_cycles") == 0)
+	    {
+	      int64_t setting = 0;
+	      if (cfg_parse_int64 (val, type, &setting) == 0 && setting >= 0)
+		g_cfg.planet_slave_unrest_stoppage_cycles = setting;
+	    }
+	  else if (strcmp (key, "planet.slave_unrest_population_loss") == 0)
+	    {
+	      int64_t setting = 0;
+	      if (cfg_parse_int64 (val, type, &setting) == 0 && setting >= 0)
+		g_cfg.planet_slave_unrest_population_loss = setting;
+	    }
 	  else if (strcmp (key, "starter_shiptype_name") == 0)
 	    {
 	      snprintf (g_cfg.starter_shiptype_name, sizeof (g_cfg.starter_shiptype_name), "%s", val);
@@ -728,8 +843,37 @@ apply_db (db_t *db)
 static void
 apply_env (void)
 {
-  /* intentionally unused in v1.0 */
-  /* same names as before: TW_ENGINE_TICK_MS, etc. */
+  const char *value = getenv ("TWCLONE_LISTEN_ADDRESS");
+  if (value && *value && strlen (value) < sizeof g_cfg.server_bind_address)
+    snprintf (g_cfg.server_bind_address, sizeof g_cfg.server_bind_address,
+              "%s", value);
+  value = getenv ("TWCLONE_LISTEN_PORT");
+  if (value && *value)
+    cfg_parse_int (value, "int", &g_cfg.server_port);
+  value = getenv ("TWCLONE_MAX_CONNECTIONS");
+  if (value && *value)
+    cfg_parse_int (value, "int", &g_cfg.server_max_connections);
+  value = getenv ("TWCLONE_MAX_REQUEST_BYTES");
+  if (value && *value)
+    cfg_parse_int (value, "int", &g_cfg.server_max_request_bytes);
+  value = getenv ("TWCLONE_REQUEST_TIMEOUT_MS");
+  if (value && *value)
+    cfg_parse_int (value, "int", &g_cfg.server_request_timeout_ms);
+  value = getenv ("TWCLONE_REQUESTS_PER_MINUTE");
+  if (value && *value)
+    cfg_parse_int (value, "int", &g_cfg.server_requests_per_minute);
+  value = getenv ("TWCLONE_TLS_ENABLED");
+  if (value && *value)
+    cfg_parse_int (value, "int", &g_cfg.tls_enabled);
+  value = getenv ("TWCLONE_TLS_REQUIRED");
+  if (value && *value)
+    cfg_parse_int (value, "int", &g_cfg.tls_required);
+  value = getenv ("TWCLONE_TLS_CERT_PATH");
+  if (value && strlen (value) < sizeof g_cfg.tls_cert_path)
+    snprintf (g_cfg.tls_cert_path, sizeof g_cfg.tls_cert_path, "%s", value);
+  value = getenv ("TWCLONE_TLS_KEY_PATH");
+  if (value && strlen (value) < sizeof g_cfg.tls_key_path)
+    snprintf (g_cfg.tls_key_path, sizeof g_cfg.tls_key_path, "%s", value);
 }
 
 
@@ -745,10 +889,86 @@ load_bootstrap_config (const char *filename)
       return -1;
     }
 
+  const char *backend = json_string_value (json_object_get (root, "backend"));
   const char *app_conn_tmpl =
     json_string_value (json_object_get (root, "app"));
+  const char *app_conn_env = getenv ("TWCLONE_DB_APP_CONNINFO");
+  if (app_conn_env && *app_conn_env)
+    app_conn_tmpl = app_conn_env;
   const char *db_name = json_string_value (json_object_get (root, "db"));
 
+  if (backend && strcasecmp (backend, "postgres") != 0
+      && strcasecmp (backend, "postgresql") != 0
+      && strcasecmp (backend, "mysql") != 0
+      && strcasecmp (backend, "mariadb") != 0)
+    {
+      LOGE ("Unsupported bootstrap database backend '%s'.", backend);
+      json_decref (root);
+      return -1;
+    }
+
+  snprintf (g_cfg.db_backend, sizeof (g_cfg.db_backend), "%s",
+            backend && (strcasecmp (backend, "mysql") == 0
+                        || strcasecmp (backend, "mariadb") == 0)
+              ? "mysql" : "postgres");
+
+  if (backend && (strcasecmp (backend, "mysql") == 0
+                  || strcasecmp (backend, "mariadb") == 0))
+    {
+      const char *host = json_string_value (json_object_get (root, "mysql_host"));
+      const char *user = json_string_value (json_object_get (root, "mysql_user"));
+      const char *password = json_string_value (json_object_get (root, "mysql_password"));
+      const char *socket = json_string_value (json_object_get (root, "mysql_unix_socket"));
+      json_t *port = json_object_get (root, "mysql_port");
+
+      if (!host || !*host || !user || !*user)
+        {
+          LOGE ("MySQL bootstrap requires nonempty mysql_host and mysql_user.");
+          json_decref (root);
+          return -1;
+        }
+      if (strlen (host) >= sizeof (g_cfg.mysql_host)
+          || strlen (user) >= sizeof (g_cfg.mysql_user)
+          || (password && strlen (password) >= sizeof (g_cfg.mysql_password))
+          || (socket && strlen (socket) >= sizeof (g_cfg.mysql_unix_socket)))
+        {
+          LOGE ("A MySQL bootstrap setting exceeds its supported length.");
+          json_decref (root);
+          return -1;
+        }
+      if (!db_name || !*db_name)
+        db_name = json_string_value (json_object_get (root, "mysql_database"));
+      if (!db_name || !*db_name)
+        {
+          LOGE ("MySQL bootstrap requires 'db' or 'mysql_database'.");
+          json_decref (root);
+          return -1;
+        }
+      if (strlen (db_name) >= sizeof (g_cfg.mysql_database))
+        {
+          LOGE ("MySQL database name exceeds its supported length.");
+          json_decref (root);
+          return -1;
+        }
+      if (port && (!json_is_integer (port) || json_integer_value (port) < 0
+                   || json_integer_value (port) > 65535))
+        {
+          LOGE ("mysql_port must be an integer between 0 and 65535.");
+          json_decref (root);
+          return -1;
+        }
+      snprintf (g_cfg.mysql_host, sizeof (g_cfg.mysql_host), "%s", host);
+      snprintf (g_cfg.mysql_user, sizeof (g_cfg.mysql_user), "%s", user);
+      snprintf (g_cfg.mysql_password, sizeof (g_cfg.mysql_password), "%s",
+                password ? password : "");
+      snprintf (g_cfg.mysql_database, sizeof (g_cfg.mysql_database), "%s", db_name);
+      if (socket)
+        snprintf (g_cfg.mysql_unix_socket, sizeof (g_cfg.mysql_unix_socket), "%s", socket);
+      g_cfg.mysql_port = port ? (unsigned int) json_integer_value (port) : 0;
+      LOGI ("Loaded MySQL bootstrap DB config (credentials redacted).");
+      json_decref (root);
+      return 0;
+    }
 
   if (!app_conn_tmpl)
     {
@@ -893,8 +1113,10 @@ cmd_system_hello (client_ctx_t *ctx, json_t *root)
   json_t *limits = json_object ();
 
 
-  json_object_set_new (limits, "max_frame_size", json_integer (131072));
-  json_object_set_new (limits, "max_req_per_min", json_integer (200));
+  json_object_set_new (limits, "max_frame_size",
+                       json_integer (g_cfg.server_max_request_bytes));
+  json_object_set_new (limits, "max_req_per_min",
+                       json_integer (g_cfg.server_requests_per_minute));
 
   json_object_set (payload, "capabilities", g_capabilities);
   json_object_set_new (payload, "limits", limits);
@@ -954,6 +1176,15 @@ config_load (void)
   c->startingcredits = (int) g_cfg.startingcredits;
   c->startingfighters = g_cfg.startingfighters;
   c->startingholds = g_cfg.startingholds;
+  c->max_ship_name_length = g_cfg.max_ship_name_length;
+  c->shipyard_sale_factor_bp = g_cfg.shipyard_sale_factor_bp;
+  c->galactic_exchange_liquidity_credits = g_cfg.galactic_exchange_liquidity_credits;
+  c->shipyard_used_resale_factor_bp = g_cfg.shipyard_used_resale_factor_bp;
+  /* Keep the runtime starter-ship policy in the legacy config view used by
+   * player provisioning.  Without this copy, spawn_starter_ship() receives
+   * an empty type name even though g_cfg has the configured value. */
+  snprintf (c->starter_shiptype_name, sizeof c->starter_shiptype_name, "%s",
+            g_cfg.starter_shiptype_name);
   c->max_players = 200;
   c->max_ships = 1000;
   return c;

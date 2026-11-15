@@ -1,0 +1,113 @@
+"""Server-side contract checks for PostgreSQL-backed insurance settlement."""
+
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_insurance_handlers_delegate_money_and_claim_state_to_database():
+    source = (ROOT / "src/server_loop.c").read_text(encoding="utf-8")
+    schema = (ROOT / "src/schemas.c").read_text(encoding="utf-8")
+    assert "repo_ships_insurance_buy_policy" in source
+    assert "repo_ships_insurance_settle_claim" in source
+    assert "SELECT * FROM insurance_buy_policy" not in source
+    assert "SELECT * FROM insurance_settle_claim" not in source
+    assert "Policy purchased" not in source
+    assert "json_integer (12345)" not in source
+    assert "insurance_subject_owned" in source
+    assert "insurance_claim_owned" in source
+    buy_handler = source.rsplit("cmd_insurance_policies_buy (client_ctx_t *ctx", 1)[1].split(
+        "cmd_insurance_claim_file", 1
+    )[0]
+    assert 'strcmp (subject_type, "ship") != 0' in buy_handler
+    buy_schema = schema.rsplit("schema_insurance_policies_buy (void)", 1)[1].split(
+        "return data_schema;", 1
+    )[0]
+    assert 'json_string ("ship")' in buy_schema
+    assert 'json_string ("cargo")' not in buy_schema
+    assert 'json_string ("planet")' not in buy_schema
+
+
+def test_insurance_json_suite_rejects_non_hull_coverage():
+    suite = (ROOT / "tests.v2/suite_economy_insurance.json").read_text(
+        encoding="utf-8"
+    )
+    assert '"subject_type": "cargo"' in suite
+    assert "Cargo insurance is not supported" in suite
+
+
+def test_insurance_policy_and_claim_transactions_are_backend_portable():
+    repo = (ROOT / "src/db/repo/repo_ships.c").read_text(encoding="utf-8")
+    assert "repo_ships_insurance_buy_policy" in repo
+    assert "repo_ships_insurance_settle_claim" in repo
+    assert '"bank_accounts_id"' in repo and '? "bank_accounts_id" : "id"' in repo
+    assert "INSURANCE_GUARANTEE" in repo
+    assert "db_tx_begin" in repo and "db_tx_commit" in repo and "db_tx_rollback" in repo
+    assert "UPDATE insurance_claims SET status='paid'" in repo
+
+
+def test_insurance_repository_rejects_non_ship_subjects_before_transaction():
+    repo = (ROOT / "src/db/repo/repo_ships.c").read_text(encoding="utf-8")
+    buy = repo.split("repo_ships_insurance_buy_policy", 1)[1].split(
+        "repo_ships_insurance_settle_claim", 1
+    )[0]
+    guard = buy.split("db_tx_begin", 1)[0]
+    assert 'strcmp (subject_type, "ship") != 0' in guard
+    assert 'strcmp (subject_type, "cargo")' not in guard
+    assert 'strcmp (subject_type, "planet")' not in guard
+    assert 'SELECT planet_id FROM planets' not in buy
+
+
+def test_insurance_sql_fixture_covers_success_refusal_and_idempotency():
+    fixture = (ROOT / "tests.v2/test_pg_insurance_settlement.sql").read_text(
+        encoding="utf-8"
+    )
+    assert "premium accounting mismatch" in fixture
+    assert "insufficient premium was not atomic" in fixture
+    assert "claim idempotency failed" in fixture
+
+
+def test_destruction_guarantees_hull_payout_when_insurer_fund_is_short():
+    source = (ROOT / "src/db/repo/repo_ships.c").read_text(encoding="utf-8")
+    settlement = source.split("settle_destruction_insurance", 1)[1].split(
+        "int repo_ships_handle_destruction", 1
+    )[0]
+    assert "INSURANCE_GUARANTEE" in settlement
+    assert 'insurer_funded ? "ADJUSTMENT" : "INSURANCE_GUARANTEE"' in settlement
+    assert "UPDATE insurance_claims SET status='paid'" in settlement
+    assert "if (!has_fund || fund_balance < amount)\n        continue" not in settlement
+    migration = (ROOT / "sql/pg/174_galactic_exchange_accounting.sql").read_text(
+        encoding="utf-8"
+    )
+    assert "'INSURANCE_GUARANTEE'" in migration
+
+
+def test_underinsured_policy_pays_configured_amount_not_full_hull_value():
+    repo = (ROOT / "src/db/repo/repo_ships.c").read_text(encoding="utf-8")
+    settlement = repo.split("settle_destruction_insurance", 1)[1].split(
+        "int repo_ships_handle_destruction", 1
+    )[0]
+    # Policies are applied in ID order. A payout below hull_value is honored
+    # as configured; only payouts above the remaining replacement value clamp.
+    assert "int64_t remaining = hull_value;" in settlement
+    assert "int64_t amount = policies[i].payout;" in settlement
+    assert "if (amount > remaining) amount = remaining;" in settlement
+    assert "remaining -= amount;" in settlement
+    assert "amount = hull_value" not in settlement
+
+
+def test_ledger_invariant_view_accepts_guaranteed_claim_credits():
+    migration = (ROOT / "sql/pg/179_insurance_guarantee_ledger_invariants.sql").read_text(
+        encoding="utf-8"
+    )
+    fixture = (ROOT / "tests.v2/test_pg_insurance_ledger_invariants.sql").read_text(
+        encoding="utf-8"
+    )
+    assert "tx_type IN ('ADJUSTMENT', 'INSURANCE_GUARANTEE')" in migration
+    assert "tx_type NOT IN ('ADJUSTMENT', 'INSURANCE_GUARANTEE')" in migration
+    assert "'insurance-claim-10', 'INSURANCE_GUARANTEE', 'CREDIT', 15, 'CRD'" in fixture
+    assert "\\ir ../sql/pg/179_insurance_guarantee_ledger_invariants.sql" in fixture
+    assert fixture.index("SET search_path TO insurance_ledger_130_test, pg_catalog;") < fixture.index(
+        "\\ir ../sql/pg/179_insurance_guarantee_ledger_invariants.sql"
+    )

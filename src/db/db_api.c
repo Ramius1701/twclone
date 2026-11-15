@@ -230,10 +230,16 @@ bool db_tx_commit(db_t *db, db_error_t *err) {
         return false;
     }
 
-    db->tx_nest_level--;
-    if (db->tx_nest_level == 0) {
-        return db->vt->tx_commit(db, err);
+    if (db->tx_nest_level == 1) {
+        /* Keep the transaction marked active until the backend confirms the
+         * commit. Callers can then roll back if the commit itself fails. */
+        if (!db->vt->tx_commit(db, err)) {
+            return false;
+        }
+        db->tx_nest_level = 0;
+        return true;
     }
+    db->tx_nest_level--;
     return true;
 }
 
@@ -285,6 +291,7 @@ bool db_exec_rows_affected(db_t *db, const char *sql, const db_bind_t *params, s
 }
 
 bool db_query(db_t *db, const char *sql, const db_bind_t *params, size_t n_params, db_res_t **out_res, db_error_t *err) {
+    db_error_clear(err);
     if (!db || !db->vt || !db->vt->query) {
         if (err) {
             err->code = ERR_DB_CLOSED;
@@ -475,4 +482,3 @@ db_ship_repair_atomic(db_t *db,
                                     out_new_credits,
                                     err);
 }
-

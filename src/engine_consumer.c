@@ -13,6 +13,7 @@
 #include "engine_consumer.h"
 #include "server_engine.h"	// For h_player_progress_from_event_payload
 #include "server_log.h"
+#include "server_ships.h"
 
 
 /* --- helpers -------------------------------------------------------------- */
@@ -172,48 +173,21 @@ handle_ship_self_destruct_initiated (db_t *db, db_res_t *ev_row)
       json_decref (payload);
       return 1;			// Quarantine
     }
-  // Get ship name for the destroyed event
-  char ship_name[256] = { 0 };
-  if (repo_engine_get_ship_name (db, ship_id, ship_name, sizeof (ship_name))
-      != 0)
-    {
-      // (Optional: handle error)
-    }
-
-
-  // Perform ship destruction
-  int rc = db_destroy_ship (db,
-			    player_id,
-			    ship_id);
-
-
+  ship_kill_context_t kill_ctx = {
+    .victim_player_id = player_id,
+    .victim_ship_id = ship_id,
+    .killer_player_id = 0,
+    .cause = KILL_CAUSE_SELF_DESTRUCT,
+    .sector_id = sector_id
+  };
+  int rc = handle_ship_destruction (db, &kill_ctx);
   if (rc != 0)
     {
       LOGE ("Error destroying ship %d for player %d: %d", ship_id, player_id,
-	    rc);
+            rc);
       json_decref (payload);
-      return 1;			// Quarantine
+      return 1;
     }
-  // Log ship.destroyed event
-  json_t *destroyed_payload = json_object ();
-
-
-  json_object_set_new (destroyed_payload, "player_id",
-		       json_integer (player_id));
-  json_object_set_new (destroyed_payload, "ship_id", json_integer (ship_id));
-  json_object_set_new (destroyed_payload, "ship_name",
-		       json_string (ship_name));
-
-
-  if (!destroyed_payload)
-    {
-      LOGE ("Error creating ship.destroyed payload.");
-      json_decref (payload);
-      return 1;			// Quarantine
-    }
-  db_log_engine_event (get_now_epoch (), "ship.destroyed", "player",
-		       player_id, sector_id, destroyed_payload, db);
-  json_decref (destroyed_payload);
   json_decref (payload);
   return 0;			// Success
 }
@@ -224,6 +198,12 @@ engine_event_handler_player_trade_v1 (db_t *db, db_res_t *ev_row)
 {
   (void) db;
   db_error_t err;
+  int64_t event_id = db_res_col_i64 (ev_row, 0, &err);
+  if (err.code != 0 || event_id <= 0)
+    {
+      LOGE ("engine_event_handler_player_trade_v1: Invalid event ID.");
+      return 1;
+    }
   // Payload is the 6th column (index 5) in the new expanded SELECT
   const char *payload_str = db_res_col_text (ev_row, 5, &err);
   json_error_t jerr;
@@ -237,6 +217,9 @@ engine_event_handler_player_trade_v1 (db_t *db, db_res_t *ev_row)
 	 jerr.text);
       return 1;			// Quarantine
     }
+  /* This identity comes from the persisted event row, never from its payload. */
+  json_object_set_new (payload, "source_event_id", json_integer (event_id));
+  json_object_set_new (payload, "type", json_string ("player.trade.v1"));
   int rc = h_player_progress_from_event_payload (payload);
 
 

@@ -8,9 +8,6 @@
 /* Repair the planets serial sequence without moving it backwards. */
 int db_planets_sync_id_sequence(db_t *db);
 
-/* Q1-Q5: Terra Sanctions */
-int db_planets_apply_terra_sanctions(db_t *db, int player_id);
-
 /* Q6: Active Ship Sector */
 int db_planets_get_ship_sector(db_t *db, int ship_id, int *sector_id);
 
@@ -22,15 +19,31 @@ int db_planets_get_ship_fighters(db_t *db, int ship_id, int *fighters);
 
 /* Q9: Citadel Defense */
 int db_planets_get_citadel_defenses(db_t *db, int planet_id, int *level, int *shields, int *reaction);
+/* Returns 0 for a successful query (including no active defenses), a
+ * negative database/argument error otherwise. */
+int db_planets_get_citadel_defenses_ex(db_t *db, int planet_id,
+                                      bool *has_active_defenses, int *level,
+                                      int *shields, int *reaction);
 
 /* Q10: Update Citadel Shields */
 int db_planets_update_citadel_shields(db_t *db, int planet_id, int new_shields);
+/* Compare-and-decrement shields. Returns ERR_DB_BUSY when expected_shields
+ * is stale or insufficient; *remaining is set only on success. */
+int db_planets_consume_citadel_shields(db_t *db, int planet_id,
+                                      int expected_shields, int amount,
+                                      int *remaining);
 
 /* Q11: Update Ship Fighters */
 int db_planets_update_ship_fighters(db_t *db, int ship_id, int loss);
 
 /* Q12: Capture Planet */
-int db_planets_capture(db_t *db, int planet_id, int new_owner, const char *new_type);
+int db_planets_capture(db_t *db, int planet_id, int new_owner,
+                       const char *new_type, bool enslave_colonists,
+                       bool liberate_slaves,
+                       const char *expected_population_type,
+                       int expected_owner_id,
+                       const char *expected_owner_type,
+                       int expected_fighters);
 
 /* Q13: Defend Planet (Lose Fighters) */
 int db_planets_lose_fighters(db_t *db, int planet_id, int loss);
@@ -43,6 +56,16 @@ int db_planets_get_sector(db_t *db, int planet_id, int *sector_id);
 
 /* Q16: Planet Owner Info */
 int db_planets_get_owner_info(db_t *db, int planet_id, int *owner_id, char **owner_type);
+/* Read and lock planet ownership; requires an active transaction. */
+int db_planets_get_owner_info_for_update(db_t *db, int planet_id,
+                                         int *owner_id, char **owner_type);
+int repo_planets_emancipate(db_t *db, int planet_id, int player_id,
+                            int64_t *population_out);
+int repo_planets_harvest(db_t *db, int player_id, int ship_id, int planet_id,
+                         int64_t harvested_out[3], int64_t *holds_remaining_out);
+int repo_planets_deposit_slaves(db_t *db, int player_id, int ship_id,
+                                int planet_id, int64_t quantity,
+                                int64_t *population_out);
 
 /* Q17: Rename Planet */
 int db_planets_rename(db_t *db, int planet_id, const char *new_name);
@@ -118,8 +141,22 @@ int db_planets_get_commodity_id(db_t *db, const char *code, int *id);
 /* Q41: Add to Treasury (Buy) */
 int db_planets_add_treasury_buy(db_t *db, int planet_id, long long amount);
 
+/* Atomically transfer fighters between the player's active landed ship and
+ * an owned planet. Direction is "ship_to_planet" or "planet_to_ship". */
+int repo_planets_transfer_fighters(db_t *db, int player_id, int ship_id,
+                                  int planet_id, const char *direction,
+                                  int quantity, int *planet_after,
+                                  int *ship_after);
+
+/* Permanently destroy an owned planet. Historical engine/player event rows
+ * use scalar references and are retained; dependent planetary state follows
+ * the existing PostgreSQL foreign-key cascade rules. */
+int db_planets_destroy(db_t *db, int player_id, int planet_id);
+
 /* Q42: Insert Commodity Order */
-int db_planets_insert_buy_order(db_t *db, int player_id, int planet_id, int commodity_id, int qty, int price, int64_t *order_id);
+int db_planets_insert_buy_order(db_t *db, int player_id, int planet_id,
+                                int commodity_id, int qty, int price,
+                                int64_t expires_at, int64_t *order_id);
 
 /* Q43: (Dup of Q22) */
 

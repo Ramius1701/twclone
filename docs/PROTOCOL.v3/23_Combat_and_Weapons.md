@@ -1,5 +1,7 @@
 # 23. Combat & Weapons
 
+Canonical product decisions: [`../V3_GAMEPLAY_DECISIONS.md`](../V3_GAMEPLAY_DECISIONS.md).
+
 ## 1. Combat Commands
 
 ### `combat.attack.ship`
@@ -14,10 +16,40 @@ Attack a planet in the current sector.
 Successful attacks are recorded as `player.attack_planet.v1` with `planet_id`,
 `result`, `ship_loss`, and `planet_loss`; captures are recorded as
 `player.capture_planet.v1` with `planet_id` and `previous_owner`.
+Both events are persisted in the same transaction as fighter losses, ownership,
+and population conversion; event-write failure aborts the combat settlement.
+A capture also compares the observed owner, population type and planetary
+fighter count at settlement; concurrent changes abort rather than bypassing
+reinforced defenses or overwriting a newer capture.
 
 ### `combat.attack.port`
 Attack a port.
 **Events**: Emits `player.port_strike.v1`.
+
+## 1.1 Historical Photon and Toll-Fighter Mechanics
+
+The original TradeWars 2002 Player's Manual (1990–2000) establishes these
+mechanics as parity references; this section does not claim that V3 handlers
+currently implement them:
+
+- Photon missiles may be used by Missile Frigates and Imperial StarShips.
+- Ship and planetary shields protect against photon impact. The manual
+  describes disabling citadel Combat Control, Quasar Cannon and Interdictor
+  systems after shields are defeated.
+- A photon neutralizes sector mines and fighters for a short-lived effect.
+  The consulted manual does not establish a numeric duration or the V3
+  configuration key/default. Do not invent either value.
+- Toll fighters stop non-hostile passers and request a payment; the deployed
+  toll-fighter quantity determines the requested amount. They fight back if
+  attacked. The manual does not state a numeric conversion formula or define
+  a JSON accept/refuse/payment interaction.
+
+Source: [TradeWars 2002 Player's Manual (1990–2000)](https://electraphysics.com/documents/tradewarsmanual.pdf),
+fighter modes at pp. 8–9 (PDF lines 385–411), photon description at p. 34
+(PDF lines 338–339). These historical facts do not fill the missing V3
+wire-level and configurable-value contracts. Until those are specified,
+photon firing and toll collection remain incomplete rather than inferred from
+current implementation.
 
 ## 2. Asset Deployment Rules (FedSpace & MSL)
 
@@ -33,6 +65,46 @@ Attack a port.
 - **Enforcement**: Attacker's ship is instantly destroyed and attacker is podded
 - **No Mitigation**: Intervention occurs regardless of target type; action does not proceed
 - **Effect**: Attack attempt returns status `refused` with error code 402 and message "Captain Z intervenes"
+
+### Ship destruction and respawn
+
+An attack on Terra (planet 1 or a planet in sector 1) is refused after the
+attacker's active hull is settled through the universal destruction path. The
+attacker is assigned an escape pod. This enforcement does not seize unrelated
+ships, credits, bank balances, planets or corporate assets; ordinary losses
+for the destroyed hull still apply. If destruction settlement fails, the
+server returns a database error and does not claim enforcement succeeded.
+
+Every player ship destruction results in escape-pod respawn. This does not
+depend on pod equipment. The destroyed ship's cargo and equipment are lost;
+bank credits, planets and corporate assets survive. No basic replacement ship
+is issued, and the player has exactly one valid active pod ship after
+settlement. All destruction sources use the same idempotent loss/respawn
+settlement. The current C repository transaction writes the destroyed hull,
+loss state, pod ownership/active-ship assignment, podded status and one
+per-hull destruction event atomically. Eligible insurance pays configured
+player-held ship-policy payouts, capped in aggregate at the shiptype base cost,
+to the player's bank ledger in the same transaction. If insurer reserves are
+short, `INSURANCE_GUARANTEE` records the explicit system-issued shortfall. It covers neither cargo
+nor installed equipment, does not directly replace the ship, and cannot pay
+twice for one destruction. Policies are applied in policy-ID order if several
+cover a hull. Insurer insolvency does not delay a qualifying payout. Selling an
+insured ship ends that ship's policy without refund.
+
+### Planet capture and population
+
+A planet may be captured only after its defences are defeated and the existing
+invasion succeeds. Capture transfers planet ownership while the planet's
+resources and treasury remain with the planet; it does not transfer the
+previous owner's personal bank balance or unrelated corporate funds. Preserve
+other planet assets unless an explicit combat rule destroys them.
+
+Population conversion is part of the same capture transaction. An evil captor
+must explicitly choose whether to enslave a colonist population. A good
+captor automatically liberates a slave population. Neutral captors retain an
+existing slave population; evil captors may also retain it. A good captor's
+liberation converts the full population to colonists. Capture does not itself
+permit partial population conversion. Do not invent corporate-capture rules.
 
 ### Major Space Lanes (MSL Sectors > 10)
 - **Deployment**: Fighters, mines, and beacons may be deployed normally

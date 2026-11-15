@@ -2,9 +2,11 @@ extends Control
 
 signal login_requested(host: String, port: int, username: String, password: String)
 signal registration_requested(host: String, port: int, username: String, password: String, ship_name: String, ui_locale: String, ui_timezone: String)
+signal connection_cancelled
 signal profiles_changed(profiles: Array, selected_index: int)
 
 const AssetCatalog = preload("res://AssetCatalog.gd")
+const POSTGRESQL_DEFAULT_PORT := 5432
 
 var host_input: LineEdit
 var port_input: LineEdit
@@ -15,7 +17,9 @@ var ship_name_input: LineEdit
 var ui_locale_input: LineEdit
 var ui_timezone_input: LineEdit
 var status_label: Label
+var caps_lock_warning: Label
 var connect_button: Button
+var cancel_button: Button
 var mode_toggle_button: Button
 var profile_selector: OptionButton
 var profile_name_input: LineEdit
@@ -28,15 +32,26 @@ var _selected_profile_index := -1
 var _editing_profile_index := -1
 var _loading_profile := false
 var _registration_mode := false
+var _caps_lock_state := false
 var _registration_fields: VBoxContainer
 
 func _ready() -> void:
 	_build()
 
+func _input(event: InputEvent) -> void:
+	if not event is InputEventKey:
+		return
+	var key_event := event as InputEventKey
+	if key_event.pressed and not key_event.echo and key_event.keycode == KEY_CAPSLOCK:
+		_caps_lock_state = not _caps_lock_state
+		caps_lock_warning.text = "CAPS LOCK IS ON · Passwords are case-sensitive." if _caps_lock_state else "Passwords are case-sensitive · Check Caps Lock if login fails."
+
 func set_status(message: String, busy: bool = false) -> void:
 	status_label.text = message
 	connect_button.disabled = busy
 	connect_button.text = "WORKING…" if busy else ("CREATE ACCOUNT" if _registration_mode else "CONNECT")
+	cancel_button.visible = busy
+	cancel_button.disabled = not busy
 	mode_toggle_button.disabled = busy
 	mode_toggle_button.text = "PLEASE WAIT" if busy else ("BACK TO LOGIN" if _registration_mode else "CREATE ACCOUNT")
 	for input in [host_input, port_input, username_input, password_input, confirm_password_input, ship_name_input, ui_locale_input, ui_timezone_input, profile_name_input]:
@@ -139,15 +154,17 @@ func _build() -> void:
 	save_profile_button.pressed.connect(_save_profile)
 	save_row.add_child(save_profile_button)
 	form.add_child(_thin_rule())
-	host_input = _field("127.0.0.1")
-	port_input = _field("1234")
+	host_input = _field("e.g. 127.0.0.1")
+	port_input = _field("e.g. 1234")
 	username_input = _field("Captain name")
-	password_input = _field("Password")
+	password_input = _field("Captain password")
 	password_input.secret = true
-	form.add_child(_labeled_field("SERVER ADDRESS", host_input))
-	form.add_child(_labeled_field("PORT", port_input))
-	form.add_child(_labeled_field("USERNAME", username_input))
-	form.add_child(_labeled_field("PASSWORD", password_input))
+	form.add_child(_labeled_field("SERVER ADDRESS *", host_input))
+	form.add_child(_labeled_field("PORT *", port_input))
+	form.add_child(_labeled_field("USERNAME *", username_input))
+	form.add_child(_labeled_field("PASSWORD *", password_input))
+	caps_lock_warning = _label("Passwords are case-sensitive · Check Caps Lock if login fails.", 11, Color(1.0, 0.62, 0.35))
+	form.add_child(caps_lock_warning)
 	confirm_password_input = _field("Confirm password")
 	confirm_password_input.secret = true
 	ship_name_input = _field("Ship name (optional)")
@@ -157,10 +174,10 @@ func _build() -> void:
 	_registration_fields.name = "RegistrationFields"
 	_registration_fields.add_theme_constant_override("separation", 8)
 	_registration_fields.visible = false
-	_registration_fields.add_child(_labeled_field("CONFIRM", confirm_password_input))
-	_registration_fields.add_child(_labeled_field("SHIP NAME", ship_name_input))
-	_registration_fields.add_child(_labeled_field("LOCALE", ui_locale_input))
-	_registration_fields.add_child(_labeled_field("TIMEZONE", ui_timezone_input))
+	_registration_fields.add_child(_labeled_field("CONFIRM *", confirm_password_input))
+	_registration_fields.add_child(_labeled_field("SHIP NAME (optional)", ship_name_input))
+	_registration_fields.add_child(_labeled_field("LOCALE (optional)", ui_locale_input))
+	_registration_fields.add_child(_labeled_field("TIMEZONE (optional)", ui_timezone_input))
 	form.add_child(_registration_fields)
 	host_input.text_changed.connect(_on_connection_field_changed)
 	port_input.text_changed.connect(_on_connection_field_changed)
@@ -173,6 +190,11 @@ func _build() -> void:
 	connect_button.add_theme_stylebox_override("hover", _panel_style(Color(0.05, 0.27, 0.3, 1.0), Color(0.55, 0.94, 0.9, 1.0)))
 	connect_button.pressed.connect(_submit)
 	form.add_child(connect_button)
+	cancel_button = _small_button("CANCEL")
+	cancel_button.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	cancel_button.visible = false
+	cancel_button.pressed.connect(func() -> void: connection_cancelled.emit())
+	form.add_child(cancel_button)
 	mode_toggle_button = _small_button("CREATE ACCOUNT")
 	mode_toggle_button.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	mode_toggle_button.pressed.connect(_toggle_registration_mode)
@@ -188,7 +210,7 @@ func _field(placeholder: String) -> LineEdit:
 	field.placeholder_text = placeholder
 	field.custom_minimum_size.y = 42
 	field.add_theme_color_override("font_color", Color(0.93, 0.93, 0.89))
-	field.add_theme_color_override("font_placeholder_color", Color(0.56, 0.62, 0.67))
+	field.add_theme_color_override("font_placeholder_color", Color(0.36, 0.44, 0.48))
 	field.add_theme_stylebox_override("normal", _panel_style(Color(0.018, 0.04, 0.063, 0.96), Color(0.19, 0.36, 0.42, 0.8)))
 	field.add_theme_stylebox_override("focus", _panel_style(Color(0.018, 0.04, 0.063, 0.98), Color(0.35, 0.81, 0.81, 1.0)))
 	field.text_submitted.connect(func(_value: String) -> void: _submit())
@@ -264,7 +286,9 @@ func _sync_selected_profile() -> void:
 	if _selected_profile_index < 0 or _selected_profile_index >= _profiles.size():
 		return
 	var profile: Dictionary = _profiles[_selected_profile_index]
-	if str(profile.get("host", "")) != host_input.text or int(profile.get("port", 0)) != int(port_input.text) or str(profile.get("username", "")) != username_input.text:
+	# A server profile identifies a connection endpoint. Captains may change
+	# without making the saved local endpoint disappear from the selector.
+	if str(profile.get("host", "")) != host_input.text or int(profile.get("port", 0)) != int(port_input.text):
 		_selected_profile_index = -1
 		profile_selector.select(0)
 		remove_profile_button.disabled = true
@@ -317,9 +341,24 @@ func _remove_profile() -> void:
 	set_status("Server profile removed. Current connection details were left in place.")
 
 func _submit() -> void:
-	var port_number := int(port_input.text)
-	if host_input.text.strip_edges().is_empty() or port_number < 1 or port_number > 65535 or username_input.text.strip_edges().is_empty() or password_input.text.is_empty():
-		set_status("Enter a server, valid port, captain name, and password.")
+	var host := host_input.text.strip_edges()
+	var port_text := port_input.text.strip_edges()
+	var port_number := int(port_text)
+	print("[AUTH_TRACE] LoginView submit mode=%s host_present=%s port=%d username_present=%s" % ["registration" if _registration_mode else "login", not host.is_empty(), port_number, not username_input.text.strip_edges().is_empty()])
+	if host.is_empty():
+		set_status("Server address is required.")
+		return
+	if port_text.is_empty() or port_number < 1 or port_number > 65535:
+		set_status("Enter a port between 1 and 65535.")
+		return
+	if port_number == POSTGRESQL_DEFAULT_PORT:
+		set_status("Port 5432 is PostgreSQL, not the twclone game server. Use the game server port (normally 1234).")
+		return
+	if username_input.text.strip_edges().is_empty():
+		set_status("Captain name is required.")
+		return
+	if password_input.text.is_empty():
+		set_status("Password is required.")
 		return
 	if _registration_mode:
 		if password_input.text != confirm_password_input.text:
@@ -343,7 +382,21 @@ func _toggle_registration_mode() -> void:
 	_registration_mode = not _registration_mode
 	_registration_fields.visible = _registration_mode
 	confirm_password_input.clear()
+	if _registration_mode:
+		if ui_locale_input.text.strip_edges().is_empty():
+			ui_locale_input.text = _system_locale()
+		if ui_timezone_input.text.strip_edges().is_empty():
+			ui_timezone_input.text = _system_timezone()
 	set_status("Choose a captain name and enter a password twice." if _registration_mode else "Enter your captain credentials to begin.")
+
+func _system_locale() -> String:
+	var locale := OS.get_locale().replace("_", "-")
+	return locale if not locale.is_empty() else "en-US"
+
+func _system_timezone() -> String:
+	var zone := Time.get_time_zone_from_system()
+	var name := str(zone.get("name", "")) if zone is Dictionary else ""
+	return name if not name.is_empty() else "UTC"
 
 func _label(text: String, size: int, color: Color) -> Label:
 	var label := Label.new()

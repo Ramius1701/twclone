@@ -53,7 +53,7 @@ int repo_bank_player_balance_add(db_t *db, int player_id, long long delta, long 
 
     if (!db_tx_commit(db, &err)) return -err.code;
 
-    return 0;
+    return fetched_account_id;
 }
 
 int repo_bank_check_account_active(db_t *db, int player_id, int *exists_out) {
@@ -105,8 +105,10 @@ int repo_bank_get_balance(db_t *db, const char *owner_type, int owner_id, long l
 int repo_bank_get_account_id(db_t *db, const char *owner_type, int owner_id, int *account_id_out) {
     db_res_t *res = NULL;
     db_error_t err;
-    /* SQL_VERBATIM: Q5 */
-    const char *q5 = "SELECT bank_accounts_id FROM bank_accounts WHERE owner_type = {1} AND owner_id = {2}";
+    const char *id_column = sql_bank_account_id_column(db);
+    if (!id_column) return ERR_NOT_IMPLEMENTED;
+    char q5[256];
+    snprintf(q5, sizeof(q5), "SELECT %s FROM bank_accounts WHERE owner_type = {1} AND owner_id = {2}", id_column);
     char sql[256]; sql_build(db, q5, sql, sizeof(sql));
     if (db_query (db, sql, (db_bind_t[]){ db_bind_text(owner_type), db_bind_i64(owner_id) }, 2, &res, &err) && db_res_step(res, &err)) {
         *account_id_out = db_res_col_i32(res, 0, &err);
@@ -120,8 +122,10 @@ int repo_bank_get_account_id(db_t *db, const char *owner_type, int owner_id, int
 int repo_bank_get_balance_by_account_id(db_t *db, int account_id, long long *balance_out) {
     db_res_t *res = NULL;
     db_error_t err;
-    /* SQL_VERBATIM: Q18 */
-    const char *q18 = "SELECT balance FROM bank_accounts WHERE bank_accounts_id = {1};";
+    const char *id_column = sql_bank_account_id_column(db);
+    if (!id_column) return ERR_NOT_IMPLEMENTED;
+    char q18[256];
+    snprintf(q18, sizeof(q18), "SELECT balance FROM bank_accounts WHERE %s = {1};", id_column);
     char sql[256]; sql_build(db, q18, sql, sizeof(sql));
     if (db_query (db, sql, (db_bind_t[]){ db_bind_i64(account_id) }, 1, &res, &err) && db_res_step(res, &err)) {
         if (balance_out) *balance_out = db_res_col_i64(res, 0, &err);
@@ -130,6 +134,27 @@ int repo_bank_get_balance_by_account_id(db_t *db, int account_id, long long *bal
     }
     if (res) db_res_finalize(res);
     return ERR_DB_NOT_FOUND;
+}
+
+int repo_bank_get_balance_by_account_id_for_update(db_t *db, int account_id,
+                                                   long long *balance_out) {
+    if (!db || account_id <= 0 || !balance_out) return ERR_INVALID_ARG;
+    db_res_t *res = NULL;
+    db_error_t err;
+    const char *id_column = sql_bank_account_id_column(db);
+    if (!id_column) return ERR_NOT_IMPLEMENTED;
+    char query[320];
+    snprintf(query, sizeof(query), "SELECT balance FROM bank_accounts WHERE %s={1} FOR UPDATE", id_column);
+    char sql[384];
+    if (sql_build(db, query, sql, sizeof(sql)) != 0) return ERR_DB_INTERNAL;
+    if (db_query(db, sql, (db_bind_t[]){db_bind_i32(account_id)}, 1, &res, &err)
+        && db_res_step(res, &err)) {
+        *balance_out = db_res_col_i64(res, 0, &err);
+        db_res_finalize(res);
+        return err.code ? err.code : 0;
+    }
+    if (res) db_res_finalize(res);
+    return err.code ? err.code : ERR_DB_NOT_FOUND;
 }
 
 int repo_bank_create_system_notice(db_t *db, const char *now_ts, int player_id, const char *msg) {
@@ -147,8 +172,10 @@ int repo_bank_create_system_notice(db_t *db, const char *now_ts, int player_id, 
 int repo_bank_add_credits_returning(db_t *db, int account_id, long long amount, long long *new_balance_out) {
     db_error_t err;
     int64_t rows = 0;
-    /* SQL_VERBATIM: Q7 */
-    const char *q7 = "UPDATE bank_accounts SET balance = balance + {1} WHERE bank_accounts_id = {2};";
+    const char *id_column = sql_bank_account_id_column(db);
+    if (!id_column) return ERR_NOT_IMPLEMENTED;
+    char q7[256];
+    snprintf(q7, sizeof(q7), "UPDATE bank_accounts SET balance = balance + {1} WHERE %s = {2};", id_column);
     char sql[256]; sql_build(db, q7, sql, sizeof(sql));
     if (db_exec_rows_affected(db, sql, (db_bind_t[]){ db_bind_i64(amount), db_bind_i64(account_id) }, 2, &rows, &err)) {
         if (rows > 0) {
@@ -158,20 +185,42 @@ int repo_bank_add_credits_returning(db_t *db, int account_id, long long amount, 
     return ERR_DB_NOT_FOUND;
 }
 
+int repo_bank_insert_transaction_returning_id(db_t *db, const char *sql_template, int account_id, const char *tx_type, const char *direction, long long amount, long long balance_after, const char *tx_group_id, const char *now_epoch, int64_t *transaction_id_out) {
+    db_error_t err;
+    (void)direction;
+    char sql[512];
+    snprintf(sql, sizeof(sql), sql_template, now_epoch);
+    int64_t transaction_id = 0;
+    const char *id_column = sql_bank_transaction_id_column(db);
+    if (!id_column || !db_exec_insert_id(db, sql,
+          (db_bind_t[]){ db_bind_i64(account_id), db_bind_text(tx_type),
+                         db_bind_i64(amount), db_bind_i64(balance_after),
+                         db_bind_text(tx_group_id) },
+          5, id_column, &transaction_id, &err))
+        return err.code ? err.code : ERR_DB_EXEC_FAILED;
+    if (transaction_id_out) *transaction_id_out = transaction_id;
+    return 0;
+}
+
 int repo_bank_insert_transaction(db_t *db, const char *sql_template, int account_id, const char *tx_type, const char *direction, long long amount, long long balance_after, const char *tx_group_id, const char *now_epoch) {
     db_error_t err;
     (void)direction;
     char sql[512];
     snprintf(sql, sizeof(sql), sql_template, now_epoch);
-    if (!db_exec(db, sql, (db_bind_t[]){ db_bind_i64(account_id), db_bind_text(tx_type), db_bind_i64(amount), db_bind_i64(balance_after), db_bind_text(tx_group_id) }, 5, &err)) return err.code;
+    if (!db_exec(db, sql, (db_bind_t[]){ db_bind_i64(account_id),
+          db_bind_text(tx_type), db_bind_i64(amount),
+          db_bind_i64(balance_after), db_bind_text(tx_group_id) }, 5, &err))
+        return err.code;
     return 0;
 }
 
 int repo_bank_deduct_credits_returning(db_t *db, int account_id, long long amount, long long *new_balance_out) {
     db_error_t err;
     int64_t rows = 0;
-    /* SQL_VERBATIM: Q9 */
-    const char *q9 = "UPDATE bank_accounts SET balance = balance - {1} WHERE bank_accounts_id = {2} AND balance >= {1};";
+    const char *id_column = sql_bank_account_id_column(db);
+    if (!id_column) return ERR_NOT_IMPLEMENTED;
+    char q9[256];
+    snprintf(q9, sizeof(q9), "UPDATE bank_accounts SET balance = balance - {1} WHERE %s = {2} AND balance >= {1};", id_column);
     char sql[256]; sql_build(db, q9, sql, sizeof(sql));
     if (db_exec_rows_affected(db, sql, (db_bind_t[]){ db_bind_i64(amount), db_bind_i64(account_id) }, 2, &rows, &err)) {
         if (rows > 0) {
@@ -285,11 +334,14 @@ int repo_bank_update_fine(db_t *db, int fine_id, const char *new_status, long lo
 
 int repo_bank_get_transactions(db_t *db, const char *owner_type, int owner_id, int limit, const char *filter, long long start, long long end, long long min, long long max, db_res_t **out_res, db_error_t *err) {
     char sql[2048];
+    const char *account_id_col = sql_bank_account_id_column(db);
+    const char *transaction_id_col = sql_bank_transaction_id_column(db);
+    if (!account_id_col || !transaction_id_col) return ERR_NOT_IMPLEMENTED;
     /* SQL_VERBATIM: Q12 */
     snprintf (sql,
             sizeof(sql),
             "SELECT ts, account_id, tx_type, amount, balance_after, description, tx_group_id FROM bank_transactions "
-            "WHERE account_id = (SELECT bank_accounts_id FROM bank_accounts WHERE owner_type = {1} AND owner_id = {2}) ");
+            "WHERE account_id = (SELECT %s FROM bank_accounts WHERE owner_type = {1} AND owner_id = {2}) ", account_id_col);
 
     db_bind_t params[12]; int idx = 0;
     params[idx++] = db_bind_text (owner_type);
@@ -320,7 +372,9 @@ int repo_bank_get_transactions(db_t *db, const char *owner_type, int owner_id, i
         strncat (sql, buf, sizeof(sql) - strlen (sql) - 1);
         params[idx++] = db_bind_i64 (max);
     }
-    strncat (sql, "ORDER BY ts DESC, bank_transactions_id DESC LIMIT ", sizeof(sql) - strlen (sql) - 1);
+    strncat (sql, "ORDER BY ts DESC, ", sizeof(sql) - strlen (sql) - 1);
+    strncat (sql, transaction_id_col, sizeof(sql) - strlen (sql) - 1);
+    strncat (sql, " DESC LIMIT ", sizeof(sql) - strlen (sql) - 1);
     char buf[16]; snprintf (buf, sizeof(buf), "$%d;", idx + 1);
     strncat (sql, buf, sizeof(sql) - strlen (sql) - 1);
     params[idx++] = db_bind_i64 (limit);

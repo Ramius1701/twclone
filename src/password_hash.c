@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 #if defined(__linux__)
@@ -29,9 +30,13 @@ static int argon2_loaded;
 static void
 load_argon2_once (void)
 {
+#if defined(__CYGWIN__)
+  argon2_handle = dlopen ("cygargon2-1.dll", RTLD_NOW | RTLD_LOCAL);
+#else
   argon2_handle = dlopen ("libargon2.so.1", RTLD_NOW | RTLD_LOCAL);
   if (!argon2_handle)
     argon2_handle = dlopen ("libargon2.so", RTLD_NOW | RTLD_LOCAL);
+#endif
   if (!argon2_handle)
     return;
 
@@ -124,5 +129,21 @@ tw_password_verify (const char *encoded, const char *password)
     return -1;
   if (strncmp (encoded, "$argon2id$", 9) != 0)
     return 0;
-  return verify_encoded (encoded, password, strlen (password)) == 0 ? 1 : 0;
+  int rc = verify_encoded (encoded, password, strlen (password));
+  if (rc == 0)
+    return 1;
+  /* On Windows (Cygwin) a correct password is sometimes reported as a
+     mismatch, about one check in five, with the same hash and password each
+     time. Check once more before refusing; a wrong password fails both. */
+  int again = verify_encoded (encoded, password, strlen (password));
+  if (again == 0)
+    {
+      fprintf (stderr, "password_hash: first argon2id_verify said %d, second matched\n", rc);
+      return 1;
+    }
+  /* -35 is ARGON2_VERIFY_MISMATCH, a wrong password. Anything else is a
+     failure to check (memory, threads, a malformed hash), not a verdict. */
+  if (rc != -35)
+    fprintf (stderr, "password_hash: argon2id_verify failed with code %d\n", rc);
+  return 0;
 }

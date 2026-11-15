@@ -26,10 +26,15 @@ BEGIN
     DECLARE v_max_id BIGINT;
     DECLARE v_added BIGINT DEFAULT 0;
     DECLARE v_lock_key BIGINT DEFAULT 72002001;
-    DECLARE v_beacons LONGTEXT DEFAULT 'For a good time, warp to Sector 69.|The Federation is lying to you regarding Ore prices!|Don''t trust the auto-pilot...|Red Dragon Corp rules this void!|Will trade sister for a Genesis Torpedo.|I hid 500,000 credits in Sector... [text unreadable]|The Feds is watching you.|Mining is for droids. Real pilots steal.|If you can read this, you''re in range of my cannons.|Turn back. Here there be dragons.';
+    DECLARE v_name TEXT;
+    DECLARE v_beacon TEXT;
     
     CALL bigbang_lock(v_lock_key);
     
+    IF target_count IS NULL OR target_count < 0 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'target_count must be >= 0';
+    END IF;
+
     SELECT COALESCE(MAX(sector_id), 0) INTO v_max_id FROM sectors;
     
     IF v_max_id >= target_count THEN
@@ -37,32 +42,32 @@ BEGIN
         RETURN 0;
     END IF;
     
-    INSERT INTO sectors (sector_id, name, beacon, nebulae)
-    SELECT 
-        gs AS sector_id,
-        CASE WHEN gs > 10 AND RAND() < 0.6 THEN CONCAT('Nebula_', gs) ELSE NULL END AS name,
-        CASE WHEN RAND() < 0.02 THEN ELT(FLOOR(RAND() * 10) + 1, 
-            'For a good time, warp to Sector 69.',
-            'The Federation is lying to you regarding Ore prices!',
-            'Don''t trust the auto-pilot...',
-            'Red Dragon Corp rules this void!',
-            'Will trade sister for a Genesis Torpedo.',
-            'I hid 500,000 credits in Sector... [text unreadable]',
-            'The Feds is watching you.',
-            'Mining is for droids. Real pilots steal.',
-            'If you can read this, you''re in range of my cannons.',
-            'Turn back. Here there be dragons.')
-        ELSE NULL END AS beacon,
-        CASE WHEN gs > 10 AND RAND() < 0.6 THEN CONCAT('Nebula_', gs) ELSE NULL END AS nebulae
-    FROM (
-        SELECT @counter := @counter + 1 AS gs FROM 
-        (SELECT @counter := v_max_id - 1) init,
-        (SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4 UNION SELECT 5) a,
-        (SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4 UNION SELECT 5) b
-    ) generated_series
-    WHERE gs <= target_count;
-    
-    SELECT ROW_COUNT() INTO v_added;
+    WHILE v_max_id < target_count DO
+        SET v_max_id = v_max_id + 1;
+        SET v_name = NULL;
+        SET v_beacon = NULL;
+
+        IF v_max_id > 10 AND RAND() < 0.6 THEN
+            SET v_name = constellation_name();
+        END IF;
+        IF RAND() < 0.02 THEN
+            SET v_beacon = ELT(FLOOR(RAND() * 10) + 1,
+                'For a good time, warp to Sector 69.',
+                'The Federation is lying to you regarding Ore prices!',
+                'Don''t trust the auto-pilot...',
+                'Red Dragon Corp rules this void!',
+                'Will trade sister for a Genesis Torpedo.',
+                'I hid 500,000 credits in Sector... [text unreadable]',
+                'The Feds is watching you.',
+                'Mining is for droids. Real pilots steal.',
+                'If you can read this, you''re in range of my cannons.',
+                'Turn back. Here there be dragons.');
+        END IF;
+
+        INSERT INTO sectors (sector_id, name, beacon, nebulae)
+        VALUES (v_max_id, v_name, v_beacon, v_name);
+        SET v_added = v_added + 1;
+    END WHILE;
     CALL bigbang_unlock(v_lock_key);
     RETURN v_added;
 END$$
@@ -74,6 +79,7 @@ CREATE FUNCTION generate_ports(target_sectors INT) RETURNS BIGINT
 DETERMINISTIC
 BEGIN
     DECLARE v_added BIGINT DEFAULT 0;
+    DECLARE v_sectors_added BIGINT DEFAULT 0;
     DECLARE v_lock_key BIGINT DEFAULT 72002002;
     DECLARE v_target INT;
     DECLARE v_port_ratio INT;
@@ -81,16 +87,17 @@ BEGIN
     DECLARE v_base_price INT;
     DECLARE v_code TEXT;
     DECLARE v_cluster_alignment INT;
-    DECLARE port_cursor CURSOR FOR SELECT port_id, type, sector_id FROM new_ports;
-    DECLARE CONTINUE HANDLER FOR NOT FOUND SET @done = 1;
     DECLARE v_port_id INT;
     DECLARE v_port_type INT;
     DECLARE v_sector_id INT;
-    DECLARE @done INT DEFAULT 0;
+    DECLARE done INT DEFAULT 0;
+    DECLARE port_cursor CURSOR FOR SELECT type, sector_id FROM new_ports;
+    DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = 1;
     
     CALL bigbang_lock(v_lock_key);
     
-    SELECT CAST(value AS INTEGER) INTO v_port_ratio FROM config WHERE key = 'port_ratio';
+    SELECT COALESCE(MAX(CAST(value AS SIGNED)), 40) INTO v_port_ratio
+    FROM config WHERE `key` = 'port_ratio';
     IF v_port_ratio IS NULL OR v_port_ratio > 100 OR v_port_ratio < 0 THEN
         SET v_port_ratio = 40;
     END IF;
@@ -105,7 +112,7 @@ BEGIN
         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'target_sectors must be >= 0';
     END IF;
     
-    CALL generate_sectors(v_target);
+    SELECT generate_sectors(v_target) INTO v_sectors_added;
     
     CREATE TEMPORARY TABLE new_ports (
         port_id INT,
@@ -113,23 +120,35 @@ BEGIN
         sector_id INT
     );
     
-    INSERT INTO new_ports (port_id, type, sector_id)
-    SELECT port_id, type, sector_id FROM (
+    INSERT INTO new_ports (type, sector_id)
+    SELECT type, sector_id FROM (
         SELECT 
-            NULL AS port_id,
             FLOOR(RAND() * 8 + 1) AS type,
             s.sector_id AS sector_id
         FROM sectors s
         WHERE s.sector_id > 10
             AND s.sector_id <= v_target
-            AND NOT EXISTS (SELECT 1 FROM ports p WHERE p.sector_id = s.sector_id)
+            AND NOT EXISTS (SELECT 1 FROM ports p WHERE p.sector_id = s.sector_id AND p.is_active = TRUE)
             AND RAND() <= (v_port_ratio / 100.0)
     ) AS new_data;
     
     OPEN port_cursor;
     port_loop: LOOP
-        FETCH port_cursor INTO v_port_id, v_port_type, v_sector_id;
-        IF @done THEN LEAVE port_loop; END IF;
+        FETCH port_cursor INTO v_port_type, v_sector_id;
+        IF done THEN LEAVE port_loop; END IF;
+
+        INSERT INTO ports (number, name, sector_id, type, size, techlevel, porttype_id)
+        VALUES (
+            v_sector_id,
+            randomname(),
+            v_sector_id,
+            v_port_type,
+            10,
+            1,
+            (SELECT porttype_id FROM porttypes WHERE code = 'CLASS0' LIMIT 1)
+        );
+        SET v_port_id = LAST_INSERT_ID();
+        SET v_added = v_added + 1;
         
         -- Insert port_trade records based on type
         IF v_port_type = 1 THEN
@@ -191,7 +210,6 @@ BEGIN
     CLOSE port_cursor;
     
     DROP TEMPORARY TABLE IF EXISTS new_ports;
-    SELECT ROW_COUNT() INTO v_added;
     CALL bigbang_unlock(v_lock_key);
     RETURN v_added;
 END$$
@@ -203,32 +221,32 @@ CREATE FUNCTION generate_stardock() RETURNS BIGINT
 DETERMINISTIC
 BEGIN
     DECLARE v_sector INT;
-    DECLARE v_max_sector INT;
     DECLARE v_lock_key BIGINT DEFAULT 72002006;
     DECLARE v_exists BOOLEAN;
     DECLARE v_port_id INT;
     
     CALL bigbang_lock(v_lock_key);
     
-    SELECT EXISTS(SELECT 1 FROM ports WHERE type = 9) INTO v_exists;
+    SELECT EXISTS(SELECT 1 FROM ports WHERE type = 9 AND is_active = TRUE) INTO v_exists;
     IF v_exists THEN
         CALL bigbang_unlock(v_lock_key);
         RETURN 0;
     END IF;
     
-    SELECT MAX(sector_id) INTO v_max_sector FROM sectors;
-    SET v_sector = 11 + FLOOR(RAND() * (v_max_sector - 10));
+    SET v_sector = (SELECT s.sector_id
+                      FROM sectors s
+                     WHERE s.sector_id > 10
+                       AND NOT EXISTS (SELECT 1 FROM ports p WHERE p.sector_id = s.sector_id AND p.is_active = TRUE)
+                     ORDER BY RAND() LIMIT 1);
+    IF v_sector IS NULL THEN
+        CALL bigbang_unlock(v_lock_key);
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'No eligible empty sector available for Stardock';
+    END IF;
     
     INSERT INTO ports (number, name, sector_id, type, size, techlevel, petty_cash, porttype_id)
-    VALUES (v_sector, 'Stardock', v_sector, 9, 10, 10, 1000000, (SELECT porttype_id FROM porttypes WHERE code = 'CLASS0'))
-    ON DUPLICATE KEY UPDATE 
-        name = VALUES(name), 
-        type = VALUES(type), 
-        size = VALUES(size), 
-        techlevel = VALUES(techlevel), 
-        petty_cash = VALUES(petty_cash);
+    VALUES (v_sector, 'Stardock', v_sector, 9, 10, 10, 1000000, (SELECT porttype_id FROM porttypes WHERE code = 'CLASS0'));
     
-    SELECT port_id INTO v_port_id FROM ports WHERE sector_id = v_sector AND type = 9 LIMIT 1;
+    SELECT port_id INTO v_port_id FROM ports WHERE sector_id = v_sector AND type = 9 AND is_active = TRUE LIMIT 1;
     
     IF v_port_id IS NOT NULL THEN
         INSERT INTO stardock_assets (sector_id, owner_id, fighters, defenses, ship_capacity)
@@ -439,9 +457,9 @@ BEGIN
     SET v_ship_name = COALESCE(p_ship_name, 'Used Scout Marauder');
     
     SELECT CAST(value AS UNSIGNED) INTO v_starting_credits
-    FROM config WHERE key = 'startingcredits';
+    FROM config WHERE `key` = 'startingcredits';
     SELECT CAST(value AS UNSIGNED) INTO v_turns_per_day
-    FROM config WHERE key = 'turnsperday';
+    FROM config WHERE `key` = 'turnsperday';
     
     SET v_starting_credits = COALESCE(v_starting_credits, 5000);
     SET v_turns_per_day = COALESCE(v_turns_per_day, 500);
@@ -469,7 +487,7 @@ BEGIN
     VALUES (v_player_id, v_turns_per_day, NOW())
     ON DUPLICATE KEY UPDATE turns_remaining = VALUES(turns_remaining);
     
-    INSERT INTO player_prefs (player_prefs_id, key, type, value)
+    INSERT INTO player_prefs (player_prefs_id, `key`, type, value)
     VALUES (v_player_id, 'default_preferences_initialized', 'bool', 'true')
     ON DUPLICATE KEY UPDATE value = VALUES(value);
     
@@ -517,14 +535,33 @@ CREATE PROCEDURE setup_orion_syndicate()
 BEGIN
     DECLARE v_ptype INT;
     DECLARE v_orion_corp_id INT;
-    DECLARE v_orion_sector INT DEFAULT 386;
+    DECLARE v_orion_port_id BIGINT DEFAULT NULL;
+    DECLARE v_orion_sector INT DEFAULT NULL;
     
     SELECT planettypes_id INTO v_ptype FROM planettypes WHERE code = 'M' LIMIT 1;
     SELECT id INTO v_orion_corp_id FROM corporations WHERE LOWER(name) = LOWER('Orion Syndicate') LIMIT 1;
-    SELECT COALESCE(exit_sector, 386) INTO v_orion_sector FROM longest_tunnels LIMIT 1 OFFSET 1;
-    
-    IF v_orion_sector IS NULL OR v_orion_sector = 0 THEN
-        SET v_orion_sector = FLOOR(RAND() * (989 - 11 + 1)) + 11;
+    SET v_orion_port_id = (SELECT port_id FROM ports
+                           WHERE type = 10 AND name = 'Orion Black Market' AND is_active = TRUE
+                           ORDER BY port_id LIMIT 1);
+    SET v_orion_sector = (SELECT sector_id FROM ports
+                          WHERE type = 10 AND name = 'Orion Black Market' AND is_active = TRUE
+                          ORDER BY port_id LIMIT 1);
+    IF v_orion_sector IS NULL THEN
+        SET v_orion_sector = (SELECT lt.exit_sector
+                                FROM longest_tunnels lt
+                               WHERE lt.exit_sector > 10
+                                 AND NOT EXISTS (SELECT 1 FROM ports p WHERE p.sector_id = lt.exit_sector AND p.is_active = TRUE)
+                               ORDER BY RAND() LIMIT 1);
+    END IF;
+    IF v_orion_sector IS NULL THEN
+        SET v_orion_sector = (SELECT s.sector_id
+                                FROM sectors s
+                               WHERE s.sector_id > 10
+                                 AND NOT EXISTS (SELECT 1 FROM ports p WHERE p.sector_id = s.sector_id AND p.is_active = TRUE)
+                               ORDER BY RAND() LIMIT 1);
+    END IF;
+    IF v_orion_sector IS NULL THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'No eligible empty sector available for Orion port';
     END IF;
     
     INSERT IGNORE INTO planets (num, sector_id, name, owner_id, owner_type, class, type, created_at, created_by)
@@ -536,8 +573,11 @@ BEGIN
     INSERT IGNORE INTO sector_assets (sector_id, owner_id, corporation_id, asset_type, quantity, deployed_at)
     VALUES (v_orion_sector, 4, COALESCE(v_orion_corp_id, 1), 1, 250, NOW());
     
-    INSERT IGNORE INTO ports (sector_id, name, type, port_code, created_by, created_at)
-    VALUES (v_orion_sector, 'Orion Black Market', 10, 9998, 0, NOW());
+    IF v_orion_port_id IS NULL THEN
+        INSERT INTO ports (sector_id, name, type, port_code, created_by, created_at)
+        VALUES (v_orion_sector, 'Orion Black Market', 10, 9998, 0, NOW());
+        SET v_orion_port_id = LAST_INSERT_ID();
+    END IF;
 END$$
 
 CREATE PROCEDURE spawn_initial_fleet()
@@ -551,4 +591,3 @@ BEGIN
 END$$
 
 DELIMITER ;
-

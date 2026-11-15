@@ -4,6 +4,7 @@ import tempfile
 import time
 import logging
 import hashlib
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from helpers import canon_commodity
 
 
@@ -17,30 +18,54 @@ class StateManager:
             "session_id": None,
             "player_info": None,
             "ship_info": None,
+            # Locally observed purchase lots survive authoritative ship-status
+            # refreshes, which omit purchase price and origin-port details.
+            "cargo_metadata": [],
             "player_location_sector": None,
             "sector_data": {},          # Caches for sector.info
             "universe_map": {},         # NEW: For systematic exploration
             "port_info_by_sector": {},  # Caches for port.info
             "price_cache": {},          # Caches for trade.quote
             "bank_balance": 0,
+            "planet_info": None,
             "command_retry_info": {},   # Tracks failures/cooldowns
             "strategy_plan": [],        # NEW: For multi-stage plans
+            "strategy_plan_source": None,
+            "strategy_inference_status": None,
             "trade_successful": False,  # For bandit reward,
             "q_table": {},              # Persist learning
             "n_table": {},              # Persist learning
             "command_schemas": {},      # NEW: Cache for command schemas
+            "server_capabilities": {},  # V3 system.welcome/system.capabilities
+            "handshake_complete": False,
+            "ordinary_player_commands": [],
             "schema_blacklist": [],     # NEW: List of commands that failed schema fetching
             "pending_schema_requests": {}, # NEW: Map of schema request ID to command name
             "recent_sectors": [],       # NEW: To avoid ping-ponging
             "pending_commands": {},     # NEW: To track sent commands for error correlation
+            "uncertain_mutations": {},  # Durable ambiguity markers for every mutating command
             "port_trade_blacklist": [], # NEW: List of ports that failed on trade
             "warp_blacklist": [],       # NEW: List of sectors that are unreachable via warp
+            "sector_danger": {},        # Persisted hazard/interdiction risk by sector
+            "route_memory": [],         # Successful profitable trade routes
+            "market_history": {},       # Bounded quote history for forecasting
+            "opponent_model": {},       # Public observations of other players
+            "combat_memory": [],        # Recent combat outcomes and readiness
+            "victory_status": {},      # Server/configured endgame progress
+            "restart_checkpoint": {},  # Last durable strategic checkpoint
+            "fleet_state": {"ships": {}, "active_ship_id": None},
+            "mission": {},              # Current objective, deadline, budget, fallback
+            "diplomacy_queue": [],      # Explicit player-to-player offers
+            "decision_trace": [],       # Bounded explainability history
+            "learning_history": [],     # Outcome samples used to tune policy
             "current_path": [],         # NEW: Stores the server-provided path for navigation
             "last_action_result": None, # NEW: Feedback loop for LLM
             "last_quotes": {},          # NEW: Deterministic trade rule support
             "command_sent_in_response_loop": False, # NEW: To prevent double-sending
             "last_port_trade": None,    # NEW: To prevent immediate buy-back or sell-back
             "server_events": [],       # Bounded event history for strategy/recovery
+            "notices": [],
+            "deployed_assets": {"fighters.recall": [], "mines.recall": []},
             "seen_server_event_ids": [],
             "event_refresh_requests": [],
             "market_recommendations": [],
@@ -71,8 +96,20 @@ class StateManager:
                 with open(self.state_file, 'r') as f:
                     # Merge saved state with defaults
                     saved_state = json.load(f)
+                    if not isinstance(saved_state, dict):
+                        raise ValueError("state file root must be an object")
                     self.state.update(saved_state)
                     logger.info("Loaded state from %s", self.state_file)
+
+                    # Recover the last strategic plan if a process was
+                    # interrupted between planning and the normal state save.
+                    checkpoint = self.state.get("restart_checkpoint") or {}
+                    if (not self.state.get("strategy_plan")
+                            and isinstance(checkpoint.get("strategy_plan"), list)):
+                        self.state["strategy_plan"] = list(checkpoint["strategy_plan"])
+                    if (not self.state.get("strategy_plan_source")
+                            and checkpoint.get("strategy_plan_source")):
+                        self.state["strategy_plan_source"] = checkpoint["strategy_plan_source"]
                     
                     # Transient data that SHOULD be reset on load
                     self.state["command_retry_info"] = {} 
@@ -106,6 +143,27 @@ class StateManager:
         """Saves the current state to the state file."""
         temporary_path = None
         try:
+            self.state["restart_checkpoint"] = {
+                "saved_at": time.time(),
+                "strategy_plan": list(self.state.get("strategy_plan", [])),
+                "strategy_plan_source": self.state.get("strategy_plan_source"),
+                "player_location_sector": self.state.get("player_location_sector"),
+                "mission_name": (self.state.get("mission") or {}).get("name"),
+            }
+            # Session credentials are runtime-only. Reauthentication is already
+            # required on process start, so there is no reason to persist them.
+            persisted_state = dict(self.state)
+            persisted_state["session_id"] = None
+            player_info = persisted_state.get("player_info")
+            if isinstance(player_info, dict):
+                persisted_player_info = dict(player_info)
+                player = persisted_player_info.get("player")
+                if isinstance(player, dict):
+                    persisted_player = dict(player)
+                    persisted_player.pop("session_token", None)
+                    persisted_player.pop("session", None)
+                    persisted_player_info["player"] = persisted_player
+                persisted_state["player_info"] = persisted_player_info
             target_path = os.path.abspath(self.state_file)
             target_dir = os.path.dirname(target_path)
             prefix = f".{os.path.basename(target_path)}."
@@ -113,7 +171,7 @@ class StateManager:
                 prefix=prefix, suffix=".tmp", dir=target_dir
             )
             with os.fdopen(file_descriptor, 'w', encoding='utf-8') as f:
-                json.dump(self.state, f, indent=4)
+                json.dump(persisted_state, f, indent=4)
                 f.flush()
             os.replace(temporary_path, target_path)
             temporary_path = None
@@ -145,6 +203,21 @@ class StateManager:
         """Sets a value in the state only if it doesn't exist."""
         if key not in self.state:
             self.state[key] = default_value
+
+    def mark_uncertain_mutation(self, request_id, command, data=None, contract=None):
+        """Persist an in-flight mutation so a restart cannot silently replay it."""
+        mutations = self.state.setdefault("uncertain_mutations", {})
+        mutations[str(request_id)] = {
+            "request_id": str(request_id), "command": command,
+            "data": data or {}, "contract": contract or {},
+        }
+        self.save_state()
+
+    def resolve_uncertain_mutation(self, request_id):
+        mutations = self.state.setdefault("uncertain_mutations", {})
+        if str(request_id) in mutations:
+            mutations.pop(str(request_id), None)
+            self.save_state()
 
     def set_last_action_result(self, result_dict):
         """Updates the result of the last attempted action for LLM feedback."""
@@ -354,7 +427,152 @@ class StateManager:
         self.state["price_cache"][port_id]["buy"][commodity] = quote_data.get("buy_price")
         self.state["price_cache"][port_id]["sell"][commodity] = quote_data.get("sell_price")
         self.state["price_cache"][port_id].setdefault("quoted_at", {})[commodity] = time.time()
+        history = self.state.setdefault("market_history", {}).setdefault(
+            f"{port_id}:{commodity}", []
+        )
+        history.append({
+            "timestamp": time.time(),
+            "buy_price": quote_data.get("buy_price"),
+            "sell_price": quote_data.get("sell_price"),
+        })
+        del history[:-20]
             
+        self.save_state()
+
+    def forecast_market(self, port_id, commodity):
+        """Return a conservative trend forecast from persisted quote history."""
+        key = f"{port_id}:{canon_commodity(commodity)}"
+        samples = [item for item in self.state.get("market_history", {}).get(key, [])
+                   if isinstance(item, dict)]
+        if not samples:
+            return {}
+
+        def trend(field):
+            values = []
+            for item in samples:
+                try:
+                    values.append(float(item.get(field)))
+                except (TypeError, ValueError):
+                    continue
+            if not values:
+                return {}
+            recent = values[-min(5, len(values)):]
+            baseline_values = values[:-len(recent)] or recent[:1]
+            baseline = sum(baseline_values) / len(baseline_values)
+            return {"current": recent[-1], "baseline": baseline,
+                    "delta": recent[-1] - baseline}
+
+        return {"buy": trend("buy_price"), "sell": trend("sell_price"),
+                "samples": len(samples)}
+
+    def record_opponent_observation(self, observations, sector_id=None):
+        """Persist public observations of other players and their threat level."""
+        if not isinstance(observations, list):
+            return
+        models = self.state.setdefault("opponent_model", {})
+        now = time.time()
+        for observed in observations:
+            if not isinstance(observed, dict):
+                continue
+            identity = observed.get("player_id", observed.get("username", observed.get("ship_id")))
+            if identity is None:
+                continue
+            key = str(identity)
+            entry = dict(models.get(key, {}))
+            entry.update({k: observed[k] for k in (
+                "player_id", "username", "ship_id", "corporation_id", "alignment"
+            ) if k in observed})
+            entry["sector_id"] = observed.get("sector_id", sector_id)
+            entry["last_seen"] = now
+            try:
+                threat = float(entry.get("threat_score", 0) or 0)
+            except (TypeError, ValueError):
+                threat = 0.0
+            if observed.get("hostile") or observed.get("is_hostile"):
+                threat += 25.0
+            entry["threat_score"] = max(0.0, min(100.0, threat))
+            models[key] = entry
+        if len(models) > 200:
+            self.state["opponent_model"] = dict(sorted(
+                models.items(), key=lambda item: item[1].get("last_seen", 0), reverse=True
+            )[:200])
+        self.save_state()
+
+    def record_combat_outcome(self, outcome):
+        if not isinstance(outcome, dict):
+            return
+        allowed = {"result", "target_player_id", "sector_id", "hull", "shields",
+                   "fighters", "damage_taken"}
+        history = self.state.setdefault("combat_memory", [])
+        history.append({"timestamp": time.time(), **{
+            key: value for key, value in outcome.items() if key in allowed
+        }})
+        del history[:-50]
+        self.save_state()
+
+    def record_fleet_snapshot(self, ships):
+        """Track owned/public ships without assuming control of inactive ships."""
+        if not isinstance(ships, list):
+            return
+        fleet = self.state.setdefault("fleet_state", {"ships": {}, "active_ship_id": None})
+        registry = fleet.setdefault("ships", {})
+        for ship in ships:
+            if not isinstance(ship, dict):
+                continue
+            ship_id = ship.get("ship_id", ship.get("id"))
+            if ship_id is None:
+                continue
+            registry[str(ship_id)] = {
+                key: ship[key] for key in (
+                    "ship_id", "id", "name", "type", "sector_id", "status", "role",
+                    "hull", "shields", "fighters", "holds", "owner_id"
+                ) if key in ship
+            }
+        if len(registry) > 50:
+            fleet["ships"] = dict(list(registry.items())[-50:])
+        self.save_state()
+
+    def assign_fleet_role(self, ship_id, role):
+        fleet = self.state.setdefault("fleet_state", {"ships": {}, "active_ship_id": None})
+        entry = fleet.setdefault("ships", {}).setdefault(str(ship_id), {"ship_id": ship_id})
+        entry["role"] = str(role)
+        self.save_state()
+
+    def set_mission(self, mission):
+        """Persist a bounded mission contract used by the planner after restart."""
+        if not isinstance(mission, dict):
+            return
+        self.state["mission"] = {
+            "name": str(mission.get("name", "unnamed")),
+            "goals": list(mission.get("goals", [])),
+            "deadline": mission.get("deadline"),
+            "budget": mission.get("budget"),
+            "fallback": mission.get("fallback"),
+            "started_at": mission.get("started_at", time.time()),
+        }
+        self.save_state()
+
+    def record_decision(self, decision, outcome=None):
+        """Keep an explainable, bounded record of why the controller acted."""
+        if not isinstance(decision, dict):
+            return
+        trace = self.state.setdefault("decision_trace", [])
+        item = {"timestamp": time.time(), **{
+            key: decision[key] for key in ("goal", "command", "reason", "risk", "source")
+            if key in decision
+        }}
+        if outcome is not None:
+            item["outcome"] = outcome
+        trace.append(item)
+        del trace[:-100]
+        self.save_state()
+
+    def record_learning_outcome(self, action, context, reward, success):
+        history = self.state.setdefault("learning_history", [])
+        history.append({"timestamp": time.time(), "action": action,
+                        "context": context, "reward": float(reward),
+                        "success": bool(success)})
+        del history[:-200]
         self.save_state()
 
     def set_credits(self, credits):
@@ -364,8 +582,8 @@ class StateManager:
             logger.info(f"Updated credits to {credits}.")
             self.save_state()
 
-    def update_cargo_after_buy(self, items_bought, port_id, credits_remaining=None):
-        """Updates cargo list after a successful buy, including purchase price."""
+    def update_cargo_after_buy(self, items_bought, port_id, credits_remaining=None, fees=None):
+        """Update cargo using receipt prices with the paid buy fee in its cost basis."""
         if credits_remaining is not None:
             self.set_credits(credits_remaining)
 
@@ -378,16 +596,43 @@ class StateManager:
         # We don't need to look up price cache for unit_price if it is in items_bought
         # But we might want to normalize keys if we did.
         
+        def money(value):
+            try:
+                return Decimal(str(value))
+            except (InvalidOperation, TypeError, ValueError):
+                return None
+
+        fee_total = money(fees) or Decimal("0")
+        gross_values = []
         for item in items_bought:
+            quantity = item.get("units") or item.get("quantity")
+            unit_price = money(item.get("price_per_unit") or item.get("unit_price"))
+            gross = money(item.get("value"))
+            if gross is None and quantity and unit_price is not None:
+                gross = unit_price * int(quantity)
+            gross_values.append(max(Decimal("0"), gross or Decimal("0")))
+        gross_total = sum(gross_values, Decimal("0"))
+
+        for item_index, item in enumerate(items_bought):
             commodity = canon_commodity(item.get("commodity"))
             # Note: trade.buy_receipt_v1 uses "units" not "quantity"!
             quantity = item.get("units") or item.get("quantity")
             # Note: trade.buy_receipt_v1 uses "price_per_unit" not "unit_price"!
-            purchase_price = item.get("price_per_unit") or item.get("unit_price")
+            purchase_price = money(item.get("price_per_unit") or item.get("unit_price"))
 
             if not all([commodity, quantity, purchase_price is not None]):
                 logger.warning(f"Could not log purchase for {item}, missing data (commodity, quantity, or unit_price).")
                 continue
+
+            if purchase_price is not None and quantity:
+                if gross_total > 0:
+                    fee_share = fee_total * gross_values[item_index] / gross_total
+                else:
+                    fee_share = Decimal("0")
+                purchase_price = float(
+                    (purchase_price + fee_share / Decimal(int(quantity)))
+                    .quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                )
 
             # Check if we already have a batch of this commodity at the same price and origin
             found = False
@@ -413,11 +658,15 @@ class StateManager:
                 "commodity": commodity,
                 "type": "buy"
             }
+        self.state["cargo_metadata"] = [
+            dict(item) for item in self.state["ship_info"].get("cargo", [])
+            if isinstance(item, dict)
+        ]
         logger.info(f"Cargo updated after buy: {self.state['ship_info']['cargo']}")
         self.save_state()
 
-    def update_cargo_after_sell(self, items_sold, port_id, credits_remaining=None):
-        """Updates cargo list after a successful sell and returns total profit."""
+    def update_cargo_after_sell(self, items_sold, port_id, credits_remaining=None, fees=None):
+        """Update cargo and return net realized profit after receipt sell fees."""
         if credits_remaining is not None:
             self.set_credits(credits_remaining)
 
@@ -427,10 +676,38 @@ class StateManager:
         total_profit = 0
         port_sell_prices = self.state.get("price_cache", {}).get(str(port_id), {}).get("sell", {})
 
-        for item_sold in items_sold:
+        def money(value):
+            try:
+                return Decimal(str(value))
+            except (InvalidOperation, TypeError, ValueError):
+                return None
+
+        fee_total = money(fees) or Decimal("0")
+        origin_ports = {}
+        for cargo_item in self.state["ship_info"].get("cargo", []):
+            commodity = canon_commodity(cargo_item.get("commodity"))
+            if commodity and cargo_item.get("origin_port_id") is not None:
+                origin_ports.setdefault(commodity, cargo_item.get("origin_port_id"))
+        gross_values = []
+        for item in items_sold:
+            quantity = item.get("quantity") or item.get("units")
+            gross = money(item.get("value"))
+            unit_price = money(item.get("unit_price") or item.get("price_per_unit"))
+            if gross is None and quantity and unit_price is not None:
+                gross = unit_price * int(quantity)
+            if gross is None and quantity:
+                unit_price = money(port_sell_prices.get(canon_commodity(item.get("commodity"))))
+                if unit_price is not None:
+                    gross = unit_price * int(quantity)
+            gross_values.append(max(Decimal("0"), gross or Decimal("0")))
+        gross_total = sum(gross_values, Decimal("0"))
+
+        for item_index, item_sold in enumerate(items_sold):
             commodity_sold = canon_commodity(item_sold.get("commodity"))
             quantity_sold = item_sold.get("quantity")
-            sell_price = port_sell_prices.get(commodity_sold)
+            sell_price = money(item_sold.get("unit_price") or item_sold.get("price_per_unit"))
+            if sell_price is None:
+                sell_price = money(port_sell_prices.get(commodity_sold))
 
             if not all([commodity_sold, quantity_sold, sell_price is not None]):
                 continue
@@ -455,8 +732,14 @@ class StateManager:
                     qty_from_this_batch = min(quantity_to_remove, cargo_item.get("quantity", 0))
                     
                     # Log profit based on batch purchase price
-                    profit = (sell_price - purchase_price) * qty_from_this_batch
-                    total_profit += profit
+                    gross_proceeds = money(item_sold.get("value"))
+                    if gross_proceeds is None:
+                        gross_proceeds = sell_price * int(quantity_sold)
+                    fee_share = (fee_total * gross_values[item_index] / gross_total
+                                 if gross_total > 0 else Decimal("0"))
+                    net_unit_proceeds = (gross_proceeds - fee_share) / Decimal(int(quantity_sold))
+                    profit = (net_unit_proceeds - money(purchase_price)) * int(qty_from_this_batch)
+                    total_profit += float(profit)
 
                     # Decrement the quantity of the batch
                     cargo_item['quantity'] -= qty_from_this_batch
@@ -467,6 +750,10 @@ class StateManager:
             
             # Combine the remaining parts of sold commodity with the other items
             self.state['ship_info']['cargo'] = other_items + new_cargo_list
+            self.state["cargo_metadata"] = [
+                dict(item) for item in self.state["ship_info"]["cargo"]
+                if isinstance(item, dict)
+            ]
             
             # Record last trade
             self.state["last_port_trade"] = {
@@ -474,6 +761,22 @@ class StateManager:
                 "commodity": commodity_sold,
                 "type": "sell"
             }
+            # A completed sale is the strongest evidence that a route works.
+            # Resolve the original port back to its surveyed sector so the
+            # next cargo run can prefer this route without guessing.
+            origin_port = origin_ports.get(commodity_sold)
+            buy_sector = None
+            for sector_id, port in (self.state.get("port_info_by_sector") or {}).items():
+                if str((port or {}).get("port_id")) == str(origin_port):
+                    buy_sector = sector_id
+                    break
+            if buy_sector is not None and self.state.get("player_location_sector") is not None:
+                self.record_trade_route({
+                    "buy_sector": buy_sector,
+                    "sell_sector": self.state.get("player_location_sector"),
+                    "commodity": commodity_sold,
+                    "profit": total_profit,
+                })
 
         logger.info(f"Cargo updated after sell. Profit: {total_profit}. New cargo: {self.state['ship_info']['cargo']}")
         self.save_state()
@@ -524,6 +827,8 @@ class StateManager:
             # Trust server cargo if provided, but PRESERVE local tracking data (prices, origins)
             server_cargo = player_data['ship'].get('cargo')
             local_cargo = (self.state.get('ship_info') or {}).get('cargo', [])
+            if not local_cargo:
+                local_cargo = self.state.get("cargo_metadata", [])
             
             # Save local cargo metadata in a map for quick lookup during merge
             # Key: commodity name, Value: list of batches with metadata
@@ -552,20 +857,27 @@ class StateManager:
                         s_qty = s_item.get("quantity", 0)
                         
                         if c in local_cargo_meta and s_qty > 0:
-                            # We have local metadata for this commodity. 
-                            # If quantities match perfectly, just use local item.
-                            # If not, we still use local metadata but might need to adjust (TODO: smarter splitting)
+                            # Preserve only metadata supported by the observed
+                            # lots. An uncertain buy can add an unknown lot;
+                            # an unexplained reduction cannot identify which
+                            # lots were removed.
                             l_items = local_cargo_meta[c]
                             l_qty_total = sum(i.get("quantity", 0) for i in l_items)
                             
                             if l_qty_total == s_qty:
                                 merged_cargo.extend(l_items)
+                            elif l_qty_total < s_qty:
+                                merged_cargo.extend(l_items)
+                                unknown_item = dict(s_item)
+                                unknown_item["quantity"] = s_qty - l_qty_total
+                                unknown_item.pop("purchase_price", None)
+                                unknown_item.pop("origin_port_id", None)
+                                merged_cargo.append(unknown_item)
                             else:
-                                # Quantity mismatch. Trust server quantity but keep metadata if possible.
-                                # For now, take the first local batch and adjust its quantity.
-                                base_item = dict(l_items[0])
-                                base_item["quantity"] = s_qty
-                                merged_cargo.append(base_item)
+                                unknown_item = dict(s_item)
+                                unknown_item.pop("purchase_price", None)
+                                unknown_item.pop("origin_port_id", None)
+                                merged_cargo.append(unknown_item)
                         else:
                             # No local metadata, use server item as-is
                             merged_cargo.append(s_item)
@@ -573,6 +885,11 @@ class StateManager:
                     self.state['ship_info']['cargo'] = merged_cargo
             else:
                 self.state['ship_info']['cargo'] = local_cargo
+
+            self.state["cargo_metadata"] = [
+                dict(item) for item in self.state["ship_info"].get("cargo", [])
+                if isinstance(item, dict)
+            ]
 
             # Update location from ship info (authoritative GPS)
             if 'location' in player_data['ship'] and 'sector_id' in player_data['ship']['location']:
@@ -635,12 +952,16 @@ class StateManager:
                 expired.append((request_id, command))
         return expired
 
-    def clear_connection_state(self):
+    def clear_connection_state(self, record_reconnect=True):
         """Drop connection-scoped state and require authoritative re-hydration."""
         self.state["session_id"] = None
         self.state["pending_commands"] = {}
         self._pending_command_times.clear()
         self.state["pending_schema_requests"] = {}
+        self.state["handshake_complete"] = False
+        self.state["server_capabilities"] = {}
+        self.state["ordinary_player_commands"] = []
+        self.state["server_commands"] = []
         self.state["player_info"] = None
         self.state["ship_info"] = None
         self.state["player_location_sector"] = None
@@ -649,12 +970,23 @@ class StateManager:
         self.state["autopilot_status_checked"] = False
         self.state["strategy_plan"] = []
         self.state["needs_bootstrap"] = True
-        self.record_ai_metric("reconnects")
+        if record_reconnect:
+            self.record_ai_metric("reconnects")
         self.save_state()
 
     def record_ai_metric(self, name, amount=1):
         metrics = self.state.setdefault("ai_metrics", {})
         metrics[name] = metrics.get(name, 0) + amount
+        self.save_state()
+
+    def record_command_timeout(self, command_name):
+        """Record aggregate and per-command timeout metrics without request data."""
+        command = str(command_name or "unknown")
+        suffix = "".join(ch if ch.isalnum() else "_" for ch in command)[:80] or "unknown"
+        metrics = self.state.setdefault("ai_metrics", {})
+        metrics["commands_timed_out"] = metrics.get("commands_timed_out", 0) + 1
+        metric_name = f"command_timeout_{suffix}"
+        metrics[metric_name] = metrics.get(metric_name, 0) + 1
         self.save_state()
 
     def ingest_server_event(self, envelope):
@@ -722,6 +1054,50 @@ class StateManager:
             self.state["warp_blacklist"].append(sector_id)
             logger.info(f"Added sector {sector_id} to warp blacklist.")
             self.save_state()
+
+    def record_sector_danger(self, sector_id, hazard_types=None, severity=1):
+        """Persist destination risk so autonomous routing avoids repeat losses."""
+        try:
+            key = str(int(sector_id))
+        except (TypeError, ValueError):
+            return
+        current = self.state.setdefault("sector_danger", {}).get(key, {})
+        hazards = set(current.get("hazards", []))
+        hazards.update(str(value) for value in (hazard_types or []) if value)
+        try:
+            severity = max(1, int(severity))
+        except (TypeError, ValueError):
+            severity = 1
+        self.state.setdefault("sector_danger", {})[key] = {
+            "hazards": sorted(hazards),
+            "severity": max(severity, int(current.get("severity", 0) or 0)),
+            "last_seen": time.time(),
+        }
+        self.save_state()
+
+    def record_trade_route(self, route):
+        """Keep bounded memory of routes that actually produced a sale."""
+        if not isinstance(route, dict):
+            return
+        if any(route.get(key) is None for key in ("buy_sector", "sell_sector", "commodity")):
+            return
+        normalized = dict(route)
+        try:
+            normalized["buy_sector"] = int(normalized["buy_sector"])
+            normalized["sell_sector"] = int(normalized["sell_sector"])
+        except (TypeError, ValueError):
+            return
+        normalized["commodity"] = canon_commodity(normalized["commodity"])
+        normalized["last_used"] = time.time()
+        routes = self.state.setdefault("route_memory", [])
+        routes = [item for item in routes if not (
+            str(item.get("buy_sector")) == str(normalized["buy_sector"])
+            and str(item.get("sell_sector")) == str(normalized["sell_sector"])
+            and canon_commodity(item.get("commodity")) == normalized["commodity"]
+        )]
+        routes.insert(0, normalized)
+        self.state["route_memory"] = routes[:50]
+        self.save_state()
 
     def record_trade_failure(self, port_id, command_name, error_code, error_message):
         """Records a trade command failure and updates blacklists as appropriate."""

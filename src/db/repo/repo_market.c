@@ -2,6 +2,7 @@
 #include "db_int.h"
 #include <string.h>             // For strncpy, strcmp
 #include <stdlib.h>             // For malloc, free
+#include <stdio.h>
 // local includes
 #include "repo_market.h"
 #include "db/repo/repo_database.h"           // For db_get_handle, db_begin, db_commit, db_rollback
@@ -81,20 +82,33 @@ db_update_commodity_order (db_t *db,
                            int new_filled_quantity,
                            const char *new_status)
 {
+  return db_update_commodity_order_state (db, order_id, new_quantity,
+                                          new_filled_quantity, new_status,
+                                          NULL);
+}
+
+int
+db_update_commodity_order_state (db_t *db, int order_id, int new_quantity,
+                                 int new_filled_quantity,
+                                 const char *new_status,
+                                 const char *cancellation_reason)
+{
   db_error_t err;
   db_error_clear (&err);
-  db_bind_t params[4];
+  db_bind_t params[5];
 
 
   params[0] = db_bind_i64 (order_id);
   params[1] = db_bind_i64 (new_quantity);
   params[2] = db_bind_i64 (new_filled_quantity);
   params[3] = db_bind_text (new_status);
+  params[4] = cancellation_reason ? db_bind_text(cancellation_reason)
+                                  : db_bind_null();
 
 
  const char *sql_tmpl =
   "UPDATE commodity_orders "
-  "SET quantity = {2}, filled_quantity = {3}, status = {4} "
+  "SET quantity = {2}, filled_quantity = {3}, status = {4}, cancellation_reason = {5} "
   "WHERE commodity_orders_id = {1};";
 
  char sql[256];
@@ -103,7 +117,7 @@ db_update_commodity_order (db_t *db,
    return ERR_DB;
 
  
-  if (!db_exec (db, sql, params, 4, &err))
+ if (!db_exec (db, sql, params, 5, &err))
     {
       LOGE ("db_update_commodity_order: update failed: %s (code=%d backend=%d)",
             err.message, err.code, err.backend_code);
@@ -111,6 +125,59 @@ db_update_commodity_order (db_t *db,
     }
 
   return 0;
+}
+
+int
+db_market_lock_planet_buy_order (db_t *db, int order_id, int *player_id,
+                                 int *planet_id, int *quantity,
+                                 int *filled_quantity, char status_out[16])
+{
+  if (!db || order_id <= 0 || !player_id || !planet_id || !quantity
+      || !filled_quantity || !status_out)
+    return ERR_INVALID_ARG;
+  db_res_t *res = NULL;
+  db_error_t err;
+  char sql[512];
+  if (sql_build(db,
+      "SELECT actor_id, location_id, quantity, filled_quantity, status "
+      "FROM commodity_orders WHERE commodity_orders_id={1} "
+      "AND actor_type='player' AND location_type='planet' AND side='buy' "
+      "FOR UPDATE", sql, sizeof(sql)) != 0)
+    return ERR_DB_INTERNAL;
+  if (!db_query(db, sql, (db_bind_t[]){db_bind_i32(order_id)}, 1, &res, &err))
+    return err.code ? err.code : ERR_DB_QUERY_FAILED;
+  if (!db_res_step(res, &err)) {
+    db_res_finalize(res);
+    return ERR_DB_NOT_FOUND;
+  }
+  *player_id = db_res_col_i32(res, 0, &err);
+  *planet_id = db_res_col_i32(res, 1, &err);
+  *quantity = db_res_col_i32(res, 2, &err);
+  *filled_quantity = db_res_col_i32(res, 3, &err);
+  const char *status = db_res_col_text(res, 4, &err);
+  snprintf(status_out, 16, "%s", status ? status : "");
+  db_res_finalize(res);
+  return err.code ? err.code : 0;
+}
+
+int
+db_market_cancel_open_order (db_t *db, int order_id,
+                             const char *cancellation_reason)
+{
+  if (!db || order_id <= 0 || !cancellation_reason)
+    return ERR_INVALID_ARG;
+  char sql[512];
+  db_error_t err;
+  int64_t affected = 0;
+  if (sql_build(db,
+      "UPDATE commodity_orders SET status='cancelled', cancellation_reason={2} "
+      "WHERE commodity_orders_id={1} AND status='open'", sql, sizeof(sql)) != 0)
+    return ERR_DB_INTERNAL;
+  if (!db_exec_rows_affected(db, sql,
+      (db_bind_t[]){db_bind_i32(order_id), db_bind_text(cancellation_reason)},
+      2, &affected, &err))
+    return err.code ? err.code : ERR_DB_EXEC_FAILED;
+  return affected == 1 ? 0 : ERR_DB_CONSTRAINT;
 }
 
 
@@ -206,7 +273,7 @@ db_get_open_order (db_t *db,
   params[3] = db_bind_text (side);
 
   const char *sql_tmpl =
-    "SELECT commodity_orders_id, actor_type, actor_id, commodity_id, side, "
+    "SELECT commodity_orders_id, actor_type, actor_id, location_type, location_id, commodity_id, side, "
     "quantity, price, status, ts, expires_at, filled_quantity "
     "FROM commodity_orders "
     "WHERE actor_type = {1} AND actor_id = {2} AND commodity_id = {3} "
@@ -233,37 +300,40 @@ db_get_open_order (db_t *db,
 
   if (db_res_step (res, &err))
     {
-      /* Column 0..10 match SELECT list */
+      /* Column 0..12 match SELECT list */
       out_order->id = (int) db_res_col_i64 (res, 0, &err);
 
       h_copy_cstr (out_order->actor_type, sizeof(out_order->actor_type),
                    db_res_col_text (res, 1, &err));
 
       out_order->actor_id = (int) db_res_col_i64 (res, 2, &err);
-      out_order->commodity_id = (int) db_res_col_i64 (res, 3, &err);
+      h_copy_cstr (out_order->location_type, sizeof(out_order->location_type),
+                   db_res_col_text (res, 3, &err));
+      out_order->location_id = (int) db_res_col_i64 (res, 4, &err);
+      out_order->commodity_id = (int) db_res_col_i64 (res, 5, &err);
 
       h_copy_cstr (out_order->side, sizeof(out_order->side),
-                   db_res_col_text (res, 4, &err));
+                   db_res_col_text (res, 6, &err));
 
-      out_order->quantity = (int) db_res_col_i64 (res, 5, &err);
-      out_order->price = (int) db_res_col_i64 (res, 6, &err);
+      out_order->quantity = (int) db_res_col_i64 (res, 7, &err);
+      out_order->price = (int) db_res_col_i64 (res, 8, &err);
 
       h_copy_cstr (out_order->status, sizeof(out_order->status),
-                   db_res_col_text (res, 7, &err));
+                   db_res_col_text (res, 9, &err));
 
       /* Handle NULL expires_at safely if your schema allows it */
-      out_order->ts = db_res_col_i64 (res, 8, &err);
+      out_order->ts = db_res_col_i64 (res, 10, &err);
 
-      if (db_res_col_is_null (res, 9))
+      if (db_res_col_is_null (res, 11))
         {
           out_order->expires_at = 0;
         }
       else
         {
-          out_order->expires_at = db_res_col_i64 (res, 9, &err);
+          out_order->expires_at = db_res_col_i64 (res, 11, &err);
         }
 
-      out_order->filled_quantity = (int) db_res_col_i64 (res, 10, &err);
+      out_order->filled_quantity = (int) db_res_col_i64 (res, 12, &err);
       out_order->remaining_quantity = out_order->quantity -
                                       out_order->filled_quantity;
 
@@ -286,6 +356,65 @@ db_get_open_order (db_t *db,
 
   db_res_finalize (res);
   return rc;
+}
+
+int
+db_market_lock_order_for_update (db_t *db, int order_id,
+                                 commodity_order_t *out_order)
+{
+  if (!db || order_id <= 0 || !out_order)
+    return ERR_INVALID_ARG;
+
+  char expires_expr[128];
+  if (sql_ts_to_epoch_expr (db, "expires_at", expires_expr,
+                            sizeof (expires_expr)) != 0)
+    return ERR_DB;
+
+  char sql_tmpl[512];
+  snprintf (sql_tmpl, sizeof (sql_tmpl),
+            "SELECT commodity_orders_id, actor_type, actor_id, location_type, "
+            "location_id, commodity_id, side, quantity, price, status, "
+            "filled_quantity, %s FROM commodity_orders "
+            "WHERE commodity_orders_id={1} FOR UPDATE;", expires_expr);
+  char sql[768];
+  if (sql_build (db, sql_tmpl, sql, sizeof (sql)) != 0)
+    return ERR_DB;
+
+  db_res_t *res = NULL;
+  db_error_t err;
+  db_error_clear (&err);
+  if (!db_query (db, sql, (db_bind_t[]){ db_bind_i64 (order_id) }, 1,
+                 &res, &err))
+    return err.code ? err.code : ERR_DB;
+
+  if (!db_res_step (res, &err))
+    {
+      db_res_finalize (res);
+      return err.code ? err.code : ERR_DB_NOT_FOUND;
+    }
+
+  memset (out_order, 0, sizeof (*out_order));
+  out_order->id = (int) db_res_col_i64 (res, 0, &err);
+  h_copy_cstr (out_order->actor_type, sizeof (out_order->actor_type),
+               db_res_col_text (res, 1, &err));
+  out_order->actor_id = (int) db_res_col_i64 (res, 2, &err);
+  h_copy_cstr (out_order->location_type, sizeof (out_order->location_type),
+               db_res_col_text (res, 3, &err));
+  out_order->location_id = (int) db_res_col_i64 (res, 4, &err);
+  out_order->commodity_id = (int) db_res_col_i64 (res, 5, &err);
+  h_copy_cstr (out_order->side, sizeof (out_order->side),
+               db_res_col_text (res, 6, &err));
+  out_order->quantity = (int) db_res_col_i64 (res, 7, &err);
+  out_order->price = (int) db_res_col_i64 (res, 8, &err);
+  h_copy_cstr (out_order->status, sizeof (out_order->status),
+               db_res_col_text (res, 9, &err));
+  out_order->filled_quantity = (int) db_res_col_i64 (res, 10, &err);
+  out_order->remaining_quantity = out_order->quantity -
+                                  out_order->filled_quantity;
+  if (!db_res_col_is_null (res, 11))
+    out_order->expires_at = db_res_col_i64 (res, 11, &err);
+  db_res_finalize (res);
+  return err.code ? err.code : 0;
 }
 
 
@@ -311,6 +440,7 @@ commodity_order_t *
 db_load_open_orders_for_commodity (db_t *db,
                                    int commodity_id,
                                    const char *side,
+                                   int64_t now_s,
                                    int *count)
 {
   if (!count || !side)
@@ -324,12 +454,13 @@ db_load_open_orders_for_commodity (db_t *db,
 
   db_error_clear (&err);
 
-  /* Only two binds: $1=commodity_id, $2=side (or swap) */
-  db_bind_t params[2];
+  /* $1=commodity_id, $2=side, $3=matching timestamp */
+  db_bind_t params[3];
 
 
   params[0] = db_bind_i64 (commodity_id);
   params[1] = db_bind_text (side);
+  params[2] = db_bind_timestamp_text (now_s);
 
 
 
@@ -338,19 +469,21 @@ db_load_open_orders_for_commodity (db_t *db,
   if (strcmp(side, "buy") == 0)
     {
       sql_tmpl =
-	"SELECT commodity_orders_id, actor_type, actor_id, commodity_id, side, quantity, price, status, "
+	"SELECT commodity_orders_id, actor_type, actor_id, location_type, location_id, commodity_id, side, quantity, price, status, "
 	"ts, expires_at, filled_quantity "
 	"FROM commodity_orders "
 	"WHERE commodity_id = {1} AND side = {2} AND status = 'open' "
+	"AND (expires_at IS NULL OR expires_at > {3}) "
 	"ORDER BY price DESC, ts ASC;";
     }
   else if (strcmp(side, "sell") == 0)
     {
       sql_tmpl =
-	"SELECT commodity_orders_id, actor_type, actor_id, commodity_id, side, quantity, price, status, "
+	"SELECT commodity_orders_id, actor_type, actor_id, location_type, location_id, commodity_id, side, quantity, price, status, "
 	"ts, expires_at, filled_quantity "
 	"FROM commodity_orders "
 	"WHERE commodity_id = {1} AND side = {2} AND status = 'open' "
+	"AND (expires_at IS NULL OR expires_at > {3}) "
 	"ORDER BY price ASC, ts ASC;";
     }
   else
@@ -370,7 +503,7 @@ db_load_open_orders_for_commodity (db_t *db,
   db_res_t *res = NULL;
 
 
-  if (!db_query (db, sql, params, 2, &res, &err))
+  if (!db_query (db, sql, params, 3, &res, &err))
     {
       LOGE (
         "db_load_open_orders_for_commodity: query failed: %s (code=%d backend=%d)",
@@ -418,24 +551,27 @@ db_load_open_orders_for_commodity (db_t *db,
                                                                           1,
                                                                           &err));
       o->actor_id = (int) db_res_col_i64 (res, 2, &err);
-      o->commodity_id = (int) db_res_col_i64 (res, 3, &err);
-      h_copy_cstr (o->side, sizeof(o->side), db_res_col_text (res, 4, &err));
-      o->quantity = (int) db_res_col_i64 (res, 5, &err);
-      o->price = (int) db_res_col_i64 (res, 6, &err);
+      h_copy_cstr (o->location_type, sizeof(o->location_type),
+                   db_res_col_text (res, 3, &err));
+      o->location_id = (int) db_res_col_i64 (res, 4, &err);
+      o->commodity_id = (int) db_res_col_i64 (res, 5, &err);
+      h_copy_cstr (o->side, sizeof(o->side), db_res_col_text (res, 6, &err));
+      o->quantity = (int) db_res_col_i64 (res, 7, &err);
+      o->price = (int) db_res_col_i64 (res, 8, &err);
       h_copy_cstr (o->status, sizeof(o->status),
-                   db_res_col_text (res, 7, &err));
-      o->ts = db_res_col_i64 (res, 8, &err);
+                   db_res_col_text (res, 9, &err));
+      o->ts = db_res_col_i64 (res, 10, &err);
 
-      if (db_res_col_is_null (res, 9))
+      if (db_res_col_is_null (res, 11))
         {
           o->expires_at = 0;
         }
       else
         {
-          o->expires_at = db_res_col_i64 (res, 9, &err);
+          o->expires_at = db_res_col_i64 (res, 11, &err);
         }
 
-      o->filled_quantity = (int) db_res_col_i64 (res, 10, &err);
+      o->filled_quantity = (int) db_res_col_i64 (res, 12, &err);
       o->remaining_quantity = o->quantity - o->filled_quantity;
 
       (*count)++;
@@ -485,28 +621,38 @@ db_insert_commodity_trade (db_t *db,
                            int price,
                            const char *buyer_actor_type,
                            int buyer_actor_id,
+                           const char *buyer_location_type,
+                           int buyer_location_id,
                            const char *seller_actor_type,
                            int seller_actor_id,
-                           int settlement_tx_buy,
-                           int settlement_tx_sell)
+                           const char *seller_location_type,
+                           int seller_location_id,
+                           int64_t settlement_tx_buy,
+                           int64_t settlement_tx_sell)
 {
   db_error_t err;
   db_error_clear(&err);
+  /* The current commodity_trades schema records actor/location data but does
+   * not persist order foreign keys. Keep the established API parameters until
+   * that schema contract is extended. */
+  (void) buy_order_id;
+  (void) sell_order_id;
 
-  db_bind_t params[12];
+  db_bind_t params[13];
 
   params[0]  = db_bind_i64 (commodity_id);         /* {1} */
   params[1]  = db_bind_text(buyer_actor_type);     /* {2} */
   params[2]  = db_bind_i64 (buyer_actor_id);       /* {3} */
-  params[3]  = db_bind_text("port");               /* {4} */
-  params[4]  = db_bind_i64 (0);                    /* {5} placeholder location */
+  params[3]  = db_bind_text(buyer_location_type);  /* {4} */
+  params[4]  = db_bind_i64 (buyer_location_id);    /* {5} */
   params[5]  = db_bind_text(seller_actor_type);    /* {6} */
   params[6]  = db_bind_i64 (seller_actor_id);      /* {7} */
-  params[7]  = db_bind_text("port");               /* {8} */
-  params[8]  = db_bind_i64 (0);                    /* {9} placeholder location */
+  params[7]  = db_bind_text(seller_location_type); /* {8} */
+  params[8]  = db_bind_i64 (seller_location_id);   /* {9} */
   params[9]  = db_bind_i64 (quantity);             /* {10} */
   params[10] = db_bind_i64 (price);                /* {11} */
   params[11] = db_bind_i64 (settlement_tx_buy);    /* {12} */
+  params[12] = db_bind_i64 (settlement_tx_sell);   /* {13} */
 
   const char *sql_tmpl =
     "INSERT INTO commodity_trades ("
@@ -514,15 +660,15 @@ db_insert_commodity_trade (db_t *db,
     "buyer_location_type, buyer_location_id, "
     "seller_actor_type, seller_actor_id, "
     "seller_location_type, seller_location_id, "
-    "quantity, price, settlement_tx_buy) "
-    "VALUES ({1}, {2}, {3}, {4}, {5}, {6}, {7}, {8}, {9}, {10}, {11}, {12})";
+    "quantity, price, settlement_tx_buy, settlement_tx_sell) "
+    "VALUES ({1}, {2}, {3}, {4}, {5}, {6}, {7}, {8}, {9}, {10}, {11}, {12}, {13})";
 
   char sql[512];
   if (sql_build(db, sql_tmpl, sql, sizeof(sql)) != 0)
     return -1;
 
   int64_t new_id = -1;
-  if (!db_exec_insert_id(db, sql, params, 12, "id", &new_id, &err))
+  if (!db_exec_insert_id(db, sql, params, 13, "id", &new_id, &err))
     {
       LOGE("db_insert_commodity_trade: insert failed: %s (code=%d backend=%d)",
            err.message, err.code, err.backend_code);
@@ -537,21 +683,21 @@ db_insert_commodity_trade (db_t *db,
         "'commodity-market-trade:'||{2}||':'||{1} FROM commodities c WHERE c.commodities_id={5} "
         "AND {6}='planet' ON CONFLICT (idempotency_key) DO NOTHING;";
       if (!db_exec (db, activity_sql,
-                    (db_bind_t[]){db_bind_i64 (buyer_actor_id),
+                    (db_bind_t[]){db_bind_i64 (buyer_location_id),
                                   db_bind_i64 (new_id),
                                   db_bind_i64 (quantity),
                                   db_bind_i64 (price),
                                   db_bind_i64 (commodity_id),
-                                  db_bind_text ((char *)buyer_actor_type)},
+                                  db_bind_text ((char *)buyer_location_type)},
                     6, &err))
         return -1;
       if (!db_exec (db, activity_sql,
-                    (db_bind_t[]){db_bind_i64 (seller_actor_id),
+                    (db_bind_t[]){db_bind_i64 (seller_location_id),
                                   db_bind_i64 (new_id),
                                   db_bind_i64 (quantity),
                                   db_bind_i64 (price),
                                   db_bind_i64 (commodity_id),
-                                  db_bind_text ((char *)seller_actor_type)},
+                                  db_bind_text ((char *)seller_location_type)},
                     6, &err))
         return -1;
     }

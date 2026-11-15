@@ -14,7 +14,9 @@
 #include "server_config.h"
 #include "game_db.h"
 #include "repo_cmd.h"
+#include "repo_ships.h"
 #include "repo_planets.h"
+#include "repo_universe.h"
 #include "server_log.h"
 #include "server_cron.h"
 #include "errors.h"
@@ -590,6 +592,154 @@ cleanup:
 
 
 int
+db_player_apply_progress_event (db_t *db, int player_id,
+                                const char *source_type,
+                                const char *source_key,
+                                long long xp_delta,
+                                int alignment_delta,
+                                int formula_version)
+{
+  if (!db || player_id <= 0 || !source_type || !*source_type
+      || !source_key || !*source_key || formula_version <= 0)
+    return ERR_DB_MISUSE;
+
+  db_error_t err = { 0 };
+  db_res_t *res = NULL;
+  int rc = -1;
+  long long current_xp = 0;
+  int current_alignment = 0;
+  long long new_xp = 0;
+  int new_alignment = 0;
+  int new_commission_id = 0;
+
+  if (!db_tx_begin (db, DB_TX_DEFAULT, &err))
+    return err.code ? err.code : -1;
+
+  const char *select_sql =
+    "SELECT experience, alignment FROM players WHERE player_id = {1} FOR UPDATE;";
+  char sql[512];
+  if (sql_build (db, select_sql, sql, sizeof sql) != 0
+      || !db_query (db, sql, (db_bind_t[]){db_bind_i64 (player_id)}, 1,
+                    &res, &err))
+    goto rollback;
+  if (!db_res_step (res, &err))
+    {
+      if (err.code == 0)
+        err.code = ERR_NOT_FOUND;
+      db_res_finalize (res);
+      res = NULL;
+      goto rollback;
+    }
+  current_xp = db_res_col_i64 (res, 0, &err);
+  current_alignment = db_res_col_i32 (res, 1, &err);
+  db_res_finalize (res);
+  res = NULL;
+  if (err.code != 0)
+    goto rollback;
+  if (current_xp < 0)
+    current_xp = 0;
+
+  /* Clamp arithmetic before writing so XP never wraps or falls below zero. */
+  if (xp_delta > 0 && xp_delta > LLONG_MAX - current_xp)
+    new_xp = LLONG_MAX;
+  else if (xp_delta < 0 && xp_delta < -current_xp)
+    new_xp = 0;
+  else
+    new_xp = current_xp + xp_delta;
+
+  int64_t alignment_sum = (int64_t) current_alignment + alignment_delta;
+  if (alignment_sum > 2000)
+    alignment_sum = 2000;
+  if (alignment_sum < -2000)
+    alignment_sum = -2000;
+  new_alignment = (int) alignment_sum;
+
+  const char *insert_sql =
+    "INSERT INTO player_progress_adjustments "
+    "(player_id,source_type,source_key,xp_delta,alignment_delta,formula_version) "
+    "VALUES ({1},{2},{3},{4},{5},{6}) "
+    "ON CONFLICT (source_key) DO NOTHING RETURNING player_progress_adjustment_id;";
+  if (sql_build (db, insert_sql, sql, sizeof sql) != 0
+      || !db_exec_returning (db, sql,
+                             (db_bind_t[]){db_bind_i64 (player_id),
+                               db_bind_text ((char *) source_type),
+                               db_bind_text ((char *) source_key),
+                               db_bind_i64 (new_xp - current_xp),
+                               db_bind_i64 (new_alignment - current_alignment),
+                               db_bind_i64 (formula_version)},
+                             6, &res, &err))
+    goto rollback;
+
+  if (!db_res_step (res, &err))
+    {
+      db_res_finalize (res);
+      res = NULL;
+      /* A repeated source is harmless only when it describes the same event. */
+      const char *duplicate_sql =
+        "SELECT player_id,source_type,xp_delta,alignment_delta,formula_version "
+        "FROM player_progress_adjustments WHERE source_key={1};";
+      db_error_clear (&err);
+      if (sql_build (db, duplicate_sql, sql, sizeof sql) != 0
+          || !db_query (db, sql,
+                        (db_bind_t[]){db_bind_text ((char *) source_key)}, 1,
+                        &res, &err)
+          || !db_res_step (res, &err))
+        goto rollback;
+      bool same_event = db_res_col_i32 (res, 0, &err) == player_id
+        && strcmp (db_res_col_text (res, 1, &err) ?: "", source_type) == 0
+        && db_res_col_i32 (res, 4, &err) == formula_version;
+      db_res_finalize (res);
+      res = NULL;
+      if (!same_event || err.code != 0)
+        {
+          if (err.code == 0)
+            err.code = ERR_DB_CONSTRAINT;
+          goto rollback;
+        }
+      if (!db_tx_commit (db, &err))
+        goto rollback;
+      return 0;
+    }
+  db_res_finalize (res);
+  res = NULL;
+
+  const char *update_sql =
+    "UPDATE players SET experience={1},alignment={2} WHERE player_id={3};";
+  if (sql_build (db, update_sql, sql, sizeof sql) != 0
+      || !db_exec (db, sql,
+                   (db_bind_t[]){db_bind_i64 (new_xp),
+                     db_bind_i64 (new_alignment), db_bind_i64 (player_id)},
+                   3, &err))
+    goto rollback;
+
+  int is_evil = 0;
+  if (db_alignment_band_for_value (db, new_alignment, NULL, NULL, NULL, NULL,
+                                   &is_evil, NULL, NULL) != 0
+      || db_commission_for_player (db, is_evil, new_xp,
+                                   &new_commission_id, NULL, NULL) != 0)
+    goto rollback;
+
+  const char *commission_sql =
+    "UPDATE players SET commission_id={1} WHERE player_id={2};";
+  if (sql_build (db, commission_sql, sql, sizeof sql) != 0
+      || !db_exec (db, sql,
+                   (db_bind_t[]){db_bind_i64 (new_commission_id),
+                     db_bind_i64 (player_id)}, 2, &err))
+    goto rollback;
+  if (!db_tx_commit (db, &err))
+    goto rollback;
+  return 0;
+
+rollback:
+  if (res)
+    db_res_finalize (res);
+  db_tx_rollback (db, &err);
+  rc = err.code ? err.code : -1;
+  return rc;
+}
+
+
+int
 db_alignment_band_for_value (db_t *db,
                              int align,
                              int *out_id,
@@ -991,30 +1141,27 @@ db_planet_update_goods_on_hand (db_t *db,
 int
 db_mark_ship_destroyed (db_t *db, int ship_id)
 {
-  if (!db)
-    {
-      return ERR_DB_CLOSED;
-    }
-  db_res_t *res = NULL;
+  if (!db || ship_id <= 0) return ERR_INVALID_ARG;
+  const char *sql = "SELECT player_id FROM ship_ownership WHERE ship_id={1} "
+                    "AND is_primary=TRUE ORDER BY player_id LIMIT 1";
+  char converted[256];
+  if (sql_build(db, sql, converted, sizeof converted) != 0)
+    return ERR_DB_QUERY_FAILED;
   db_error_t err = {0};
-  int rc = ERR_DB;
-  /* Use stored procedure */
-  const char *sql = "SELECT * FROM ship_destroy({1});";
-  char sql_converted[256];
-  sql_build(db, sql, sql_converted, sizeof(sql_converted));
-
-
-  if (!db_query (db, sql_converted, (db_bind_t[]){db_bind_i64 (ship_id)}, 1, &res, &err))
+  db_res_t *res = NULL;
+  if (!db_query(db, converted, (db_bind_t[]){db_bind_i64(ship_id)}, 1,
+                &res, &err))
+    return err.code ? err.code : ERR_DB_QUERY_FAILED;
+  if (!db_res_step(res, &err))
     {
-      rc = err.code;
-      goto cleanup;
+      db_res_finalize(res);
+      return err.code ? err.code : ERR_DB_NOT_FOUND;
     }
-  rc = 0;
-
-cleanup:
-  if (res)
-    db_res_finalize (res);
-  return rc;
+  int player_id = db_res_col_i32(res, 0, &err);
+  db_res_finalize(res);
+  if (err.code) return err.code;
+  return repo_ships_handle_destruction(db, player_id, ship_id, 0, "other", 0,
+                                       0, 0, 0, 0, (int64_t)time(NULL), NULL);
 }
 
 
@@ -2097,7 +2244,12 @@ db_get_port_id_by_sector (db_t *db, int sid)
   db_error_t err = {0};
   int pid = 0;
 
-  const char *sql_template = "SELECT port_id FROM ports WHERE sector_id = {1};";
+  /* Prefer the StarDock when a sector contains more than one port.  The
+     dock.status protocol does not carry a port id, so selecting an arbitrary
+     row could bypass StarDock-only behaviour such as limpet decontamination. */
+  const char *sql_template =
+    "SELECT port_id FROM ports WHERE sector_id = {1} "
+    "ORDER BY CASE WHEN type = 9 THEN 0 ELSE 1 END, port_id LIMIT 1;";
   char sql[256];
   sql_build(db, sql_template, sql, sizeof sql);
 
@@ -2413,30 +2565,9 @@ db_apply_lock_policy_for_pilot (db_t *db, int ship_id, int pilot_id)
 int
 db_destroy_ship (db_t *db, int pid, int sid)
 {
-  if (!db)
-    {
-      return ERR_DB_CLOSED;
-    }
-  db_res_t *res = NULL;
-  db_error_t err = {0};
-  int rc = 0;
-  const char *sql = "SELECT * FROM ship_destroy({1});";
-  char sql_converted[256];
-  sql_build(db, sql, sql_converted, sizeof(sql_converted));
-
-
-  if (db_query (db, sql_converted, (db_bind_t[]){db_bind_i64 (sid)}, 1, &res, &err))
-    {
-      (void)pid;
-      rc = 0;
-      goto cleanup;
-    }
-  rc = err.code;
-
-cleanup:
-  if (res)
-    db_res_finalize (res);
-  return rc;
+  if (!db || pid <= 0 || sid <= 0) return ERR_INVALID_ARG;
+  return repo_ships_handle_destruction(db, pid, sid, 0, "other", 0,
+                                       0, 0, 0, 0, (int64_t)time(NULL), NULL);
 }
 
 
@@ -3030,6 +3161,18 @@ db_adjacent_sectors_json (db_t *db, int sid, json_t **out)
                 &err))
     {
       rc = stmt_to_json_array (res, out, &err);
+      /* Clients expect neighbours as plain sector IDs, not {"to_sector": n} rows. */
+      if (rc == 0 && *out)
+        {
+          size_t i;
+          json_t *row;
+          json_array_foreach (*out, i, row)
+          {
+            json_t *to = json_is_object (row) ? json_object_get (row, "to_sector") : NULL;
+            if (to && json_is_integer (to))
+              json_array_set_new (*out, i, json_integer (json_integer_value (to)));
+          }
+        }
       goto cleanup;
     }
 
@@ -3084,7 +3227,12 @@ db_ships_at_sector_json (db_t *db, int pid, int sid, json_t **out)
   db_error_t err = {0};
   int rc = -1;
 
-  const char *sql_template = "SELECT ship_id, name FROM ships WHERE sector_id = {1};";
+  const char *sql_template =
+    "SELECT s.ship_id, s.name, "
+    "       (NOT EXISTS (SELECT 1 FROM ship_ownership so "
+    "                    WHERE so.ship_id = s.ship_id)) AS is_derelict "
+    "FROM ships s "
+    "WHERE s.sector_id = {1} AND COALESCE(s.destroyed, FALSE) = FALSE;";
   char sql[256];
   sql_build(db, sql_template, sql, sizeof sql);
 
@@ -3261,22 +3409,7 @@ cleanup:
 int
 db_update_player_sector (db_t *db, int pid, int sid)
 {
-  if (!db)
-    {
-      return -1;
-    }
-  db_error_t err;
-
-  const char *sql_template = "UPDATE players SET sector_id = {1} WHERE player_id = {2};";
-  char sql[256];
-  sql_build(db, sql_template, sql, sizeof sql);
-
-  if (!db_exec (db, sql,
-                (db_bind_t[]){db_bind_i64 (sid), db_bind_i64 (pid)}, 2, &err))
-    {
-      return -1;
-    }
-  return 0;
+  return repo_universe_update_player_sector(db, pid, sid);
 }
 
 
@@ -3591,11 +3724,15 @@ db_ships_inspectable_at_sector_json (db_t *db,
   /* const char *sql = */
   /*   "SELECT ship_id, name FROM ships WHERE sector_id = {1} AND (cloaked IS NULL OR {2} = (SELECT player_id FROM ship_ownership WHERE ship_id = ships.ship_id AND is_primary = TRUE));"; */
   const char *sql =
-    "SELECT ship_id, name FROM ships "
-    "WHERE sector_id = {1} AND ( cloaked IS NULL "
+    "SELECT s.ship_id, s.name, "
+    "       (NOT EXISTS (SELECT 1 FROM ship_ownership so "
+    "                    WHERE so.ship_id = s.ship_id)) AS is_derelict "
+    "FROM ships s "
+    "WHERE s.sector_id = {1} AND COALESCE(s.destroyed, FALSE) = FALSE "
+    "  AND (s.cloaked IS NULL "
     "        OR EXISTS ( SELECT 1 "
     "            FROM ship_ownership "
-    "            WHERE ship_id = ships.ship_id "
+    "            WHERE ship_id = s.ship_id "
     "              AND is_primary = {3} "
     "              AND player_id = {2} )); ";
 
@@ -5050,91 +5187,7 @@ db_player_set_sector (int pid, int sid)
     {
       return ERR_DB_CLOSED;
     }
-  db_error_t err;
-
-
-  if (!db_tx_begin (db, DB_TX_DEFAULT, &err))
-    {
-      return err.code;
-    }
-
-
-  const char *sql_player =
-    "UPDATE players SET sector_id = {1} WHERE player_id = {2};";
-
-  char sql_player_converted[256];
-  sql_build(db, sql_player, sql_player_converted, sizeof(sql_player_converted));
-
-  if (!db_exec (db, sql_player_converted,
-                (db_bind_t[]){ db_bind_i64 (sid), db_bind_i64 (pid) }, 2, &err))
-    {
-      db_tx_rollback (db, NULL);
-      return err.code;
-    }
-
-
-  /* Sync the ship sector if player has an active ship */
-  const char *sql_ship_info =
-    "SELECT ship_id FROM players WHERE player_id = {1};";
-  db_res_t *res = NULL;
-  int ship_id = 0;
-
-  char sql_ship_info_converted[256];
-  sql_build(db, sql_ship_info, sql_ship_info_converted, sizeof(sql_ship_info_converted));
-
-  if (db_query (db,
-                sql_ship_info_converted,
-                (db_bind_t[]){ db_bind_i64 (pid) },
-                1,
-                &res,
-                &err))
-    {
-      if (db_res_step (res, &err))
-        {
-          ship_id = (int) db_res_col_i32 (res, 0, &err);
-        }
-      db_res_finalize (res);
-    }
-
-
-  if (ship_id > 0)
-    {
-      const char *sql_ship =
-        "UPDATE ships SET sector_id = {1} WHERE ship_id = {2};";
-
-      char sql_ship_converted[256];
-      sql_build(db, sql_ship, sql_ship_converted, sizeof(sql_ship_converted));
-
-      if (!db_exec (db,
-                    sql_ship_converted,
-                    (db_bind_t[]){ db_bind_i64 (sid), db_bind_i64 (ship_id) },
-                    2,
-                    &err))
-        {
-          LOGW ("db_player_set_sector: Failed to sync ship %d for player %d",
-                ship_id,
-                pid);
-        }
-
-      /* Canon #471: Move towed ships and their owners */
-      const char *sql_towed = "UPDATE ships SET sector_id = {1} WHERE is_being_towed_by = {2};";
-      char sql_towed_conv[256];
-      sql_build(db, sql_towed, sql_towed_conv, sizeof(sql_towed_conv));
-      db_exec(db, sql_towed_conv, (db_bind_t[]){ db_bind_i64(sid), db_bind_i64(ship_id) }, 2, &err);
-
-      const char *sql_towed_p = "UPDATE players SET sector_id = {1} WHERE ship_id IN (SELECT ship_id FROM ships WHERE is_being_towed_by = {2});";
-      char sql_towed_p_conv[256];
-      sql_build(db, sql_towed_p, sql_towed_p_conv, sizeof(sql_towed_p_conv));
-      db_exec(db, sql_towed_p_conv, (db_bind_t[]){ db_bind_i64(sid), db_bind_i64(ship_id) }, 2, &err);
-    }
-
-
-  if (!db_tx_commit (db, &err))
-    {
-      db_tx_rollback (db, NULL);
-      return err.code;
-    }
-  return 0;
+  return repo_universe_update_player_sector (db, pid, sid);
 }
 
 
