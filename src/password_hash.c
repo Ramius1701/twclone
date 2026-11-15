@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 #if defined(__linux__)
@@ -128,5 +129,13 @@ tw_password_verify (const char *encoded, const char *password)
     return -1;
   if (strncmp (encoded, "$argon2id$", 9) != 0)
     return 0;
-  return verify_encoded (encoded, password, strlen (password)) == 0 ? 1 : 0;
+  int rc = verify_encoded (encoded, password, strlen (password));
+  if (rc == 0)
+    return 1;
+  /* -35 is ARGON2_VERIFY_MISMATCH, a wrong password. Anything else is a
+     failure to check (memory, threads, a malformed hash), not a verdict. */
+  if (rc != -35)
+    fprintf (stderr, "password_hash: argon2id_verify failed with code %d
+", rc);
+  return 0;
 }
