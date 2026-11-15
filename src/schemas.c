@@ -2915,10 +2915,8 @@ schema_move_describe_sector (void)
 		       ("https://json-schema.org/draft/2020-12/schema"));
   json_object_set_new (root, "type", json_string ("object"));
   json_object_set_new (root, "properties", props);
-
-  json_t *required = json_array ();
-  json_array_append_new (required, json_string ("sector_id"));
-  json_object_set_new (root, "required", required);
+  /* sector_id is optional (PROTOCOL.v3 21): without it the handler describes
+     the caller's current sector, which the client reads after every move. */
   json_object_set_new (root, "additionalProperties", json_boolean (0));
   return root;
 }
