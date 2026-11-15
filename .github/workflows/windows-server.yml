@@ -39,7 +39,7 @@ jobs:
           if-no-files-found: error
       - name: V2 economy regression (not yet updated for V3)
         continue-on-error: true
-        shell: C:\cygwininash.exe --noprofile --norc -o igncr -eo pipefail {0}
+        shell: C:\cygwin\bin\bash.exe --noprofile --norc -o igncr -eo pipefail {0}
         run: |
           export PATH="/usr/bin:$PATH"
           package="$PWD/package check/twclone-windows-x64"
