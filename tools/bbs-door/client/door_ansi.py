@@ -178,6 +178,7 @@ class ColourStream(io.TextIOBase):
     def __init__(self, raw):
         self.raw = raw
         self.buf = ""
+        self.output_lines = 0
 
     def writable(self):
         return True
@@ -195,6 +196,8 @@ class ColourStream(io.TextIOBase):
         self.buf += s
         while "\n" in self.buf:
             line, self.buf = self.buf.split("\n", 1)
+            if visible_len(line.strip()):
+                self.output_lines += 1
             self.raw.write(colour_line(line) + "\n")
         return len(s)
 
@@ -232,7 +235,8 @@ def install(client) -> None:
     global T
     color = os.environ.get("TWDOOR_COLOR", "1") not in ("0", "off", "no", "false")
     T = Theme(color)
-    sys.stdout = ColourStream(sys.stdout)
+    stream = ColourStream(sys.stdout)
+    sys.stdout = stream
 
     hud_module = client.hud_module
 
@@ -432,7 +436,13 @@ def install(client) -> None:
             opts = menu.get("options", []) + [o for s in menu.get("sections", []) for o in s.get("options", [])]
             if not any(o.get("key") == "?" for o in opts):
                 return  # "?" redraws the menu unless the menu has its own "?"
-        return orig_handle(ctx, choice)
+        before = stream.output_lines
+        orig_handle(ctx, choice)
+        if stream.output_lines > before:
+            try:
+                input("\nPress Enter to return to the menu.")
+            except (EOFError, KeyboardInterrupt):
+                raise SystemExit(0) from None
 
     client.handle_choice = handle_choice
 
