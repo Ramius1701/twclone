@@ -2919,9 +2919,10 @@ def pretty_print_shipyard_list(ctx):
         print("[no response captured]")
         return
 
-    if resp.get("status") != "ok":
-        print(f"[Error] Failed to get shipyard list: {resp.get('error', {}).get('message', 'Unknown error')}")
-        _pp(resp)
+    if not isinstance(resp, dict) or resp.get("status") != "ok":
+        error = resp.get("error") if isinstance(resp, dict) else None
+        message = error.get("message") if isinstance(error, dict) else None
+        print(message or "The shipyard list is unavailable.")
         return
 
     data = resp.get("data")

@@ -500,17 +500,6 @@
           }
         },
         {
-          "key": "c",
-          "label": "(C) Ship Catalogue",
-          "action": {
-            "rpc": {
-              "command": "shipyard.list",
-              "data": {}
-            },
-            "post": "pretty_print_shipyard_list"
-          }
-        },
-        {
           "key": "l",
           "label": "(L) Trade Loop Recommendations",
           "action": {
