@@ -396,8 +396,8 @@
           }
         },
         {
-          "key": "i",
-          "label": "(I) Inspect Owned Ship",
+          "key": "n",
+          "label": "(N) Inspect Owned Ship",
           "action": {
             "pycall": "ship_roster_inspect_flow"
           }
@@ -472,8 +472,8 @@
           }
         },
         {
-          "key": "x",
-          "label": "(X) Transfer Owned Ship",
+          "key": "b",
+          "label": "(B) Transfer Owned Ship",
           "action": {
             "pycall": "ship_transfer_flow"
           }
