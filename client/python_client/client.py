@@ -1172,8 +1172,6 @@ def normalize_port_info(resp: dict) -> dict:
         # fallback for already-cached legacy snapshots; never infer capacity
         # from stock or use it as a settlement rule.
         maximum = item.get("capacity", item.get("max_quantity"))
-        sells = item.get("sells")
-        buys = item.get("buys")
         price = item.get("price", item.get("buy_price", item.get("sell_price")))
         # Port-info prices are server-owned indicative integer credits.  Keep
         # malformed values out of the display model rather than allowing a
@@ -1191,8 +1189,7 @@ def normalize_port_info(resp: dict) -> dict:
             "max_quantity": maximum if type(maximum) is int and maximum >= 0 else None,
             "base_price": price,
             # Fixed direction is server policy; never derive it from stock.
-            "sells": sells if isinstance(sells, bool) else None,
-            "buys": buys if isinstance(buys, bool) else None,
+            **{key: item[key] for key in ("sells", "buys") if key in item},
         })
     return {"id": port_id, "name": raw.get("name") or "Port",
             "commodities": rows, "raw": raw}
@@ -4311,8 +4308,12 @@ def refresh_sector_and_display(ctx: Context):
         if not _response_type_matches(resp, "sector.info"):
             print("[Error] Sector refresh returned an unexpected response type; keeping the last confirmed state.")
             return False
+        payload = resp.get("data")
+        if not isinstance(payload, dict):
+            print("[Error] Sector refresh returned malformed data; keeping the last confirmed state.")
+            return False
         try:
-            refreshed = normalize_sector(get_data(resp))
+            refreshed = normalize_sector(payload)
         except (TypeError, ValueError, AttributeError):
             # A success envelope is not sufficient to replace the cache.  A
             # schema-mismatched reconciliation response must fail closed just
@@ -6455,8 +6456,7 @@ def dock_trade_flow(ctx: Context, direction: str):
         return
     receipt = resp.get("data")
     if (not _trade_receipt_type_matches(resp, direction)
-            or not _trade_receipt_lines_match(resp, payload)
-            or not _trade_receipt_player_matches(resp, _known_player_id(ctx))):
+            or not _trade_receipt_lines_match(resp, payload)):
         print("Trade response had an unexpected receipt type; settlement was not displayed.")
         _refresh_trade_views(ctx, port_id)
         return
@@ -6477,20 +6477,7 @@ def dock_trade_flow(ctx: Context, direction: str):
         print("Trade response did not identify the confirmed port and sector; settlement was not displayed.")
         _refresh_trade_views(ctx, port_id)
         return
-    expected_player_id = _known_player_id(ctx)
-    receipt_player_id = (receipt.get("player_id")
-                         if isinstance(receipt, dict) else None)
-    # The canonical receipt schema always identifies the settling player. A
-    # missing identity is not a compact response variant: it cannot prove that
-    # this session's credits/cargo were settled, even when the local session
-    # snapshot is incomplete.
-    if (type(receipt_player_id) is not int or receipt_player_id <= 0
-            or (expected_player_id is not None
-                and receipt_player_id != expected_player_id)):
-        # A receipt for another player is not evidence of this session's
-        # settlement. A known session identity also makes an omitted player ID
-        # non-authoritative under the published receipt contract. Reconcile the
-        # authoritative views without presenting it or retrying the mutation.
+    if not _trade_receipt_player_matches(resp, _known_player_id(ctx)):
         print("Trade response did not identify the confirmed player; settlement was not displayed.")
         _refresh_trade_views(ctx, port_id)
         return

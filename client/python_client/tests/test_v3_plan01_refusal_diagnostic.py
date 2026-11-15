@@ -16,7 +16,7 @@ def test_landing_refusal_diagnostic_cannot_open_reported_planet_surface(
         "planet.land",
         {
             "status": "refused",
-            "type": "planet.land.success",
+            "type": "error",
             "error": {
                 "message": "Planetary defenses refused landing.",
                 "data": {"planet_id": 77, "landing_allowed": True},
@@ -25,15 +25,15 @@ def test_landing_refusal_diagnostic_cannot_open_reported_planet_surface(
     )
     fake_conn.queue(
         "player.my_info",
-        {"status": "ok", "data": {"player": {"id": 3, "turns": 40}}},
+        {"status": "ok", "type": "player.info", "data": {"player": {"id": 3, "turns": 40}}},
     )
     fake_conn.queue(
         "ship.status",
-        {"status": "ok", "data": {"ship": {"ship_id": 9, "onplanet": 12}}},
+        {"status": "ok", "type": "ship.status", "data": {"ship": {"ship_id": 9, "onplanet": 12}}},
     )
     fake_conn.queue(
         "move.describe_sector",
-        {"status": "ok", "data": {"id": 17, "planets": [{"id": 77}]}},
+        {"status": "ok", "type": "sector.info", "data": {"id": 17, "planets": [{"id": 77}]}},
     )
 
     client.land_flow(ctx)

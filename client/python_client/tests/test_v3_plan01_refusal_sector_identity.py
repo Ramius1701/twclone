@@ -13,20 +13,20 @@ def test_landing_refusal_rejects_contradictory_sector_without_claiming_planet(
     ctx.state["current_planet_id"] = 12
     ctx.state["on_planet"] = True
     fake_conn.queue("planet.land", {
-        "status": "refused",
+        "status": "refused", "type": "error",
         "error": {
             "message": "Landing is not permitted.",
             "data": {"planet_id": 77},
         },
     })
     fake_conn.queue("player.my_info", {
-        "status": "ok", "data": {"player": {"id": 3, "turns": 40}},
+        "status": "ok", "type": "player.info", "data": {"player": {"id": 3, "turns": 40}},
     })
     fake_conn.queue("ship.status", {
-        "status": "ok", "data": {"ship": {"ship_id": 9, "hull": 85}},
+        "status": "ok", "type": "ship.status", "data": {"ship": {"ship_id": 9, "hull": 85}},
     })
     fake_conn.queue("move.describe_sector", {
-        "status": "ok",
+        "status": "ok", "type": "sector.info",
         "data": {"id": 18, "planets": [{"id": 88, "name": "Authoritative"}]},
     })
 

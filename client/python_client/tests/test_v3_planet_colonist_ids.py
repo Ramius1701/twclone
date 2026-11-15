@@ -19,6 +19,7 @@ def test_colonist_transfer_uses_confirmed_landing_id(
     ctx_factory, fake_conn, monkeypatch
 ):
     ctx = ctx_factory(sector={"id": 17})
+    ctx.state["on_planet"] = True
     ctx.state["current_planet_id"] = 77
     fake_conn.queue("planet.colonists.get", {
         "status": "ok",

@@ -32,7 +32,7 @@ def test_move_refresh_rejects_success_payload_without_response_type(
     fake_conn.queue("move.warp", {"status": "ok", "data": {"sector_id": 17}})
     fake_conn.queue("move.describe_sector", {
         "status": "ok", "type": "sector.info",
-        "data": {"sector_id": 17, "name": "Unconfirmed"},
+        "data": {"sector_id": 12, "name": "Confirmed"},
     })
 
     assert client._perform_warp(ctx, 17) is False

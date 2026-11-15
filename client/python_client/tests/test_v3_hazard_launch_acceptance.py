@@ -12,7 +12,7 @@ def test_terminal_launch_hazard_clears_surface_and_refreshes_all_affected_state(
     ctx.state["current_planet_id"] = 77
     ctx.menu_stack.append("SURFACE")
     fake_conn.queue("planet.launch", {
-        "status": "error",
+        "status": "error", "type": "error",
         "error": {
             "message": "Entry hazard destroyed the ship.",
             "data": {
@@ -23,13 +23,13 @@ def test_terminal_launch_hazard_clears_surface_and_refreshes_all_affected_state(
         },
     })
     fake_conn.queue("player.my_info", {
-        "status": "ok", "data": {"player": {"id": 3, "turns": 38}},
+        "status": "ok", "type": "player.info", "data": {"player": {"id": 3, "turns": 38}},
     })
     fake_conn.queue("ship.status", {
-        "status": "ok", "data": {"ship": {"ship_id": 9, "hull": 0}},
+        "status": "ok", "type": "ship.status", "data": {"ship": {"ship_id": 9, "hull": 0}},
     })
     fake_conn.queue("move.describe_sector", {
-        "status": "ok", "data": {"sector_id": 17, "name": "Planet sector"},
+        "status": "ok", "type": "sector.info", "data": {"sector_id": 17, "name": "Planet sector"},
     })
 
     client.launch_flow(ctx)

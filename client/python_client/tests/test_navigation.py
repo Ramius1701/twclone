@@ -162,7 +162,7 @@ def test_transwarp_flow_uses_server_command_then_refreshes_authoritative_sector(
         "status": "ok", "type": "move.transwarp",
         "data": {"sector_id": 77, "status": "transwarp_complete"},
     })
-    fake_conn.queue("move.describe_sector", {"status": "ok", "data": {
+    fake_conn.queue("move.describe_sector", {"status": "ok", "type": "sector.info", "data": {
         "sector_id": 77, "name": "New Sector", "adjacent_sectors": [],
         "ports": [], "ships_present": [], "players_present": [],
     }})
@@ -185,12 +185,12 @@ def test_successful_transwarp_does_not_cache_a_different_sector_response(
 ):
     """A successful envelope cannot authorize a mismatched sector refresh."""
     ctx = ctx_factory(sector={"id": 4, "name": "Old Sector"})
-    fake_conn.queue("move.transwarp", {"status": "ok", "data": {"to_sector_id": 77}})
-    fake_conn.queue("move.describe_sector", {"status": "ok", "data": {
+    fake_conn.queue("move.transwarp", {"status": "ok", "type": "move.transwarp", "data": {"sector_id": 77, "status": "transwarp_complete"}})
+    fake_conn.queue("move.describe_sector", {"status": "ok", "type": "sector.info", "data": {
         "sector_id": 88, "name": "Unrequested Sector",
     }})
-    fake_conn.queue("player.my_info", {"status": "ok", "data": {"player": {"turns": 9}}})
-    fake_conn.queue("ship.status", {"status": "ok", "data": {"ship": {"ship_id": 2}}})
+    fake_conn.queue("player.my_info", {"status": "ok", "type": "player.info", "data": {"player": {"turns": 9}}})
+    fake_conn.queue("ship.status", {"status": "ok", "type": "ship.status", "data": {"ship": {"ship_id": 2}}})
     monkeypatch.setattr("builtins.input", lambda *_: "77")
 
     client.transwarp_flow(ctx)
@@ -207,10 +207,10 @@ def test_successful_transwarp_does_not_cache_a_different_sector_response(
 def test_transwarp_error_reconciles_after_possible_committed_move(ctx_factory, fake_conn, monkeypatch, capsys):
     ctx = ctx_factory(sector={"id": 4, "name": "Old Sector"})
     fake_conn.queue("move.transwarp", {
-        "status": "error", "error": {"message": "Entry hazard resolution failed"},
+        "status": "error", "type": "error", "error": {"message": "Entry hazard resolution failed"},
     })
     fake_conn.queue("move.describe_sector", {
-        "status": "ok", "data": {"sector_id": 77, "name": "New Sector"},
+        "status": "ok", "type": "sector.info", "data": {"sector_id": 77, "name": "New Sector"},
     })
     monkeypatch.setattr("builtins.input", lambda *_: "77")
 
@@ -228,7 +228,7 @@ def test_transwarp_refusal_reconciles_authoritative_state_before_retry(
 ):
     ctx = ctx_factory(sector={"id": 4, "name": "Old Sector"})
     fake_conn.queue("move.transwarp", {
-        "status": "refused", "error": {"message": "Transwarp drive not installed."},
+        "status": "refused", "type": "error", "error": {"message": "Transwarp drive not installed."},
     })
     fake_conn.queue("move.describe_sector", {
         "status": "ok", "type": "sector.info",
@@ -249,7 +249,7 @@ def test_transwarp_refusal_reconciles_authoritative_state_before_retry(
     assert [call["command"] for call in fake_conn.calls] == [
         "move.transwarp", "move.describe_sector", "player.my_info", "ship.status",
     ]
-    assert ctx.last_sector_desc == {"id": 4, "name": "Confirmed Sector"}
+    assert ctx.last_sector_desc == client.normalize_sector({"id": 4, "name": "Confirmed Sector"})
     output = capsys.readouterr().out
     assert "Transwarp drive not installed" in output
     assert "Current sector refreshed after the movement error: 4." in output
@@ -260,20 +260,20 @@ def test_transwarp_refusal_with_hazard_report_reconciles_authoritative_state(
 ):
     ctx = ctx_factory(sector={"id": 12, "name": "Origin"})
     fake_conn.queue("move.transwarp", {
-        "status": "refused",
+        "status": "refused", "type": "error",
         "error": {
             "message": "Entry hazard processing failed.",
             "data": {"hazards": [{"hazard_type": "minefield", "hull_lost": 9}]},
         },
     })
     fake_conn.queue("move.describe_sector", {
-        "status": "ok", "data": {"sector_id": 13, "name": "Confirmed"},
+        "status": "ok", "type": "sector.info", "data": {"sector_id": 13, "name": "Confirmed"},
     })
     fake_conn.queue("player.my_info", {
-        "status": "ok", "data": {"player": {"turns": 4}},
+        "status": "ok", "type": "player.info", "data": {"player": {"turns": 4}},
     })
     fake_conn.queue("ship.status", {
-        "status": "ok", "data": {"ship": {"hull": 91}},
+        "status": "ok", "type": "ship.status", "data": {"ship": {"hull": 91}},
     })
     monkeypatch.setattr("builtins.input", lambda _prompt: "13")
 

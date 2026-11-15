@@ -12,13 +12,13 @@ import client
 def test_successful_move_updates_cached_sector_and_shows_destination(ctx_factory, fake_conn, capsys):
     ctx = ctx_factory(sector={"id": 1, "name": "Sector 1", "adjacent": [{"to_sector": 2}]})
 
-    fake_conn.queue("move.warp", {"status": "ok", "data": {"sector_id": 1, "to_sector_id": 2}})
+    fake_conn.queue("move.warp", {"status": "ok", "type": "move.result", "data": {"sector_id": 1, "to_sector_id": 2}})
     fake_conn.queue("move.describe_sector", {
-        "status": "ok",
+        "status": "ok", "type": "sector.info",
         "data": {"sector_id": 2, "name": "Sector 2", "adjacent_sectors": []},
     })
     fake_conn.queue("ship.status", {
-        "status": "ok", "data": {"ship": {"hull": 91, "shields": 80, "fighters": 20}}
+        "status": "ok", "type": "ship.status", "data": {"ship": {"hull": 91, "shields": 80, "fighters": 20}}
     })
 
     ok = client._perform_warp(ctx, 2)
@@ -37,7 +37,7 @@ def test_refused_move_leaves_cached_sector_unchanged_and_shows_refusal(ctx_facto
     ctx = ctx_factory(sector={"id": 1, "name": "Sector 1", "adjacent": [{"to_sector": 2}]})
 
     fake_conn.queue("move.warp", {
-        "status": "refused",
+        "status": "refused", "type": "error",
         "data": {"reason": "insufficient_turns"},
         "error": {"code": 1301, "message": "Not enough turns remaining."},
     })
@@ -60,10 +60,10 @@ def test_error_move_refreshes_authoritative_sector_and_ship_state(ctx_factory, f
     ctx = ctx_factory(sector={"id": 1, "name": "Sector 1", "adjacent": [{"to_sector": 2}]})
 
     fake_conn.queue("move.warp", {
-        "status": "error",
+        "status": "error", "type": "error",
         "error": {"code": 500, "message": "Internal server error."},
     })
-    fake_conn.queue("move.describe_sector", {"status": "ok", "data": {"sector_id": 2, "name": "Sector 2"}})
+    fake_conn.queue("move.describe_sector", {"status": "ok", "type": "sector.info", "data": {"sector_id": 2, "name": "Sector 2"}})
 
     ok = client._perform_warp(ctx, 2)
 
@@ -80,12 +80,12 @@ def test_error_move_refreshes_authoritative_sector_and_ship_state(ctx_factory, f
 def test_error_move_hazard_is_shown_and_state_is_reconciled(ctx_factory, fake_conn, capsys):
     ctx = ctx_factory(sector={"id": 1, "name": "Old"})
     fake_conn.queue("move.warp", {
-        "status": "error",
+        "status": "error", "type": "error",
         "error": {"code": 500, "message": "Hazard resolution failed", "data": {
             "hazards": [{"hazard_type": "ion storm", "shields_lost": 8}],
         }},
     })
-    fake_conn.queue("move.describe_sector", {"status": "ok", "data": {"sector_id": 2, "name": "New"}})
+    fake_conn.queue("move.describe_sector", {"status": "ok", "type": "sector.info", "data": {"sector_id": 2, "name": "New"}})
 
     assert client._perform_warp(ctx, 2) is False
 
@@ -98,13 +98,13 @@ def test_refused_move_hazard_reconciles_authoritative_state(ctx_factory, fake_co
     """A refusal with server-reported entry hazards must refresh before retry."""
     ctx = ctx_factory(sector={"id": 1, "name": "Old"})
     fake_conn.queue("move.warp", {
-        "status": "refused",
+        "status": "refused", "type": "error",
         "error": {"code": 409, "message": "Entry hazard processing stopped.", "data": {
             "hazards": [{"hazard_type": "minefield", "hull_lost": 6}],
         }},
     })
     fake_conn.queue("move.describe_sector", {
-        "status": "ok", "data": {"sector_id": 2, "name": "Authoritative location"},
+        "status": "ok", "type": "sector.info", "data": {"sector_id": 2, "name": "Authoritative location"},
     })
 
     assert client._perform_warp(ctx, 2) is False
@@ -120,8 +120,8 @@ def test_refused_move_hazard_reconciles_authoritative_state(ctx_factory, fake_co
 def test_unconfirmed_move_clears_stale_location_and_stops_navigation(ctx_factory, fake_conn, capsys):
     ctx = ctx_factory(sector={"id": 1, "name": "Old"})
     ctx.state["sector_id"] = 1
-    fake_conn.queue("move.warp", {"status": "ok", "data": {"to_sector_id": 2}})
-    fake_conn.queue("move.describe_sector", {"status": "refused", "error": {"message": "Unavailable"}})
+    fake_conn.queue("move.warp", {"status": "ok", "type": "move.result", "data": {"to_sector_id": 2}})
+    fake_conn.queue("move.describe_sector", {"status": "refused", "type": "error", "error": {"message": "Unavailable"}})
 
     assert client._perform_warp(ctx, 2) is False
 
@@ -145,10 +145,10 @@ def test_move_to_adjacent_rejects_non_adjacent_target_without_calling_server(ctx
 
 def test_move_displays_server_reported_sector_hazard_damage(ctx_factory, fake_conn, capsys):
     ctx = ctx_factory(sector={"id": 1})
-    fake_conn.queue("move.warp", {"status": "ok", "data": {"to_sector_id": 2, "hazards": [
+    fake_conn.queue("move.warp", {"status": "ok", "type": "move.result", "data": {"to_sector_id": 2, "hazards": [
         {"hazard_type": "radiation", "damage": 17, "shields_lost": 10, "hull_lost": 7},
     ]}})
-    fake_conn.queue("move.describe_sector", {"status": "ok", "data": {"sector_id": 2}})
+    fake_conn.queue("move.describe_sector", {"status": "ok", "type": "sector.info", "data": {"sector_id": 2}})
 
     assert client._perform_warp(ctx, 2)
 

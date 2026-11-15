@@ -9,7 +9,7 @@ def test_landing_error_envelope_refreshes_without_claiming_planet(
     """A non-OK landing envelope cannot be treated as a successful landing."""
     ctx = ctx_factory(sector={"id": 17, "planets": [{"id": 77, "name": "Terra"}]})
     fake_conn.queue("planet.land", {
-        "status": "error",
+        "status": "error", "type": "error",
         "error": {
             "message": "Planetary defenses stopped landing.",
             "data": {"planet_id": 77, "combat": [{
@@ -19,13 +19,13 @@ def test_landing_error_envelope_refreshes_without_claiming_planet(
         },
     })
     fake_conn.queue("player.my_info", {
-        "status": "ok", "data": {"player": {"id": 3, "turns": 40}},
+        "status": "ok", "type": "player.info", "data": {"player": {"id": 3, "turns": 40}},
     })
     fake_conn.queue("ship.status", {
-        "status": "ok", "data": {"ship": {"ship_id": 9, "hull": 89}},
+        "status": "ok", "type": "ship.status", "data": {"ship": {"ship_id": 9, "hull": 89}},
     })
     fake_conn.queue("move.describe_sector", {
-        "status": "ok", "data": {"id": 17, "planets": [{"id": 77, "name": "Terra"}]},
+        "status": "ok", "type": "sector.info", "data": {"id": 17, "planets": [{"id": 77, "name": "Terra"}]},
     })
 
     client.land_flow(ctx)

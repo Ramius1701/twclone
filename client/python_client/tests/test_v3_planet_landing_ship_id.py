@@ -12,16 +12,16 @@ def test_landing_does_not_open_surface_without_authoritative_ship_id(
         "status": "ok", "type": "planet.land.success", "data": {"planet_id": 77},
     })
     fake_conn.queue("player.my_info", {
-        "status": "ok", "data": {"player": {"id": 3, "turns": 39}},
+        "status": "ok", "type": "player.info", "data": {"player": {"id": 3, "turns": 39}},
     })
     fake_conn.queue("ship.status", {
-        "status": "ok", "data": {"ship": {"hull": 100}},
+        "status": "ok", "type": "ship.status", "data": {"ship": {"hull": 100}},
     })
     client.land_flow(ctx)
 
     assert [call["command"] for call in fake_conn.calls] == [
-        "planet.land", "player.my_info", "ship.status",
+        "planet.land", "player.my_info", "ship.status", "move.describe_sector",
     ]
     assert ctx.menu_stack[-1] != "SURFACE"
     assert ctx.state["current_planet_id"] == 77
-    assert "post-landing HUD refresh was incomplete" in capsys.readouterr().out
+    assert "post-landing authoritative refresh was incomplete" in capsys.readouterr().out

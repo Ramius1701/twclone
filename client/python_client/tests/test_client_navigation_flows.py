@@ -30,7 +30,7 @@ def test_autopilot_stops_on_first_refused_warp_and_keeps_remaining_route(
     ctx.state["ap_route"] = [20, 30, 40]
     ctx.state["ap_route_plotted"] = True
     fake_conn.queue("move.warp", {
-        "status": "refused", "error": {"message": "Insufficient turns."},
+        "status": "refused", "type": "error", "error": {"message": "Insufficient turns."},
     })
 
     client.start_autopilot(ctx)

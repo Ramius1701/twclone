@@ -28,7 +28,7 @@ def test_empty_density_response_is_a_valid_no_row_result(
 ):
     ctx = ctx_factory(sector={"id": 12, "name": "Known"})
     fake_conn.queue("sector.scan.density", {
-        "status": "ok", "data": [],
+        "status": "ok", "type": "sector.density.scan", "data": [],
     })
 
     client.sector_density_scan_flow(ctx)

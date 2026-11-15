@@ -10,12 +10,12 @@ def test_landing_does_not_open_surface_for_another_player_refresh(
 ):
     ctx = ctx_factory(sector={"id": 17, "planets": [{"id": 77, "name": "Terra"}]})
     ctx.player_info = {"player": {"id": 3, "turns": 40}}
-    fake_conn.queue("planet.land", {"status": "ok", "data": {"planet_id": 77}})
+    fake_conn.queue("planet.land", {"status": "ok", "type": "planet.land.success", "data": {"planet_id": 77}})
     fake_conn.queue("player.my_info", {
-        "status": "ok", "data": {"player": {"id": 4, "turns": 39}},
+        "status": "ok", "type": "player.info", "data": {"player": {"id": 4, "turns": 39}},
     })
     fake_conn.queue("ship.status", {
-        "status": "ok", "data": {"ship": {"ship_id": 9, "hull": 100}},
+        "status": "ok", "type": "ship.status", "data": {"ship": {"ship_id": 9, "hull": 100}},
     })
 
     client.land_flow(ctx)
@@ -23,7 +23,7 @@ def test_landing_does_not_open_surface_for_another_player_refresh(
     assert ctx.menu_stack == ["MAIN"]
     assert ctx.player_info == {"player": {"id": 3, "turns": 40}}
     assert ctx.state["current_planet_id"] == 77
-    assert "post-landing HUD refresh was incomplete" in capsys.readouterr().out
+    assert "post-landing authoritative refresh was incomplete" in capsys.readouterr().out
 
 
 def test_landing_uses_confirmed_session_player_id_before_player_cache_exists(
@@ -32,19 +32,19 @@ def test_landing_uses_confirmed_session_player_id_before_player_cache_exists(
     """Startup identity must protect landing refreshes before player_info is hydrated."""
     ctx = ctx_factory(sector={"id": 17, "planets": [{"id": 77, "name": "Terra"}]})
     ctx.state["player_id"] = 3
-    fake_conn.queue("planet.land", {"status": "ok", "data": {"planet_id": 77}})
+    fake_conn.queue("planet.land", {"status": "ok", "type": "planet.land.success", "data": {"planet_id": 77}})
     fake_conn.queue("player.my_info", {
-        "status": "ok", "data": {"player": {"id": 4, "turns": 39}},
+        "status": "ok", "type": "player.info", "data": {"player": {"id": 4, "turns": 39}},
     })
     fake_conn.queue("ship.status", {
-        "status": "ok", "data": {"ship": {"ship_id": 9, "hull": 100, "onplanet": 77}},
+        "status": "ok", "type": "ship.status", "data": {"ship": {"ship_id": 9, "hull": 100, "onplanet": 77}},
     })
 
     client.land_flow(ctx)
 
     assert ctx.player_info == {}
     assert ctx.menu_stack == ["MAIN"]
-    assert "post-landing HUD refresh was incomplete" in capsys.readouterr().out
+    assert "post-landing authoritative refresh was incomplete" in capsys.readouterr().out
 
 
 def test_landing_does_not_open_surface_when_ship_matches_but_player_does_not(
@@ -53,12 +53,12 @@ def test_landing_does_not_open_surface_when_ship_matches_but_player_does_not(
     """A matching ship/planet pair cannot authorize a mismatched player refresh."""
     ctx = ctx_factory(sector={"id": 17, "planets": [{"id": 77, "name": "Terra"}]})
     ctx.player_info = {"player": {"id": 3, "turns": 40}}
-    fake_conn.queue("planet.land", {"status": "ok", "data": {"planet_id": 77}})
+    fake_conn.queue("planet.land", {"status": "ok", "type": "planet.land.success", "data": {"planet_id": 77}})
     fake_conn.queue("player.my_info", {
-        "status": "ok", "data": {"player": {"id": 4, "turns": 39}},
+        "status": "ok", "type": "player.info", "data": {"player": {"id": 4, "turns": 39}},
     })
     fake_conn.queue("ship.status", {
-        "status": "ok", "data": {"ship": {"ship_id": 9, "hull": 100, "onplanet": 77}},
+        "status": "ok", "type": "ship.status", "data": {"ship": {"ship_id": 9, "hull": 100, "onplanet": 77}},
     })
 
     client.land_flow(ctx)
@@ -66,9 +66,9 @@ def test_landing_does_not_open_surface_when_ship_matches_but_player_does_not(
     assert ctx.menu_stack == ["MAIN"]
     assert ctx.player_info == {"player": {"id": 3, "turns": 40}}
     assert ctx.state["current_planet_id"] == 77
-    assert "post-landing HUD refresh was incomplete" in capsys.readouterr().out
+    assert "post-landing authoritative refresh was incomplete" in capsys.readouterr().out
     assert [call["command"] for call in fake_conn.calls] == [
-        "planet.land", "player.my_info", "ship.status",
+        "planet.land", "player.my_info", "ship.status", "move.describe_sector",
     ]
 
 

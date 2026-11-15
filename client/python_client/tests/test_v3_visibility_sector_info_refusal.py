@@ -25,7 +25,7 @@ def test_sector_info_refusal_refreshes_only_confirmed_sector(
 
     client.sector_info_flow(ctx)
 
-    assert ctx.last_sector_desc == {"id": 12, "name": "Authoritative refresh"}
+    assert ctx.last_sector_desc == client.normalize_sector({"id": 12, "name": "Authoritative refresh"})
     assert [call["command"] for call in fake_conn.calls] == [
         "sector.info", "move.describe_sector",
     ]

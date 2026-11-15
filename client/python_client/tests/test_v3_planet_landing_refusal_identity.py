@@ -15,7 +15,7 @@ def test_landing_refusal_data_cannot_replace_confirmed_surface(
     ctx.menu_stack.append("SURFACE")
 
     fake_conn.queue("planet.land", {
-        "status": "error",
+        "status": "error", "type": "error",
         "error": {
             "message": "Planetary defenses refused landing.",
             # This is diagnostic data from the attempted target, not proof of
@@ -24,15 +24,15 @@ def test_landing_refusal_data_cannot_replace_confirmed_surface(
         },
     })
     fake_conn.queue("player.my_info", {
-        "status": "ok",
+        "status": "ok", "type": "player.info",
         "data": {"player": {"id": 3, "turns": 40}},
     })
     fake_conn.queue("ship.status", {
-        "status": "ok",
+        "status": "ok", "type": "ship.status",
         "data": {"ship": {"ship_id": 9, "hull": 85, "onplanet": 66}},
     })
     fake_conn.queue("move.describe_sector", {
-        "status": "ok",
+        "status": "ok", "type": "sector.info",
         "data": {"id": 17, "planets": [{"id": 77, "name": "Terra"}]},
     })
 

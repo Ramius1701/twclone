@@ -7,7 +7,7 @@ import pytest
 
 
 PORT_RESPONSE = {
-    "status": "ok",
+    "status": "ok", "type": "trade.port_info",
     "data": {"port": {"id": 7, "name": "New Dawn", "commodities": [
         {"code": "ORE", "quantity": 12, "max_quantity": 100, "price": 40,
          "sells": True, "buys": True},
@@ -58,7 +58,7 @@ def test_port_info_uses_authoritative_capacity_field():
 
     assert normalized["commodities"] == [{
         "commodity": "ORE", "available": 12, "max_quantity": 100,
-        "base_price": 40, "sells": None, "buys": None,
+        "base_price": 40,
     }]
 
 
@@ -299,8 +299,8 @@ def test_port_info_does_not_derive_fixed_direction_from_stock():
     ]}}}
 
     normalized = client.normalize_port_info(response)
-    assert normalized["commodities"][0]["sells"] is None
-    assert normalized["commodities"][0]["buys"] is None
+    assert "sells" not in normalized["commodities"][0]
+    assert "buys" not in normalized["commodities"][0]
     assert len(client._trade_rows(type("Ctx", (), {"state": {"port_inventory": normalized}})(), "buy")) == 2
     assert "server decides" in client.render_port_summary(normalized)[1]
 
@@ -440,7 +440,7 @@ def test_quote_reconciliation_disconnect_fails_closed_without_raising(ctx_factor
 
     assert client._safe_refresh_port_info(ctx, {"port_id": 7, "sector_id": 9}) is False
     assert "port_inventory" not in ctx.state
-    assert "connection lost" in ctx.state["trade_refresh_error"]
+    assert "socket closed" in ctx.state["trade_refresh_error"]
     assert "Reconnect before attempting another trade" in capsys.readouterr().out
 
 
@@ -546,7 +546,7 @@ def test_port_refresh_rejects_omitted_port_response_type(ctx_factory, fake_conn)
 def test_port_summary_uses_indicative_prices_and_port_name():
     lines = client.render_port_summary(client.normalize_port_info(PORT_RESPONSE))
     assert lines[0] == "--- Port: New Dawn ---"
-    assert "ORE: stock 12/100; sell/buy; base ~40" in lines[1]
+    assert "ORE: stock 12/100; buy/sell; base ~40" in lines[1]
 
 
 def test_port_summary_maps_server_directions_to_player_actions():
@@ -631,6 +631,7 @@ def test_typed_quote_with_malformed_price_refuses_before_settlement(
 
 def test_confirmed_buy_uses_uuid_and_refreshes_state(ctx_factory, fake_conn, monkeypatch, capsys):
     ctx = ctx_factory({"id": 9, "port": {"id": 7, "name": "New Dawn"}})
+    ctx.state["player_id"] = 1
     ctx.state["port_inventory"] = client.normalize_port_info(PORT_RESPONSE)
     fake_conn.queue("trade.quote", {"status": "ok", "type": "trade.quote", "data": {
         "port_id": 7, "commodity": "ORE", "quantity": 2,
@@ -656,6 +657,7 @@ def test_successful_trade_receipt_does_not_claim_port_refresh_when_refused(
 ):
     """A receipt is shown, but stock remains explicitly un-reconciled."""
     ctx = ctx_factory({"id": 9, "port": {"id": 7, "name": "New Dawn"}})
+    ctx.state["player_id"] = 9
     ctx.state["port_inventory"] = client.normalize_port_info(PORT_RESPONSE)
     fake_conn.queue("trade.quote", {"status": "ok", "type": "trade.quote", "data": {
         "port_id": 7, "commodity": "ORE", "quantity": 1,
@@ -665,9 +667,9 @@ def test_successful_trade_receipt_does_not_claim_port_refresh_when_refused(
         "port_id": 7, "sector_id": 9, "player_id": 9,
         "total_cost": "40.00", "lines": [{"commodity": "ORE", "quantity": 1}],
     }})
-    fake_conn.queue("player.my_info", {"status": "ok", "data": {"player": {"id": 9, "credits": 60}}})
-    fake_conn.queue("ship.status", {"status": "ok", "data": {"ship": {"id": 4, "cargo": []}}})
-    fake_conn.queue("port.info", {"status": "error", "error": {"message": "port is no longer current"}})
+    fake_conn.queue("player.my_info", {"status": "ok", "type": "player.info", "data": {"player": {"id": 9, "credits": 60}}})
+    fake_conn.queue("ship.status", {"status": "ok", "type": "ship.status", "data": {"ship": {"id": 4, "cargo": []}}})
+    fake_conn.queue("port.info", {"status": "error", "type": "error", "error": {"message": "port is no longer current"}})
     answers = iter(["1", "1", "", "y"])
     monkeypatch.setattr("builtins.input", lambda _prompt: next(answers))
 
@@ -676,7 +678,7 @@ def test_successful_trade_receipt_does_not_claim_port_refresh_when_refused(
     output = capsys.readouterr().out
     assert "Trade Receipt" in output
     assert "port stock could not be refreshed" in output
-    assert ctx.state["trade_refresh_error"] == "port is no longer current"
+    assert ctx.state["trade_refresh_error"] == "authoritative port stock refresh failed"
     assert "port_inventory" not in ctx.state
 
 
@@ -691,8 +693,8 @@ def test_trade_refresh_does_not_claim_reconciliation_when_player_read_refused(
         "buy_price": 40, "total_buy_price": 40,
     }})
     fake_conn.queue("trade.buy", {"status": "error", "error": {"message": "credits changed"}})
-    fake_conn.queue("player.my_info", {"status": "error", "error": {"message": "refresh refused"}})
-    fake_conn.queue("ship.status", {"status": "ok", "data": {"ship": {"id": 4}}})
+    fake_conn.queue("player.my_info", {"status": "error", "type": "error", "error": {"message": "refresh refused"}})
+    fake_conn.queue("ship.status", {"status": "ok", "type": "ship.status", "data": {"ship": {"id": 4}}})
     fake_conn.queue("port.info", PORT_RESPONSE)
     answers = iter(["1", "1", "", "y"])
     monkeypatch.setattr("builtins.input", lambda _prompt: next(answers))
@@ -731,7 +733,7 @@ def test_trade_refresh_rejects_cross_account_or_ship_success(
     assert client._refresh_trade_views(ctx, 7) is False
     assert ctx.hud.credits == 100
     assert ctx.hud.ship_id == 4
-    assert "authoritative port stock could not be refreshed" in capsys.readouterr().out
+    assert "authoritative player balance, ship cargo could not be refreshed" in capsys.readouterr().out
 
 
 def test_trade_refresh_rejects_unrelated_success_response_type(
@@ -755,7 +757,7 @@ def test_trade_refresh_rejects_unrelated_success_response_type(
 
     assert client._refresh_trade_views(ctx, 7) is False
     assert ctx.hud.credits == 100
-    assert "port stock could not be refreshed" in capsys.readouterr().out
+    assert "player balance could not be refreshed" in capsys.readouterr().out
 
 
 def test_trade_refresh_rejects_untyped_balance_or_cargo_reads(
@@ -778,7 +780,7 @@ def test_trade_refresh_rejects_untyped_balance_or_cargo_reads(
 
     assert client._refresh_trade_views(ctx, 7) is False
     assert ctx.hud.credits == 100
-    assert "port stock could not be refreshed" in capsys.readouterr().out
+    assert "player balance could not be refreshed" in capsys.readouterr().out
 
 
 def test_port_refresh_rejects_malformed_requested_sector_without_response_sector(
@@ -804,6 +806,7 @@ def test_buy_uses_authoritative_quote_commodity_casing(
 ):
     """A canonical quote may normalize the display commodity spelling."""
     ctx = ctx_factory({"id": 9, "port": {"id": 7, "name": "New Dawn"}})
+    ctx.state["player_id"] = 9
     ctx.state["port_inventory"] = client.normalize_port_info(PORT_RESPONSE)
     fake_conn.queue("trade.quote", {"status": "ok", "data": {
         "port_id": 7, "commodity": "ore", "quantity": 1,
@@ -827,6 +830,7 @@ def test_buy_uses_authoritative_quote_commodity_casing(
 
 def test_sell_receipt_describes_net_total(ctx_factory, fake_conn, monkeypatch, capsys):
     ctx = ctx_factory({"id": 9, "port": {"id": 7, "name": "New Dawn"}})
+    ctx.state["player_id"] = 1
     ctx.state["port_inventory"] = client.normalize_port_info(PORT_RESPONSE)
     fake_conn.queue("trade.quote", {"status": "ok", "data": {
         "port_id": 7, "commodity": "ORE", "quantity": 2,
@@ -975,15 +979,15 @@ def test_confirmed_buy_defaults_to_saved_server_trade_preference(
         "port_id": 7, "sector_id": 9, "total_cost": "40.00",
         "lines": [{"commodity": "ORE", "quantity": 1}],
     }})
+    prompts = []
     answers = iter(["1", "1", "", "y"])
-    monkeypatch.setattr("builtins.input", lambda _prompt: next(answers))
+    monkeypatch.setattr("builtins.input", lambda prompt: (prompts.append(prompt), next(answers))[1])
 
     client.dock_trade_flow(ctx, "buy")
 
     trade = next(call for call in fake_conn.calls if call["command"] == "trade.buy")
     assert "account" not in trade["data"]
-    output = capsys.readouterr().out
-    assert "default S" in output
+    assert any("default S" in prompt for prompt in prompts)
 
 
 def test_mismatched_trade_receipt_is_not_presented_and_refreshes_state(
@@ -1060,10 +1064,10 @@ def test_mismatched_trade_receipt_player_is_not_presented_and_refreshes_state(
     }})
     fake_conn.queue("trade.buy", {"status": "ok", "data": {
         "port_id": 7, "sector_id": 9, "player_id": 99,
-        "total_cost": "40.00", "lines": [],
+        "total_cost": "40.00", "lines": [{"commodity": "ORE", "quantity": 1}],
     }})
-    fake_conn.queue("player.my_info", {"status": "ok", "data": {"player": {"id": 14}}})
-    fake_conn.queue("ship.status", {"status": "ok", "data": {"ship": {"id": 9, "cargo": []}}})
+    fake_conn.queue("player.my_info", {"status": "ok", "type": "player.info", "data": {"player": {"id": 14}}})
+    fake_conn.queue("ship.status", {"status": "ok", "type": "ship.status", "data": {"ship": {"id": 9, "cargo": []}}})
     fake_conn.queue("port.info", PORT_RESPONSE)
     answers = iter(["1", "1", "", "y"])
     monkeypatch.setattr("builtins.input", lambda _prompt: next(answers))
@@ -1090,10 +1094,10 @@ def test_trade_receipt_without_player_id_is_not_presented_when_session_identity_
         "buy_price": 40, "total_buy_price": 40,
     }})
     fake_conn.queue("trade.buy", {"status": "ok", "data": {
-        "port_id": 7, "sector_id": 9, "total_cost": "40.00", "lines": [],
+        "port_id": 7, "sector_id": 9, "total_cost": "40.00", "lines": [{"commodity": "ORE", "quantity": 1}],
     }})
-    fake_conn.queue("player.my_info", {"status": "ok", "data": {"player": {"id": 14}}})
-    fake_conn.queue("ship.status", {"status": "ok", "data": {"ship": {"id": 9, "cargo": []}}})
+    fake_conn.queue("player.my_info", {"status": "ok", "type": "player.info", "data": {"player": {"id": 14}}})
+    fake_conn.queue("ship.status", {"status": "ok", "type": "ship.status", "data": {"ship": {"id": 9, "cargo": []}}})
     fake_conn.queue("port.info", PORT_RESPONSE)
     answers = iter(["1", "1", "", "y"])
     monkeypatch.setattr("builtins.input", lambda _prompt: next(answers))
@@ -1147,8 +1151,8 @@ def test_refused_trade_refreshes_authoritative_state_without_claiming_mutation(
         "buy_price": 40.0, "total_buy_price": 80,
     }})
     fake_conn.queue("trade.buy", {"status": "refused", "error": {"message": "Stock exhausted"}})
-    fake_conn.queue("player.my_info", {"status": "ok", "data": {"player": {"credits": 20}}})
-    fake_conn.queue("ship.status", {"status": "ok", "data": {"ship": {"id": 9, "cargo": []}}})
+    fake_conn.queue("player.my_info", {"status": "ok", "type": "player.info", "data": {"player": {"id": 1, "credits": 20}}})
+    fake_conn.queue("ship.status", {"status": "ok", "type": "ship.status", "data": {"ship": {"id": 9, "cargo": []}}})
     fake_conn.queue("port.info", PORT_RESPONSE)
     answers = iter(["1", "2", "", "y"])
     monkeypatch.setattr("builtins.input", lambda _prompt: next(answers))
@@ -1232,6 +1236,7 @@ def test_trade_refresh_disconnect_does_not_crash_or_show_stale_summary(
 ):
     """A confirmed trade still requires reconnect when reconciliation is lost."""
     ctx = ctx_factory({"id": 9, "port": {"id": 7, "name": "New Dawn"}})
+    ctx.state["player_id"] = 1
     ctx.state["port_inventory"] = client.normalize_port_info(PORT_RESPONSE)
     fake_conn.queue("trade.quote", {"status": "ok", "type": "trade.quote", "data": {
         "port_id": 7, "commodity": "ORE", "quantity": 2,

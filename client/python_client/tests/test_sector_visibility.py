@@ -134,7 +134,7 @@ def test_density_scan_without_confirmed_sector_id_sends_no_request(
 
 def test_scan_does_not_retain_legacy_port_class_from_sector_cache(ctx_factory, fake_conn, capsys):
     ctx = ctx_factory(sector={"id": 12, "port": {"present": True, "id": 8, "class": 9}})
-    fake_conn.queue("move.scan", {"status": "ok", "data": {
+    fake_conn.queue("move.scan", {"status": "ok", "type": "sector.scan", "data": {
         "sector_id": 12, "ports": [{"id": 8, "type": 9}],
         "adjacent_sectors": [], "ships_present": [], "celestial_objects": [],
     }})
@@ -149,7 +149,7 @@ def test_scan_does_not_coerce_malformed_port_presence_into_cache(
     ctx_factory, fake_conn, capsys
 ):
     ctx = ctx_factory(sector={"id": 12, "port": {"present": True, "id": 8}})
-    fake_conn.queue("move.scan", {"status": "ok", "data": {
+    fake_conn.queue("move.scan", {"status": "ok", "type": "sector.scan", "data": {
         "sector_id": 12,
         "port": {"present": "false", "id": 8},
         "adjacent_sectors": [], "ships_present": [], "celestial_objects": [],
@@ -167,7 +167,7 @@ def test_scan_does_not_infer_port_presence_from_malformed_port_rows(
     ctx_factory, fake_conn, capsys
 ):
     ctx = ctx_factory(sector={"id": 12, "port": {"present": False}})
-    fake_conn.queue("move.scan", {"status": "ok", "data": {
+    fake_conn.queue("move.scan", {"status": "ok", "type": "sector.scan", "data": {
         "sector_id": 12,
         "ports": ["untrusted row"],
         "counts": {},
@@ -260,7 +260,7 @@ def test_scan_with_wrong_success_type_preserves_cache_and_refreshes_sector(
         "data": {"sector_id": 12, "name": "Untrusted scan"},
     })
     fake_conn.queue("move.describe_sector", {
-        "status": "ok", "data": {"id": 12, "name": "Reconciled"},
+        "status": "ok", "type": "sector.info", "data": {"id": 12, "name": "Reconciled"},
     })
 
     client.scan_sector(ctx)
@@ -280,11 +280,11 @@ def test_scan_without_authoritative_sector_id_does_not_merge_payload(
 ):
     ctx = ctx_factory(sector={"id": 12, "name": "Known"})
     fake_conn.queue("move.scan", {
-        "status": "ok",
+        "status": "ok", "type": "sector.scan",
         "data": {"name": "Unidentified sector", "counts": {"ships": 9}},
     })
     fake_conn.queue("move.describe_sector", {
-        "status": "ok", "data": {"id": 12, "name": "Known"},
+        "status": "ok", "type": "sector.info", "data": {"id": 12, "name": "Known"},
     })
 
     client.scan_sector(ctx)
@@ -326,11 +326,11 @@ def test_density_scan_does_not_display_mismatched_single_sector(
     """A success-shaped density row for another sector is not usable state."""
     ctx = ctx_factory(sector={"id": 12, "name": "Known"})
     fake_conn.queue("sector.scan.density", {
-        "status": "ok",
+        "status": "ok", "type": "sector.density.scan",
         "data": {"sector_id": 999, "density": 42},
     })
     fake_conn.queue("move.describe_sector", {
-        "status": "ok", "data": {"id": 12, "name": "Refreshed"},
+        "status": "ok", "type": "sector.info", "data": {"id": 12, "name": "Refreshed"},
     })
 
     client.sector_density_scan_flow(ctx)
@@ -350,7 +350,7 @@ def test_density_scan_unwraps_authoritative_single_sector_row(
 ):
     ctx = ctx_factory(sector={"id": 12, "name": "Known"})
     fake_conn.queue("sector.scan.density", {
-        "status": "ok",
+        "status": "ok", "type": "sector.density.scan",
         "data": {"sectors": [{"sector_id": 12, "density": 7}]},
     })
 
@@ -414,10 +414,10 @@ def test_density_scan_does_not_infer_missing_single_row_id(
 ):
     ctx = ctx_factory(sector={"id": 12, "name": "Known"})
     fake_conn.queue("sector.scan.density", {
-        "status": "ok", "data": {"density": 7},
+        "status": "ok", "type": "sector.density.scan", "data": {"density": 7},
     })
     fake_conn.queue("move.describe_sector", {
-        "status": "ok", "data": {"id": 12, "name": "Refreshed"},
+        "status": "ok", "type": "sector.info", "data": {"id": 12, "name": "Refreshed"},
     })
 
     client.sector_density_scan_flow(ctx)
@@ -435,10 +435,10 @@ def test_density_scan_rejects_boolean_compact_sector_id(
 ):
     ctx = ctx_factory(sector={"id": 12, "name": "Known"})
     fake_conn.queue("sector.scan.density", {
-        "status": "ok", "data": {"sectors": [True, 7]},
+        "status": "ok", "type": "sector.density.scan", "data": {"sectors": [True, 7]},
     })
     fake_conn.queue("move.describe_sector", {
-        "status": "ok", "data": {"id": 12, "name": "Refreshed"},
+        "status": "ok", "type": "sector.info", "data": {"id": 12, "name": "Refreshed"},
     })
 
     client.sector_density_scan_flow(ctx)
@@ -454,10 +454,10 @@ def test_density_scan_rejects_non_positive_compact_sector_id(
 ):
     ctx = ctx_factory(sector={"id": 12, "name": "Known"})
     fake_conn.queue("sector.scan.density", {
-        "status": "ok", "data": {"sectors": [0, 7]},
+        "status": "ok", "type": "sector.density.scan", "data": {"sectors": [0, 7]},
     })
     fake_conn.queue("move.describe_sector", {
-        "status": "ok", "data": {"id": 12, "name": "Refreshed"},
+        "status": "ok", "type": "sector.info", "data": {"id": 12, "name": "Refreshed"},
     })
 
     client.sector_density_scan_flow(ctx)
@@ -496,8 +496,8 @@ def test_malformed_density_scan_refreshes_confirmed_sector(
     ctx_factory, fake_conn, capsys
 ):
     ctx = ctx_factory(sector={"id": 12, "name": "Known"})
-    fake_conn.queue("sector.scan.density", {"status": "ok", "data": "not-a-density-response"})
-    fake_conn.queue("move.describe_sector", {"status": "ok", "data": {"id": 12, "name": "Refreshed"}})
+    fake_conn.queue("sector.scan.density", {"status": "ok", "type": "sector.density.scan", "data": "not-a-density-response"})
+    fake_conn.queue("move.describe_sector", {"status": "ok", "type": "sector.info", "data": {"id": 12, "name": "Refreshed"}})
 
     client.sector_density_scan_flow(ctx)
 
@@ -513,8 +513,8 @@ def test_sector_info_without_authoritative_id_refreshes_without_merging_payload(
     ctx_factory, fake_conn, capsys
 ):
     ctx = ctx_factory(sector={"id": 12, "name": "Known"})
-    fake_conn.queue("sector.info", {"status": "ok", "data": {"name": "Unidentified"}})
-    fake_conn.queue("move.describe_sector", {"status": "ok", "data": {"id": 12, "name": "Refreshed"}})
+    fake_conn.queue("sector.info", {"status": "ok", "type": "sector.info", "data": {"name": "Unidentified"}})
+    fake_conn.queue("move.describe_sector", {"status": "ok", "type": "sector.info", "data": {"id": 12, "name": "Refreshed"}})
 
     client.sector_info_flow(ctx)
 
@@ -532,11 +532,11 @@ def test_sector_info_mismatched_authoritative_id_refreshes_without_merging_paylo
     """A sector.info reply for another sector must not replace current state."""
     ctx = ctx_factory(sector={"id": 12, "name": "Confirmed"})
     fake_conn.queue("sector.info", {
-        "status": "ok",
+        "status": "ok", "type": "sector.info",
         "data": {"sector_id": 99, "name": "Remote sector", "ports": []},
     })
     fake_conn.queue("move.describe_sector", {
-        "status": "ok", "data": {"id": 12, "name": "Refreshed"},
+        "status": "ok", "type": "sector.info", "data": {"id": 12, "name": "Refreshed"},
     })
 
     client.sector_info_flow(ctx)
@@ -555,8 +555,8 @@ def test_malformed_detailed_scan_refreshes_without_rendering_payload(
     ctx_factory, fake_conn, capsys
 ):
     ctx = ctx_factory(sector={"id": 12, "name": "Known"})
-    fake_conn.queue("sector.scan", {"status": "ok", "data": [12, "not-a-sector"]})
-    fake_conn.queue("move.describe_sector", {"status": "ok", "data": {"id": 12, "name": "Refreshed"}})
+    fake_conn.queue("sector.scan", {"status": "ok", "type": "sector.scan", "data": [12, "not-a-sector"]})
+    fake_conn.queue("move.describe_sector", {"status": "ok", "type": "sector.info", "data": {"id": 12, "name": "Refreshed"}})
 
     client.detailed_sector_scan_flow(ctx)
 
@@ -574,7 +574,7 @@ def test_detailed_scan_rejects_success_for_another_sector_and_refreshes(
     """A success envelope cannot authorize a scan for a different sector."""
     ctx = ctx_factory(sector={"id": 12, "name": "Known"})
     fake_conn.queue("sector.scan", {
-        "status": "ok",
+        "status": "ok", "type": "sector.scan",
         "data": {
             "sector_id": 99,
             "name": "Remote sector",
@@ -583,7 +583,7 @@ def test_detailed_scan_rejects_success_for_another_sector_and_refreshes(
         },
     })
     fake_conn.queue("move.describe_sector", {
-        "status": "ok", "data": {"id": 12, "name": "Refreshed"},
+        "status": "ok", "type": "sector.info", "data": {"id": 12, "name": "Refreshed"},
     })
 
     client.detailed_sector_scan_flow(ctx)
@@ -624,7 +624,7 @@ def test_authoritative_sector_refresh_rejects_mismatched_id(
     known_sector = {"id": 12, "name": "Known"}
     ctx = ctx_factory(sector=known_sector)
     fake_conn.queue("move.describe_sector", {
-        "status": "ok",
+        "status": "ok", "type": "sector.info",
         "data": {"sector_id": 999, "name": "Untrusted remote sector"},
     })
 
@@ -641,7 +641,7 @@ def test_authoritative_sector_refresh_rejects_boolean_id(
 ):
     ctx = ctx_factory(sector={"id": 12, "name": "Known"})
     fake_conn.queue("move.describe_sector", {
-        "status": "ok", "data": {"sector_id": True, "name": "Malformed"},
+        "status": "ok", "type": "sector.info", "data": {"sector_id": True, "name": "Malformed"},
     })
 
     client.refresh_sector_and_display(ctx)
@@ -655,10 +655,10 @@ def test_density_scan_rejects_boolean_values_as_compact_ids(
 ):
     ctx = ctx_factory(sector={"id": 12, "name": "Known"})
     fake_conn.queue("sector.scan.density", {
-        "status": "ok", "data": [True, 3],
+        "status": "ok", "type": "sector.density.scan", "data": [True, 3],
     })
     fake_conn.queue("move.describe_sector", {
-        "status": "ok", "data": {"id": 12, "name": "Refreshed"},
+        "status": "ok", "type": "sector.info", "data": {"id": 12, "name": "Refreshed"},
     })
 
     client.sector_density_scan_flow(ctx)
@@ -676,9 +676,9 @@ def test_malformed_sector_info_refreshes_confirmed_sector(
 ):
     """A successful envelope with a non-object payload must not be trusted."""
     ctx = ctx_factory(sector={"id": 12, "name": "Known"})
-    fake_conn.queue("sector.info", {"status": "ok", "data": [12, "not-a-sector"]})
+    fake_conn.queue("sector.info", {"status": "ok", "type": "sector.info", "data": [12, "not-a-sector"]})
     fake_conn.queue("move.describe_sector", {
-        "status": "ok", "data": {"id": 12, "name": "Refreshed"},
+        "status": "ok", "type": "sector.info", "data": {"id": 12, "name": "Refreshed"},
     })
 
     client.sector_info_flow(ctx)
@@ -750,11 +750,11 @@ def test_successful_detailed_scan_without_authoritative_id_is_not_rendered(
 ):
     ctx = ctx_factory(sector={"id": 12, "name": "Known"})
     fake_conn.queue("sector.scan", {
-        "status": "ok",
+        "status": "ok", "type": "sector.scan",
         "data": {"name": "Unidentified remote sector", "counts": {"ships": 9}},
     })
     fake_conn.queue("move.describe_sector", {
-        "status": "ok", "data": {"id": 12, "name": "Known"},
+        "status": "ok", "type": "sector.info", "data": {"id": 12, "name": "Known"},
     })
 
     client.detailed_sector_scan_flow(ctx)
@@ -774,7 +774,7 @@ def test_scan_with_different_authoritative_sector_id_does_not_replace_confirmed_
     known_sector = {"id": 12, "name": "Known"}
     ctx = ctx_factory(sector=known_sector)
     fake_conn.queue("move.scan", {
-        "status": "ok",
+        "status": "ok", "type": "sector.scan",
         "data": {
             "sector_id": 999,
             "name": "Unconfirmed remote sector",
@@ -782,7 +782,7 @@ def test_scan_with_different_authoritative_sector_id_does_not_replace_confirmed_
         },
     })
     fake_conn.queue("move.describe_sector", {
-        "status": "ok", "data": known_sector,
+        "status": "ok", "type": "sector.info", "data": known_sector,
     })
 
     client.scan_sector(ctx)

@@ -28,9 +28,9 @@ def test_landing_success_does_not_authorize_untyped_player_refresh(
     assert ctx.state.get("on_planet") is not True
     assert ctx.state.get("current_planet_id") == 77
     assert [call["command"] for call in fake_conn.calls] == [
-        "planet.land", "player.my_info", "ship.status",
+        "planet.land", "player.my_info", "ship.status", "move.describe_sector",
     ]
-    assert "post-landing HUD refresh was incomplete" in capsys.readouterr().out
+    assert "post-landing authoritative refresh was incomplete" in capsys.readouterr().out
 
 
 def test_landing_success_does_not_authorize_untyped_ship_refresh(
@@ -59,6 +59,6 @@ def test_landing_success_does_not_authorize_untyped_ship_refresh(
     assert ctx.state.get("on_planet") is not True
     assert ctx.state.get("current_planet_id") == 77
     assert [call["command"] for call in fake_conn.calls] == [
-        "planet.land", "player.my_info", "ship.status",
+        "planet.land", "player.my_info", "ship.status", "move.describe_sector",
     ]
-    assert "post-landing HUD refresh was incomplete" in capsys.readouterr().out
+    assert "post-landing authoritative refresh was incomplete" in capsys.readouterr().out

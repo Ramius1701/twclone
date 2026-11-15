@@ -20,7 +20,10 @@ def test_ship_roster_malformed_reply_enters_typed_recovery(
     assert "invalid response" in output
     assert fake_conn.calls == [
         {"command": "ship.list", "data": {}},
+        {"command": "ship.list", "data": {}},
+        {"command": "player.my_info", "data": {}},
         {"command": "ship.status", "data": {}},
+        {"command": "move.describe_sector", "data": {}},
     ]
 
 

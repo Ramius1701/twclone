@@ -10,12 +10,12 @@ def test_refused_sector_info_refreshes_without_merging_attached_remote_data(
     known_sector = {"id": 12, "name": "Known"}
     ctx = ctx_factory(sector=known_sector)
     fake_conn.queue("sector.info", {
-        "status": "refused",
+        "status": "refused", "type": "error",
         "error": {"message": "Current-sector information unavailable"},
         "data": {"sector_id": 999, "name": "Untrusted remote sector"},
     })
     fake_conn.queue("move.describe_sector", {
-        "status": "ok",
+        "status": "ok", "type": "sector.info",
         "data": {"id": 12, "name": "Authoritative refresh"},
     })
 

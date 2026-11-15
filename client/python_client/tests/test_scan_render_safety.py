@@ -118,11 +118,11 @@ def test_scan_flow_never_dumps_raw_payload_when_presenter_fails(
 ):
     ctx = ctx_factory(sector={"id": 12, "name": "Known"})
     fake_conn.queue("move.scan", {
-        "status": "ok",
+        "status": "ok", "type": "sector.scan",
         "data": {"sector_id": 12, "secret_future_field": "must not be rendered"},
     })
     fake_conn.queue("move.describe_sector", {
-        "status": "ok", "data": {"id": 12, "name": "Refreshed"},
+        "status": "ok", "type": "sector.info", "data": {"id": 12, "name": "Refreshed"},
     })
     monkeypatch.setattr(client, "_render_scan_card", lambda _response: (_ for _ in ()).throw(RuntimeError("presenter failure")))
 
@@ -143,7 +143,7 @@ def test_unrenderable_scan_does_not_merge_payload_and_refreshes_current_sector(
 ):
     ctx = ctx_factory(sector={"id": 12, "name": "Known"})
     fake_conn.queue("move.scan", {
-        "status": "ok",
+        "status": "ok", "type": "sector.scan",
         "data": {
             "sector_id": 12,
             "name": ExplodingValue(),
@@ -151,7 +151,7 @@ def test_unrenderable_scan_does_not_merge_payload_and_refreshes_current_sector(
         },
     })
     fake_conn.queue("move.describe_sector", {
-        "status": "ok",
+        "status": "ok", "type": "sector.info",
         "data": {"id": 12, "name": "Refreshed"},
     })
 

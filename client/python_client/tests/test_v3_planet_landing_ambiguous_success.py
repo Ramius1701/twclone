@@ -19,18 +19,18 @@ def test_ambiguous_success_reconciles_without_claiming_planet(
 ):
     """An incomplete success cannot establish a local landing or surface."""
     ctx = ctx_factory(sector={"id": 17, "planets": [{"id": 77, "name": "Terra"}]})
-    fake_conn.queue("planet.land", landing_response)
+    fake_conn.queue("planet.land", {"type": "planet.land.success", **landing_response})
     fake_conn.queue(
         "player.my_info",
-        {"status": "ok", "data": {"player": {"id": 3, "turns": 40}}},
+        {"status": "ok", "type": "player.info", "data": {"player": {"id": 3, "turns": 40}}},
     )
     fake_conn.queue(
         "ship.status",
-        {"status": "ok", "data": {"ship": {"ship_id": 9, "hull": 100}}},
+        {"status": "ok", "type": "ship.status", "data": {"ship": {"ship_id": 9, "hull": 100}}},
     )
     fake_conn.queue(
         "move.describe_sector",
-        {"status": "ok", "data": {"id": 17, "planets": [{"id": 77}]}},
+        {"status": "ok", "type": "sector.info", "data": {"id": 17, "planets": [{"id": 77}]}},
     )
 
     client.land_flow(ctx)

@@ -123,12 +123,12 @@ def test_active_route_prompt_exposes_information_and_status_without_guessing_com
 ):
     ctx = ctx_factory(sector={"id": 41, "name": "Origin"})
     ctx.state["ap_route"] = [42, 43]
-    fake_conn.queue("move.warp", {"status": "ok", "data": {"to_sector_id": 42}})
-    fake_conn.queue("move.describe_sector", {"status": "ok", "data": {"sector_id": 42, "name": "Middle"}})
-    fake_conn.queue("sector.info", {"status": "ok", "data": {"sector_id": 42, "name": "Middle"}})
+    fake_conn.queue("move.warp", {"status": "ok", "type": "move.result", "data": {"to_sector_id": 42}})
+    fake_conn.queue("move.describe_sector", {"status": "ok", "type": "sector.info", "data": {"sector_id": 42, "name": "Middle"}})
+    fake_conn.queue("sector.info", {"status": "ok", "type": "sector.info", "data": {"sector_id": 42, "name": "Middle"}})
     fake_conn.queue("move.autopilot.status", {"status": "ok", "data": {"state": "running", "next_sector_id": 43}})
-    fake_conn.queue("move.warp", {"status": "ok", "data": {"to_sector_id": 43}})
-    fake_conn.queue("move.describe_sector", {"status": "ok", "data": {"sector_id": 43, "name": "Destination"}})
+    fake_conn.queue("move.warp", {"status": "ok", "type": "move.result", "data": {"to_sector_id": 43}})
+    fake_conn.queue("move.describe_sector", {"status": "ok", "type": "sector.info", "data": {"sector_id": 43, "name": "Destination"}})
     answers = iter(["i", "r", "s", "d", "y"])
     monkeypatch.setattr("builtins.input", lambda *_: next(answers))
     monkeypatch.setattr(client, "call_handler", lambda *_: True)
@@ -147,11 +147,11 @@ def test_active_route_stop_and_stop_after_next_use_documented_server_controls(
 ):
     ctx = ctx_factory(sector={"id": 1})
     ctx.state["ap_route"] = [2, 3, 4]
-    fake_conn.queue("move.warp", {"status": "ok", "data": {"to_sector_id": 2}})
-    fake_conn.queue("move.describe_sector", {"status": "ok", "data": {"sector_id": 2}})
+    fake_conn.queue("move.warp", {"status": "ok", "type": "move.result", "data": {"to_sector_id": 2}})
+    fake_conn.queue("move.describe_sector", {"status": "ok", "type": "sector.info", "data": {"sector_id": 2}})
     fake_conn.queue("move.autopilot.control", {"status": "ok", "data": {"action": "stop_at_next", "state": "running"}})
-    fake_conn.queue("move.warp", {"status": "ok", "data": {"to_sector_id": 3}})
-    fake_conn.queue("move.describe_sector", {"status": "ok", "data": {"sector_id": 3}})
+    fake_conn.queue("move.warp", {"status": "ok", "type": "move.result", "data": {"to_sector_id": 3}})
+    fake_conn.queue("move.describe_sector", {"status": "ok", "type": "sector.info", "data": {"sector_id": 3}})
     monkeypatch.setattr("builtins.input", lambda *_: "p")
 
     client.start_autopilot(ctx)

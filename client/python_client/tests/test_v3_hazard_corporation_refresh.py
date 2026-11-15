@@ -10,13 +10,13 @@ def test_hazard_movement_error_refreshes_corporation_context(
     ctx = ctx_factory(sector={"id": 17, "name": "Before"})
     ctx.player_info = {"player": {"id": 3, "corporation_id": 7}}
     fake_conn.queue("move.describe_sector", {
-        "status": "ok", "data": {"sector_id": 18, "name": "After"},
+        "status": "ok", "type": "sector.info", "data": {"sector_id": 18, "name": "After"},
     })
     fake_conn.queue("player.my_info", {
-        "status": "ok", "data": {"player": {"id": 3, "corporation_id": 9}},
+        "status": "ok", "type": "player.info", "data": {"player": {"id": 3, "corporation_id": 9}},
     })
     fake_conn.queue("ship.status", {
-        "status": "ok", "data": {"ship": {"id": 11, "hull": 84}},
+        "status": "ok", "type": "ship.status", "data": {"ship": {"id": 11, "hull": 84}},
     })
 
     calls = []

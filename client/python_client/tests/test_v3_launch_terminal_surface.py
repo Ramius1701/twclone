@@ -11,7 +11,7 @@ def test_terminal_launch_closes_surface_and_refreshes_all_affected_domains(
     ctx.state["current_planet_id"] = 77
     ctx.menu_stack.append("SURFACE")
     fake_conn.queue("planet.launch", {
-        "status": "refused",
+        "status": "refused", "type": "error",
         "error": {
             "message": "The ship was destroyed during launch.",
             "data": {
@@ -22,13 +22,13 @@ def test_terminal_launch_closes_surface_and_refreshes_all_affected_domains(
         },
     })
     fake_conn.queue("player.my_info", {
-        "status": "ok", "data": {"player": {"id": 3, "turns": 37}},
+        "status": "ok", "type": "player.info", "data": {"player": {"id": 3, "turns": 37}},
     })
     fake_conn.queue("ship.status", {
-        "status": "ok", "data": {"ship": {"id": 9, "hull": 0}},
+        "status": "ok", "type": "ship.status", "data": {"ship": {"id": 9, "hull": 0}},
     })
     fake_conn.queue("move.describe_sector", {
-        "status": "ok", "data": {"id": 17, "planets": [{"id": 77}]},
+        "status": "ok", "type": "sector.info", "data": {"id": 17, "planets": [{"id": 77}]},
     })
 
     client.launch_flow(ctx)

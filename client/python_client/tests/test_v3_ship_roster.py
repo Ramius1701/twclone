@@ -64,6 +64,7 @@ def test_owned_ship_inspection_disconnect_reconciles_authoritative_ship(
 
     def disconnect_during_inspection(command, data):
         if command == "ship.inspect":
+            fake_conn.calls.append({"command": command, "data": data})
             raise ConnectionError("server disconnected")
         return original_rpc(command, data)
 
@@ -101,9 +102,9 @@ def test_ship_transfer_requires_typed_matching_receipt_and_refreshes_roster(
         "status": "ok", "type": "ship.list.response",
         "data": {"ships": [{"ship_id": 9, "name": "Scout", "active": True}]},
     })
-    fake_conn.queue("player.my_info", {"status": "ok", "type": "player.info", "data": {"player_id": 11}})
-    fake_conn.queue("ship.status", {"status": "ok", "type": "ship.status", "data": {"ship": {"id": 7}}})
-    fake_conn.queue("move.describe_sector", {"status": "ok", "data": {"id": 14, "ships": []}})
+    fake_conn.queue("player.my_info", {"status": "ok", "type": "player.info", "data": {"player": {"id": 11, "ship_id": 9}}})
+    fake_conn.queue("ship.status", {"status": "ok", "type": "ship.status", "data": {"ship": {"id": 9}}})
+    fake_conn.queue("move.describe_sector", {"status": "ok", "type": "sector.info", "data": {"id": 14, "ships": []}})
     answers = iter(["7", "42", "y"])
     monkeypatch.setattr("builtins.input", lambda *_: next(answers))
 
@@ -120,7 +121,7 @@ def test_ship_transfer_requires_typed_matching_receipt_and_refreshes_roster(
     output = capsys.readouterr().out
     assert "transfer confirmed by server" in output
     assert "9: Scout" in output
-    assert ctx.player_info == {"player_id": 11}
+    assert ctx.player_info == {"player": {"id": 11, "ship_id": 9}}
     assert ctx.last_sector_desc["id"] == 14
 
 
@@ -149,7 +150,9 @@ def test_ship_transfer_rejects_mismatched_receipt_without_claiming_success(
     output = capsys.readouterr().out
     assert "was not confirmed" in output
     assert "transfer confirmed by server" not in output
-    assert [call["command"] for call in fake_conn.calls] == ["ship.list", "ship.transfer", "ship.list"]
+    assert [call["command"] for call in fake_conn.calls] == [
+        "ship.list", "ship.transfer", "ship.list", "player.my_info", "ship.status", "move.describe_sector",
+    ]
 
 
 def test_ship_transfer_rejects_receipt_from_different_authenticated_owner(
@@ -219,7 +222,7 @@ def test_ship_roster_rejects_malformed_authoritative_id(ctx_factory, fake_conn, 
 def test_ship_roster_refresh_disconnect_does_not_claim_empty_roster(ctx_factory, fake_conn, monkeypatch, capsys):
     ctx = ctx_factory()
     fake_conn.queue("ship.list", {
-        "status": "ok", "type": "ship.list.response", "data": {"ships": []},
+        "status": "ok", "type": "ship.list.response", "data": {"ships": "malformed"},
     })
     original_rpc = fake_conn.rpc
 
@@ -233,7 +236,7 @@ def test_ship_roster_refresh_disconnect_does_not_claim_empty_roster(ctx_factory,
     client.ship_list_flow(ctx)
 
     output = capsys.readouterr().out
-    assert "No authoritative ships were returned" in output
+    assert "no authoritative ship list" in output
     assert "could not be confirmed after connection loss" in output
 
 
@@ -342,7 +345,7 @@ def test_ship_roster_refresh_rejects_wrong_typed_ship_status(ctx_factory, fake_c
     ctx.hud = ctx.hud.__class__(ship_id=4)
     fake_conn.queue("ship.list", {
         "status": "ok", "type": "ship.list.response",
-        "data": {"ships": []},
+        "data": {"ships": "malformed"},
     })
     fake_conn.queue("ship.status", {
         "status": "ok", "type": "player.info",

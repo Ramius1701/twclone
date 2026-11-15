@@ -29,15 +29,15 @@ def test_successful_warp_hazard_refresh_does_not_accept_another_player(
     ctx.hud = HudState(
         sector_id=17, ship_id=9, turns_remaining=40, credits=100, hull=72
     )
-    fake_conn.queue("move.warp", {"status": "ok", "data": {"sector_id": 18}})
+    fake_conn.queue("move.warp", {"status": "ok", "type": "move.result", "data": {"sector_id": 18}})
     fake_conn.queue("move.describe_sector", {
-        "status": "ok", "data": {"sector_id": 18, "name": "After"},
+        "status": "ok", "type": "sector.info", "data": {"sector_id": 18, "name": "After"},
     })
     fake_conn.queue("player.my_info", {
-        "status": "ok", "data": {"player": {"id": 44, "turns_remaining": 1, "credits": 999}},
+        "status": "ok", "type": "player.info", "data": {"player": {"id": 44, "turns_remaining": 1, "credits": 999}},
     })
     fake_conn.queue("ship.status", {
-        "status": "ok", "data": {"ship": {"id": 9, "hull": 61}},
+        "status": "ok", "type": "ship.status", "data": {"ship": {"id": 9, "hull": 61}},
     })
 
     assert client._perform_warp(ctx, 18)
@@ -56,7 +56,7 @@ def test_launch_refusal_with_error_hazard_refreshes_all_affected_domains(
     ctx.state["on_planet"] = True
     ctx.state["current_planet_id"] = 77
     fake_conn.queue("planet.launch", {
-        "status": "refused",
+        "status": "refused", "type": "error",
         "data": {"hazards": []},
         "error": {
             "message": "Launch stopped by entry hazards.",
@@ -67,13 +67,13 @@ def test_launch_refusal_with_error_hazard_refreshes_all_affected_domains(
         },
     })
     fake_conn.queue("player.my_info", {
-        "status": "ok", "data": {"player": {"id": 3, "turns": 38}},
+        "status": "ok", "type": "player.info", "data": {"player": {"id": 3, "turns": 38}},
     })
     fake_conn.queue("ship.status", {
-        "status": "ok", "data": {"ship": {"id": 9, "hull": 88}},
+        "status": "ok", "type": "ship.status", "data": {"ship": {"id": 9, "hull": 88}},
     })
     fake_conn.queue("move.describe_sector", {
-        "status": "ok", "data": {"id": 17, "planets": [{"id": 77}]},
+        "status": "ok", "type": "sector.info", "data": {"id": 17, "planets": [{"id": 77}]},
     })
 
     client.launch_flow(ctx)
@@ -97,13 +97,13 @@ def test_successful_launch_without_ship_identity_keeps_surface_actionable_state_
     ctx.state["current_planet_id"] = 77
     ctx.menu_stack.append("SURFACE")
     fake_conn.queue("planet.launch", {
-        "status": "ok", "data": {"sector_id": 17},
+        "status": "ok", "type": "planet.launch.success", "data": {"sector_id": 17},
     })
     fake_conn.queue("player.my_info", {
-        "status": "ok", "data": {"player": {"id": 3, "turns": 38}},
+        "status": "ok", "type": "player.info", "data": {"player": {"id": 3, "turns": 38}},
     })
     fake_conn.queue("ship.status", {
-        "status": "ok", "data": {"ship": {"hull": 88}},
+        "status": "ok", "type": "ship.status", "data": {"ship": {"hull": 88}},
     })
 
     client.launch_flow(ctx)
@@ -170,13 +170,13 @@ def test_successful_launch_keeps_surface_until_sector_refresh_is_confirmed(
     ctx.hud = HudState(ship_id=9)
     ctx.menu_stack.append("SURFACE")
     fake_conn.queue("planet.launch", {
-        "status": "ok", "data": {"sector_id": 17},
+        "status": "ok", "type": "planet.launch.success", "data": {"sector_id": 17},
     })
     fake_conn.queue("player.my_info", {
-        "status": "ok", "data": {"player": {"id": 3, "turns": 38}},
+        "status": "ok", "type": "player.info", "data": {"player": {"id": 3, "turns": 38}},
     })
     fake_conn.queue("ship.status", {
-        "status": "ok", "data": {"ship": {"id": 9, "hull": 88}},
+        "status": "ok", "type": "ship.status", "data": {"ship": {"id": 9, "hull": 88}},
     })
 
     client.launch_flow(ctx)
@@ -239,7 +239,7 @@ def test_launch_refusal_refresh_disconnect_is_controlled(
             self.calls.append({"command": command, "data": data})
             if command == "planet.launch":
                 return {
-                    "status": "refused",
+                    "status": "refused", "type": "error",
                     "error": {
                         "message": "Entry hazard stopped launch.",
                         "data": {"hazards": [{"hazard_type": "minefield", "hull_lost": 7}]},
@@ -277,13 +277,13 @@ def test_launch_success_does_not_close_surface_for_a_different_authoritative_shi
     ctx.state["current_planet_id"] = 77
     ctx.menu_stack.append("SURFACE")
     fake_conn.queue("planet.launch", {
-        "status": "ok", "data": {"sector_id": 17},
+        "status": "ok", "type": "planet.launch.success", "data": {"sector_id": 17},
     })
     fake_conn.queue("player.my_info", {
-        "status": "ok", "data": {"player": {"id": 3, "turns": 38}},
+        "status": "ok", "type": "player.info", "data": {"player": {"id": 3, "turns": 38}},
     })
     fake_conn.queue("ship.status", {
-        "status": "ok", "data": {"ship": {"id": 10, "hull": 20}},
+        "status": "ok", "type": "ship.status", "data": {"ship": {"id": 10, "hull": 20}},
     })
 
     client.launch_flow(ctx)
@@ -308,13 +308,13 @@ def test_launch_success_does_not_close_surface_for_a_different_authoritative_pla
     ctx.state["current_planet_id"] = 77
     ctx.menu_stack.append("SURFACE")
     fake_conn.queue("planet.launch", {
-        "status": "ok", "data": {"sector_id": 17},
+        "status": "ok", "type": "planet.launch.success", "data": {"sector_id": 17},
     })
     fake_conn.queue("player.my_info", {
-        "status": "ok", "data": {"player": {"id": 44, "turns": 38}},
+        "status": "ok", "type": "player.info", "data": {"player": {"id": 44, "turns": 38}},
     })
     fake_conn.queue("ship.status", {
-        "status": "ok", "data": {"ship": {"id": 9, "hull": 20}},
+        "status": "ok", "type": "ship.status", "data": {"ship": {"id": 9, "hull": 20}},
     })
 
     client.launch_flow(ctx)
@@ -345,7 +345,7 @@ def test_warp_refusal_with_authoritative_hazards_refreshes_location_player_and_s
     ctx = ctx_factory(sector={"id": 17, "name": "Before"})
     monkeypatch.setattr("builtins.input", lambda *_: "44")
     fake_conn.queue("move.warp", {
-        "status": "refused",
+        "status": "refused", "type": "error",
         "error": {
             "message": "Entry hazard stopped movement.",
             "data": {
@@ -355,13 +355,13 @@ def test_warp_refusal_with_authoritative_hazards_refreshes_location_player_and_s
         },
     })
     fake_conn.queue("move.describe_sector", {
-        "status": "ok", "data": {"id": 17, "name": "Confirmed"},
+        "status": "ok", "type": "sector.info", "data": {"id": 17, "name": "Confirmed"},
     })
     fake_conn.queue("player.my_info", {
-        "status": "ok", "data": {"player": {"id": 3, "turns": 38}},
+        "status": "ok", "type": "player.info", "data": {"player": {"id": 3, "turns": 38}},
     })
     fake_conn.queue("ship.status", {
-        "status": "ok", "data": {"ship": {"ship_id": 9, "hull": 91}},
+        "status": "ok", "type": "ship.status", "data": {"ship": {"ship_id": 9, "hull": 91}},
     })
 
     client.warp_flow(ctx)
@@ -381,20 +381,20 @@ def test_transwarp_success_refreshes_authoritative_state_before_rendering_destin
     ctx = ctx_factory(sector={"id": 17, "name": "Before"})
     monkeypatch.setattr("builtins.input", lambda *_: "44")
     fake_conn.queue("move.transwarp", {
-        "status": "ok",
+        "status": "ok", "type": "move.transwarp",
         "data": {
-            "to_sector_id": 44,
+            "sector_id": 44, "status": "transwarp_complete",
             "hazards": [{"hazard_type": "minefield", "hull_lost": 12}],
         },
     })
     fake_conn.queue("move.describe_sector", {
-        "status": "ok", "data": {"id": 44, "name": "Destination"},
+        "status": "ok", "type": "sector.info", "data": {"id": 44, "name": "Destination"},
     })
     fake_conn.queue("player.my_info", {
-        "status": "ok", "data": {"player": {"id": 3, "turns": 37}},
+        "status": "ok", "type": "player.info", "data": {"player": {"id": 3, "turns": 37}},
     })
     fake_conn.queue("ship.status", {
-        "status": "ok", "data": {"ship": {"ship_id": 9, "hull": 88}},
+        "status": "ok", "type": "ship.status", "data": {"ship": {"ship_id": 9, "hull": 88}},
     })
 
     client.transwarp_flow(ctx)
@@ -427,7 +427,7 @@ def test_successful_warp_with_lost_post_hazard_refresh_fails_closed(
     ctx.conn = DisconnectingConn(fake_conn)
     monkeypatch.setattr("builtins.input", lambda *_: "44")
     fake_conn.queue("move.warp", {
-        "status": "ok", "data": {"sector_id": 44,
+        "status": "ok", "type": "move.result", "data": {"sector_id": 44,
                                   "hazards": [{"hazard_type": "minefield"}]},
     })
 
@@ -451,17 +451,17 @@ def test_hazard_refresh_does_not_merge_status_for_a_different_confirmed_ship(
     ctx.hud = ctx.hud.__class__(ship_id=9, hull=72)
     monkeypatch.setattr("builtins.input", lambda *_: "44")
     fake_conn.queue("move.warp", {
-        "status": "ok", "data": {"to_sector_id": 44,
+        "status": "ok", "type": "move.result", "data": {"to_sector_id": 44,
                                     "hazards": [{"hazard_type": "minefield", "hull_lost": 8}]},
     })
     fake_conn.queue("move.describe_sector", {
-        "status": "ok", "data": {"id": 44, "name": "Destination"},
+        "status": "ok", "type": "sector.info", "data": {"id": 44, "name": "Destination"},
     })
     fake_conn.queue("player.my_info", {
-        "status": "ok", "data": {"player": {"id": 3, "turns": 37}},
+        "status": "ok", "type": "player.info", "data": {"player": {"id": 3, "turns": 37}},
     })
     fake_conn.queue("ship.status", {
-        "status": "ok", "data": {"ship": {"id": 12, "hull": 20}},
+        "status": "ok", "type": "ship.status", "data": {"ship": {"id": 12, "hull": 20}},
     })
 
     client.warp_flow(ctx)

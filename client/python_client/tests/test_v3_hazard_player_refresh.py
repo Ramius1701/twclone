@@ -11,18 +11,18 @@ def test_successful_hazard_move_replaces_cached_player_record(
     ctx.player_info = {"player": {"id": 3, "turns_remaining": 40, "credits": 100}}
     ctx.hud = HudState(sector_id=17, ship_id=9, turns_remaining=40, credits=100)
     fake_conn.queue("move.warp", {
-        "status": "ok",
+        "status": "ok", "type": "move.result",
         "data": {"sector_id": 18, "hazards": [{"hazard_type": "minefield", "hull_lost": 4}]},
     })
     fake_conn.queue("move.describe_sector", {
-        "status": "ok", "data": {"sector_id": 18, "name": "After"},
+        "status": "ok", "type": "sector.info", "data": {"sector_id": 18, "name": "After"},
     })
     fake_conn.queue("player.my_info", {
-        "status": "ok",
+        "status": "ok", "type": "player.info",
         "data": {"player": {"id": 3, "turns_remaining": 39, "credits": 92}},
     })
     fake_conn.queue("ship.status", {
-        "status": "ok", "data": {"ship": {"id": 9, "hull": 96}},
+        "status": "ok", "type": "ship.status", "data": {"ship": {"id": 9, "hull": 96}},
     })
 
     assert client._perform_warp(ctx, 18)
@@ -41,18 +41,18 @@ def test_hazard_move_does_not_merge_anonymous_player_refresh(
     ctx.player_info = {"player": {"id": 3, "turns_remaining": 40, "credits": 100}}
     ctx.hud = HudState(sector_id=17, ship_id=9, turns_remaining=40, credits=100)
     fake_conn.queue("move.warp", {
-        "status": "ok", "data": {"sector_id": 18, "hazards": [
+        "status": "ok", "type": "move.result", "data": {"sector_id": 18, "hazards": [
             {"hazard_type": "minefield", "hull_lost": 4}
         ]},
     })
     fake_conn.queue("move.describe_sector", {
-        "status": "ok", "data": {"sector_id": 18, "name": "After"},
+        "status": "ok", "type": "sector.info", "data": {"sector_id": 18, "name": "After"},
     })
     fake_conn.queue("player.my_info", {
-        "status": "ok", "data": {"player": {"turns_remaining": 1, "credits": 999}},
+        "status": "ok", "type": "player.info", "data": {"player": {"turns_remaining": 1, "credits": 999}},
     })
     fake_conn.queue("ship.status", {
-        "status": "ok", "data": {"ship": {"id": 9, "hull": 96}},
+        "status": "ok", "type": "ship.status", "data": {"ship": {"id": 9, "hull": 96}},
     })
 
     assert client._perform_warp(ctx, 18)

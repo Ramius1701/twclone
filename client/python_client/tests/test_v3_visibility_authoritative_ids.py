@@ -10,7 +10,7 @@ def test_detailed_scan_rejects_boolean_sector_id_and_refreshes_current_sector(
 ):
     ctx = ctx_factory(sector={"id": 12, "name": "Known"})
     fake_conn.queue("sector.scan", {
-        "status": "ok",
+        "status": "ok", "type": "sector.scan",
         "data": {
             "sector_id": True,
             "name": "Untrusted payload",
@@ -18,7 +18,7 @@ def test_detailed_scan_rejects_boolean_sector_id_and_refreshes_current_sector(
         },
     })
     fake_conn.queue("move.describe_sector", {
-        "status": "ok", "data": {"id": 12, "name": "Refreshed"},
+        "status": "ok", "type": "sector.info", "data": {"id": 12, "name": "Refreshed"},
     })
 
     client.detailed_sector_scan_flow(ctx)
@@ -39,11 +39,11 @@ def test_density_scan_rejects_boolean_sector_id_and_refreshes_current_sector(
     """A malformed density row must not become a server-authoritative ID."""
     ctx = ctx_factory(sector={"id": 12, "name": "Known"})
     fake_conn.queue("sector.scan.density", {
-        "status": "ok",
+        "status": "ok", "type": "sector.density.scan",
         "data": {"sectors": [{"sector_id": True, "density": 9}]},
     })
     fake_conn.queue("move.describe_sector", {
-        "status": "ok", "data": {"id": 12, "name": "Refreshed"},
+        "status": "ok", "type": "sector.info", "data": {"id": 12, "name": "Refreshed"},
     })
 
     client.sector_density_scan_flow(ctx)
@@ -65,11 +65,11 @@ def test_density_scan_rejects_non_integer_density_value(
     """A successful envelope with an invalid measurement is not authoritative."""
     ctx = ctx_factory(sector={"id": 12, "name": "Known"})
     fake_conn.queue("sector.scan.density", {
-        "status": "ok",
+        "status": "ok", "type": "sector.density.scan",
         "data": {"sector_id": 12, "density": invalid_density},
     })
     fake_conn.queue("move.describe_sector", {
-        "status": "ok", "data": {"id": 12, "name": "Refreshed"},
+        "status": "ok", "type": "sector.info", "data": {"id": 12, "name": "Refreshed"},
     })
 
     client.sector_density_scan_flow(ctx)
@@ -87,7 +87,7 @@ def test_scan_does_not_cache_malformed_nested_object_ids(ctx_factory, fake_conn,
     """A valid scan sector ID does not make nested IDs authoritative."""
     ctx = ctx_factory(sector={"id": 12, "name": "Known", "adjacent": [13]})
     fake_conn.queue("move.scan", {
-        "status": "ok",
+        "status": "ok", "type": "sector.scan",
         "data": {
             "sector_id": 12,
             "name": "Known",
@@ -115,7 +115,7 @@ def test_scan_does_not_fallback_from_malformed_port_id_to_legacy_alias(
     """An invalid explicit port ID must not redirect to a conflicting alias."""
     ctx = ctx_factory(sector={"id": 12, "name": "Known"})
     fake_conn.queue("move.scan", {
-        "status": "ok",
+        "status": "ok", "type": "sector.scan",
         "data": {
             "sector_id": 12,
             "ports": [{"id": True, "port_id": 44, "name": "Untrusted port"}],
@@ -136,11 +136,11 @@ def test_scan_rejects_invalid_primary_sector_id_instead_of_falling_back_to_alias
     """A malformed sector_id must not be replaced by a conflicting legacy id."""
     ctx = ctx_factory(sector={"id": 12, "name": "Known"})
     fake_conn.queue("move.scan", {
-        "status": "ok",
+        "status": "ok", "type": "sector.scan",
         "data": {"sector_id": 0, "id": 99, "name": "Untrusted"},
     })
     fake_conn.queue("move.describe_sector", {
-        "status": "ok", "data": {"id": 12, "name": "Refreshed"},
+        "status": "ok", "type": "sector.info", "data": {"id": 12, "name": "Refreshed"},
     })
 
     client.scan_sector(ctx)

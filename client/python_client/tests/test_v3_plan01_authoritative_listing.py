@@ -13,7 +13,7 @@ def test_landing_prefers_authoritative_planet_id_over_legacy_alias(
         }
     )
     fake_conn.queue("planet.land", {
-        "status": "refused",
+        "status": "refused", "type": "error",
         "error": {"message": "Landing denied"},
     })
     fake_conn.queue("player.my_info", {

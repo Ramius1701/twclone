@@ -8,7 +8,7 @@ def test_detailed_scan_redacts_port_class_and_keeps_authoritative_location(
 ):
     ctx = ctx_factory(sector={"id": 12, "name": "Known"})
     fake_conn.queue("sector.scan", {
-        "status": "ok",
+        "status": "ok", "type": "sector.scan",
         "data": {
             "sector_id": 12,
             "name": "Known",

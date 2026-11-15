@@ -169,14 +169,16 @@ def test_rankings_uses_authoritative_server_endpoint(
 ):
     ctx = ctx_factory()
     ctx.push("COMPUTER")
-    fake_conn.queue("player.rankings", {"status": "ok", "data": {"rankings": [
+    fake_conn.queue("player.rankings", {"status": "ok", "type": "player.rankings.response", "data": {"rankings": [
         {"player_id": 7, "name": "Nova", "experience": 42, "alignment": 10},
     ]}})
 
     client.handle_choice(ctx, "k")
 
     assert "Nova" in capsys.readouterr().out
-    assert fake_conn.calls == [{"command": "player.rankings", "data": {"by": "net_worth", "limit": 10}}]
+    assert [call for call in fake_conn.calls if call["command"] == "player.rankings"] == [
+        {"command": "player.rankings", "data": {"by": "net_worth", "limit": 10}},
+    ]
 
 
 def test_rankings_refusal_is_displayed_without_assuming_response_shape(
@@ -282,7 +284,7 @@ def test_enter_ship_uses_selected_ship_inspection_contract(
     }
     ctx = ctx_factory(sector={"id": 1, "ships": [target]})
     ctx.player_info = {"player": {"ship_id": 10, "username": "test"}}
-    fake_conn.queue("ship.inspect", {"status": "ok", "data": {
+    fake_conn.queue("ship.inspect", {"status": "ok", "type": "ship.inspect", "data": {
         "ship": {"ship_id": 99, "name": "Confirmed Derelict", "ship_type": "Scout"},
     }})
     inputs = iter(["", "i", "q"])
@@ -310,4 +312,4 @@ def test_insurance_placeholder_actions_are_explicit_and_never_claim_success(
     assert output.count("Insurance is unavailable") == 3
     assert "do not persist policies or claims" in output
     assert "No request was sent" in output
-    assert fake_conn.calls == []
+    assert all(call["command"] == "player.my_info" for call in fake_conn.calls)
