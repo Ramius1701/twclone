@@ -20,6 +20,7 @@ The protocol defines the JSON-based message exchange between:
 *   **[08_Engine_Event_Contract.md](./08_Engine_Event_Contract.md)**: The durable DB-based contract for events (Server->Engine) and commands (Engine->Server).
 *   **[09_Command_and_Rate_Limits.md](./09_Command_and_Rate_Limits.md)**: Rate limiting headers, strategies, and command-specific limits.
 *   **[10_Serialization_Rules.md](./10_Serialization_Rules.md)**: Data types, units, formatting (numbers, dates), and localization keys.
+*   **[19_Ship_Commands.md](./19_Ship_Commands.md)**: Ship inventory, inspection, status, ownership and lifecycle commands.
 *   **[20_Player_Commands.md](./20_Player_Commands.md)**: Core player RPCs: Profile, Settings, Fines, and Session management.
 *   **[21_Sector_and_Movement_Commands.md](./21_Sector_and_Movement_Commands.md)**: Movement, Warp, Scanning, Navigation, Bookmarks, and Autopilot.
 *   **[22_Trade_and_Port_Commands.md](./22_Trade_and_Port_Commands.md)**: Port docking, buying/selling cargo, and trading logic.
@@ -31,15 +32,13 @@ The protocol defines the JSON-based message exchange between:
 *   **[28_Tavern_Noticeboard_and_Community_Systems.md](./28_Tavern_Noticeboard_and_Community_Systems.md)**: Bounties, Chat, News, and Community features.
 *   **[29_SysOp_Commands.md](./29_SysOp_Commands.md)**: SysOp v1 commands for live operations (Config, Players, Engine).
 *   **[30_Gateway_Command_Event_Bridge.md](./30_Gateway_Command_Event_Bridge.md)**: Server contract for gateway command forwarding, event delivery, and reconnect replay.
+*   **[31_Player_Feedback.md](./31_Player_Feedback.md)**: Authenticated player bug reports, suggestions, diagnostics, ownership, and queue states.
 *   **[90_Appendices.md](./90_Appendices.md)**: Additional reference material, architecture diagrams, and legacy notes.
 *   **[99_Reserved_Future_Extensions.md](./99_Reserved_Future_Extensions.md)**: Placeholders for future protocol expansions.
 
-## Legacy Documentation
+## Canonical copy
 
-The following files are considered **legacy** and superseded by this directory:
-*   `PROTOCOL.v2.md`
-*   `ENGINE.md`
-*   `EVENT_CONTRACT.md`
-*   `Intra-Stack_Protocol.md`
-
-Refer to `NAV_BOOKMARKS_AVOID.md` for meta-guidance on navigation logic (not normative protocol).
+This is the sole canonical protocol copy. Client documentation should link
+here rather than maintaining local copies. Engine event and S2S schemas are
+defined in sections 07 and 08; player command schemas are defined in sections
+19 through 31.

@@ -18,6 +18,10 @@ const FIELD_TEXT := "text"
 const TAB_CATEGORIES := ["NAVIGATION", "SECTOR", "TRADING", "COMPUTER", "COMMUNICATIONS"]
 const COMMANDS := {
 	"COMPUTER": [
+		{"label": "Report Bug / Suggest Improvement", "local_feedback": true},
+		{"label": "Report This Error", "local_feedback_error": true},
+		{"label": "Check feedback report status", "local_feedback_status": true},
+		{"label": "Log out to login screen", "local_logout": true},
 		{"label": "Help · controls and command flow", "local_help": true},
 		{"label": "Player information", "command": "player.my_info"},
 		{"label": "Ship information", "command": "ship.info"},
@@ -69,6 +73,7 @@ const COMMANDS := {
 	],
 	"OPERATIONS": [
 		{"label": "Combat status", "command": "combat.status"},
+		{"label": "Fire photon at adjacent ship", "command": "combat.fire_photon", "fields": [["sector_id", FIELD_INT, "Adjacent target sector", ""], ["target_ship_id", FIELD_INT, "Target ship ID in that sector", ""]], "mutating": true},
 		{"label": "Deploy fighters", "command": "combat.deploy_fighters", "fields": [["amount", FIELD_INT, "Number of fighters", "1"], ["offense", FIELD_INT, "Offense percentage", "50"]], "mutating": true},
 		{"label": "Deploy mines", "command": "combat.deploy_mines", "fields": [["amount", FIELD_INT, "Number of mines", "1"], ["offense", FIELD_INT, "Offense mode (1 toll, 2 defend, 3 attack)", "2"]], "mutating": true},
 		# The list schemas are empty objects; the server scopes results to the
@@ -90,15 +95,16 @@ const COMMANDS := {
 		{"label": "Bank history", "command": "bank.history"},
 		{"label": "Bank leaderboard", "command": "bank.leaderboard"},
 		{"label": "Standing orders", "command": "bank.orders.list"},
-		{"label": "Create standing order", "command": "bank.orders.create", "fields": [["recipient_id", FIELD_INT, "Recipient player ID", ""], ["amount", FIELD_INT, "Amount", ""], ["frequency", FIELD_TEXT, "Payment frequency", "daily"]], "mutating": true},
+		{"label": "Create standing order", "command": "bank.orders.create", "fields": [["recipient_player_id", FIELD_INT, "Recipient player ID", ""], ["amount", FIELD_INT, "Amount in whole credits", ""], ["frequency", FIELD_TEXT, "Frequency: daily, weekly, or monthly", "daily"], ["time_utc", FIELD_TEXT, "Execution time in UTC (HH:MM)", "12:00"], ["weekday", FIELD_INT, "ISO weekday for weekly orders (1=Monday, 7=Sunday; leave blank otherwise)", ""], ["day_of_month", FIELD_INT, "Day 1–31 for monthly orders (leave blank otherwise)", ""]], "mutating": true},
 		{"label": "Cancel standing order", "command": "bank.orders.cancel", "fields": [["order_id", FIELD_INT, "Standing order ID", ""]], "mutating": true},
 	],
 	"NEWS & RECORDS": [
 		{"label": "News feed", "command": "news.get_feed"},
 		{"label": "Mark news read", "command": "news.mark_feed_read", "mutating": true},
 		{"label": "Insurance policies · server stub", "unavailable_reason": "Insurance persistence is not available from the authoritative server handler yet; no request will be sent."},
-		{"label": "Buy insurance · server stub", "unavailable_reason": "Insurance persistence is not available from the authoritative server handler yet; no request will be sent."},
-		{"label": "File insurance claim · server stub", "unavailable_reason": "Insurance persistence is not available from the authoritative server handler yet; no request will be sent."},
+		{"label": "List hull insurance policies", "command": "insurance.policies.list", "fixed": {}},
+		{"label": "Buy hull insurance policy", "command": "insurance.policies.buy", "fixed": {"subject_type": "ship"}, "fields": [["subject_id", FIELD_INT, "Owned ship ID", ""], ["duration", FIELD_INT, "Coverage duration in seconds", ""], ["premium", FIELD_NONNEGATIVE_INT, "Premium in whole credits", "0"], ["payout", FIELD_NONNEGATIVE_INT, "Hull payout in whole credits", "0"], ["fund_id", FIELD_INT, "Insurance fund ID", ""]], "mutating": true},
+		{"label": "File server-created insurance claim", "command": "insurance.claim.file", "fields": [["claim_id", FIELD_INT, "Server-created claim ID", ""], ["event_id", FIELD_TEXT, "Destruction event ID", ""], ["amount", FIELD_NONNEGATIVE_INT, "Approved amount in whole credits", "0"]], "mutating": true},
 		{"label": "Subscriptions", "command": "subscribe.list"},
 	],
 	"CORPORATION": [
@@ -245,11 +251,9 @@ func _actions_for_category(category: String) -> Array:
 			actions.append_array(COMMANDS.get("NAVIGATION", []))
 			for action in COMMANDS.get("COMPUTER", []):
 				var label := str(action.get("label", ""))
-				if label in ["Scan adjacent sectors", "Sector density scan", "Holographic adjacent-sector scan"]:
+				if label in ["Scan adjacent sectors", "Sector density scan", "Detailed current-sector scan", "Holographic adjacent-sector scan"]:
 					var scanner: Dictionary = action.duplicate(true)
-					if label == "Sector density scan":
-						scanner["label"] = "Density scan"
-					elif label == "Scan adjacent sectors":
+					if label == "Scan adjacent sectors":
 						scanner["label"] = "Scan adjacent sectors"
 					actions.append(scanner)
 		"SECTOR":
@@ -259,10 +263,14 @@ func _actions_for_category(category: String) -> Array:
 			actions.append_array(COMMANDS.get("MARKET", []))
 			for action in COMMANDS.get("COMPUTER", []):
 				var label := str(action.get("label", ""))
-				if label in ["Trade history", "Trade routes"] or (_ferengi_offer_available and label in ["Ferengi traders and open offers", "Accept Ferengi offer", "Reject Ferengi offer"]):
+				if label in [
+					"Trade history", "Trade routes", "Shipyard catalogue",
+					"Sell current ship · unavailable", "Hardware catalogue",
+					"Buy ship hardware", "Ship equipment upgrade · unavailable",
+				] or (_ferengi_offer_available and label in ["Ferengi traders and open offers", "Accept Ferengi offer", "Reject Ferengi offer"]):
 					actions.append(action)
 			for action in COMMANDS.get("NEWS & RECORDS", []):
-				if str(action.get("label", "")).contains("Insurance"):
+				if str(action.get("label", "")).to_lower().contains("insurance"):
 					actions.append(action)
 		"COMPUTER":
 			var hidden: Array[String] = [
@@ -279,6 +287,23 @@ func _actions_for_category(category: String) -> Array:
 				if not _player_has_corporation() and label in ["Create corporation", "Join corporation"]:
 					actions.append(action)
 			actions.append_array(COMMANDS.get("TAVERN", []) if _tavern_access else [])
+		"PORT":
+			# A selected port has its own contextual category in the visible
+			# selector. Keep its server-backed workflows reachable there instead
+			# of relying on the legacy, non-visible PORT registry key.
+			var selected_port_id: Variant = _authoritative_selection_id(_selection.get("data", {}), "port_id")
+			var ship_snapshot: Variant = _snapshot.get("ship", {})
+			var ported_value: Variant = ship_snapshot.get("ported", null) if ship_snapshot is Dictionary else null
+			actions = [
+				{"label": "Dock · open port screen", "command": "port.info", "context_id": "port_id", "fixed": {}},
+				{"label": "Request commodity quote", "command": "trade.quote", "context_id": "port_id", "fields": [["commodity", FIELD_TEXT, "Commodity code or name", ""], ["quantity", FIELD_INT, "Quantity", "1"]]},
+				{"label": "Shipyard · choose eligible hull", "command": "shipyard.list", "requires_shipyard_dock": true},
+			]
+			if typeof(selected_port_id) == TYPE_INT:
+				if typeof(ported_value) == TYPE_INT and int(ported_value) == int(selected_port_id):
+					actions.append({"label": "Undock from selected port", "command": "dock.status", "fixed": {"action": "undock"}, "mutating": true})
+				else:
+					actions.append({"label": "Dock at selected port", "command": "dock.status", "fixed": {"action": "dock"}, "mutating": true})
 		"CORPORATION":
 			if _player_has_corporation():
 				actions.append_array(COMMANDS.get("CORPORATION", []))
@@ -298,6 +323,27 @@ var _pinned_actions: Array[Dictionary] = []
 var _key_bindings: Dictionary = {}
 var _awaiting_binding_command := ""
 var _owned_ship_ids: Dictionary = {}
+var _confirmed_port_context: Dictionary = {}
+
+func set_confirmed_port_context(port_payload: Dictionary, sector_id: int) -> void:
+	var port: Variant = port_payload.get("port", port_payload)
+	if not port is Dictionary:
+		_confirmed_port_context.clear()
+		return
+	var port_id: Variant = port.get("id", port.get("port_id", null))
+	var port_sector: Variant = port.get("sector", sector_id)
+	var port_type: Variant = port.get("type", null)
+	if (typeof(port_id) != TYPE_INT or int(port_id) <= 0
+			or typeof(port_type) != TYPE_INT
+			or typeof(port_sector) != TYPE_INT or int(port_sector) != sector_id):
+		_confirmed_port_context.clear()
+		return
+	_confirmed_port_context = {"port_id": int(port_id), "sector_id": sector_id, "type": int(port_type)}
+	_render_actions()
+
+func clear_confirmed_port_context() -> void:
+	_confirmed_port_context.clear()
+	_render_actions()
 
 func set_owned_ship_roster(data: Dictionary) -> void:
 	# Remember only IDs from the latest validated ship.list.response.
@@ -507,7 +553,9 @@ func update_snapshot(snapshot: Dictionary) -> void:
 
 func set_tavern_access(available: bool) -> void:
 	_tavern_access = available
-	if not available and _active_category == "TAVERN":
+	if available:
+		_active_category = "TAVERN"
+	elif _active_category == "TAVERN":
 		_active_category = "COMPUTER"
 	(get_meta("context_label") as Label).text = _context_description()
 	_rebuild_categories()
@@ -852,7 +900,7 @@ func _scan_count(data: Dictionary, counts: Dictionary, key: String, aliases: Arr
 		var value = counts.get(field, data.get(field, null))
 		# Scan measurements are authoritative JSON integers. Do not coerce
 		# booleans, strings, or floating-point values into displayable counts.
-		if _is_integral_number(value) and int(value) >= 0:
+		if typeof(value) == TYPE_INT and int(value) >= 0:
 			return str(int(value))
 	return "unknown"
 
@@ -869,7 +917,7 @@ func _scan_list(value: Variant) -> String:
 		# Adjacent-sector identifiers are server-owned JSON integers. Ignore
 		# malformed rows rather than turning arbitrary payload text into a
 		# seemingly actionable location.
-		if _is_integral_number(sector_id) and int(sector_id) > 0:
+		if typeof(sector_id) == TYPE_INT and int(sector_id) > 0:
 			values.append(str(int(sector_id)))
 	if values.is_empty():
 		return "unknown"
@@ -924,13 +972,13 @@ func _format_density_result(payload: Dictionary) -> String:
 	return "\n".join(rows)
 
 func _authoritative_density_id(value: Variant) -> bool:
-	return _is_integral_number(value) and int(value) > 0
+	return typeof(value) == TYPE_INT and int(value) > 0
 
 func _is_integral_number(value: Variant) -> bool:
 	return (typeof(value) == TYPE_INT and int(value) >= 0) or (typeof(value) == TYPE_FLOAT and is_finite(value) and value >= 0.0 and value == floor(value))
 
 func _authoritative_positive_id(value: Variant) -> int:
-	return int(value) if _is_integral_number(value) and int(value) > 0 else 0
+	return int(value) if typeof(value) == TYPE_INT and int(value) > 0 else 0
 
 func _format_visibility_refusal(payload: Dictionary, operation: String) -> String:
 	var error: Variant = payload.get("error", {})
@@ -942,7 +990,7 @@ func _format_visibility_refusal(payload: Dictionary, operation: String) -> Strin
 	return "%s refused: %s" % [operation, message]
 
 func _authoritative_density_value(value: Variant) -> bool:
-	return _is_integral_number(value)
+	return typeof(value) == TYPE_INT and int(value) >= 0
 
 func _sector_identifier(value: Variant) -> String:
 	if value is float and is_finite(value) and value == floor(value):
@@ -998,7 +1046,45 @@ func show_shipyard(data: Dictionary, current_ship_name: String = "") -> void:
 			button.disabled = not eligible or not hull.has("type_id")
 			button.pressed.connect(_choose_shipyard_hull.bind(int(hull.get("type_id", 0)), current_ship_name))
 			_shipyard_rows.add_child(button)
+	var used_available: Variant = data.get("used_available", [])
+	var used_header := Label.new()
+	used_header.text = "USED HULLS · existing identity and installed equipment are retained"
+	used_header.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_shipyard_rows.add_child(used_header)
+	if used_available is Array and not used_available.is_empty():
+		for used in used_available:
+			if not (used is Dictionary):
+				continue
+			var inventory_id: Variant = used.get("used_inventory_id", null)
+			var used_ship_id: Variant = used.get("ship_id", null)
+			var used_price: Variant = used.get("price", null)
+			var valid := typeof(inventory_id) == TYPE_INT and int(inventory_id) > 0 and typeof(used_ship_id) == TYPE_INT and int(used_ship_id) > 0 and typeof(used_price) == TYPE_INT and int(used_price) >= 0
+			var used_button := Button.new()
+			used_button.text = "%s [%s] · ship %s · %s CR · hull %s + equipment %s" % [str(used.get("name", "Used hull")), str(used.get("ship_type", "Unknown")), str(used_ship_id), str(used_price), str(used.get("hull_value", "?")), str(used.get("installed_equipment_value", "?"))]
+			used_button.alignment = HORIZONTAL_ALIGNMENT_LEFT
+			used_button.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+			used_button.disabled = not valid
+			used_button.tooltip_text = "The server will recalculate the price and recheck the listing before purchase." if valid else "This listing omitted authoritative purchase identifiers or price."
+			if valid:
+				used_button.pressed.connect(_choose_used_ship.bind(int(inventory_id), int(used_ship_id), int(used_price), str(used.get("name", "Used hull"))))
+			_shipyard_rows.add_child(used_button)
+	else:
+		var no_used := Label.new()
+		no_used.text = "No used hulls are listed at this facility."
+		_shipyard_rows.add_child(no_used)
 	DialogLayout.popup(_shipyard_dialog, Vector2i(580, 450))
+
+func _choose_used_ship(inventory_id: int, ship_id: int, price: int, ship_name: String) -> void:
+	if inventory_id <= 0 or ship_id <= 0 or price < 0:
+		return
+	_shipyard_dialog.hide()
+	_choose_action({
+		"label": "Buy used %s · ship %d · %d CR" % [ship_name, ship_id, price],
+		"command": "shipyard.upgrade",
+		"fixed": {"used_inventory_id": inventory_id},
+		"mutating": true,
+		"form_notice": "The server rechecks the listing and price. The existing ship ID, condition, and equipment are retained.",
+	})
 
 func show_hardware_catalogue(data: Dictionary) -> void:
 	_shipyard_dialog.title = "Hardware catalogue · server-authoritative"
@@ -1135,6 +1221,8 @@ func _categories() -> Array[String]:
 			result.append(kind.to_upper())
 	for category in TAB_CATEGORIES:
 		result.append(category)
+	if _tavern_access:
+		result.append("TAVERN")
 	if _player_has_corporation():
 		result.append("CORPORATION")
 	return result
@@ -1190,7 +1278,7 @@ func open_settings_category() -> void:
 
 func invoke_local_action(label: String) -> bool:
 	# Used by the gear menu for actions that do not belong in a gameplay tab.
-	for group_name in ["SETTINGS & NOTES", "SESSION"]:
+	for group_name in ["SETTINGS & NOTES", "SESSION", "HELP"]:
 		for action in COMMANDS.get(group_name, []):
 			if str(action.get("label", "")) == label:
 				_choose_action(action)
@@ -1202,24 +1290,31 @@ func _render_actions() -> void:
 		child.queue_free()
 	var actions: Array = []
 	if _active_category == "PLANET":
-		actions = [{"label": "Planet information", "command": "planet.info", "context_id": "planet_id"}]
+		actions = [
+			{"label": "Public planet overview", "command": "planet.view", "context_id": "planet_id"},
+			{"label": "Planet information", "command": "planet.info", "context_id": "planet_id"}
+		]
 		var ship_state: Dictionary = _snapshot.get("ship", {})
-		var landed_planet_id: Variant = ship_state.get("onplanet", null)
-		# `onplanet` is a server-owned planet ID. Do not coerce booleans or
-		# floating-point metadata into an actionable launch/surface workflow.
+		var landed_state: Variant = ship_state.get("onplanet", null)
+		var player_state: Dictionary = _snapshot.get("player", {})
+		var landed_planet_id: Variant = player_state.get("last_planet_id", null)
+		# The published V3 ship schema encodes onplanet as 0/1. Player identity
+		# supplies the last planet ID; neither field alone authorizes surface use.
 		var selected_planet_id: Variant = _authoritative_selection_id(_selection.get("data", {}), "planet_id")
-		var selected_is_landed_planet := selected_planet_id != null and typeof(landed_planet_id) == TYPE_INT and int(landed_planet_id) > 0 and int(selected_planet_id) == int(landed_planet_id)
+		var active_ship_matches := typeof(player_state.get("ship_id", null)) == TYPE_INT and typeof(ship_state.get("id", null)) == TYPE_INT and int(player_state.get("ship_id", 0)) > 0 and int(player_state.get("ship_id", 0)) == int(ship_state.get("id", 0))
+		var is_landed := typeof(landed_state) == TYPE_INT and int(landed_state) == 1 and active_ship_matches
+		var selected_is_landed_planet := selected_planet_id != null and is_landed and typeof(landed_planet_id) == TYPE_INT and int(landed_planet_id) > 0 and int(selected_planet_id) == int(landed_planet_id)
 		if selected_is_landed_planet:
 			actions.append({"label": "Launch from planet", "command": "planet.launch", "fixed": {}, "mutating": true})
 			actions.append({"label": "Planet colonist status", "command": "planet.colonists.get", "context_id": "planet_id"})
 			actions.append({"label": "Allocate planet colonists", "command": "planet.colonists.allocate", "context_id": "planet_id", "fields": [["ore", FIELD_INT, "Ore colonists", "0"], ["organics", FIELD_INT, "Organics colonists", "0"], ["equipment", FIELD_INT, "Equipment colonists", "0"]], "mutating": true})
-			# The server exposes a harvest schema, but the handler is currently
-			# unavailable and V3 has no pinned harvest semantics. Keep the
-			# capability visible without fabricating a request or local formula.
-			actions.append({"label": "Harvest planet production · unavailable", "command": "planet.harvest", "context_id": "planet_id", "unavailable_reason": "Planet harvest is unavailable until the authoritative server implementation and V3 policy are released."})
+			actions.append({"label": "Harvest planet production", "command": "planet.harvest", "context_id": "planet_id", "mutating": true})
+			actions.append({"label": "Emancipate planet slaves", "command": "planet.emancipate", "context_id": "planet_id", "mutating": true})
+			actions.append({"label": "Sell planet surplus to Exchange", "command": "planet.market.sell", "context_id": "planet_id", "fields": [["commodity", FIELD_TEXT, "Commodity (ORE, ORG, EQU)", "ORE"], ["quantity", FIELD_INT, "Quantity", "1"]], "mutating": true})
+			actions.append({"label": "Construct StarPort", "command": "planet.port.construct", "context_id": "planet_id", "fields": [["port_class", FIELD_INT, "Trading class (1–8)", "1"]], "mutating": true, "idempotency": true, "tooltip": "Choose the port's fixed V3 trading class. Construction consumes planetary materials and the server delivers materials on its schedule."})
 			actions.append({"label": "Build planet citadel", "command": "citadel.build", "context_id": "planet_id", "mutating": true})
 			actions.append({"label": "Upgrade planet citadel", "command": "citadel.upgrade", "context_id": "planet_id", "mutating": true})
-		elif typeof(landed_planet_id) == TYPE_INT and int(landed_planet_id) > 0:
+		elif is_landed:
 			# A ship can only use surface commands for the exact server-confirmed
 			# planet it occupies.  Keep the selected planet's read action visible,
 			# but fail closed for launch/colonist/citadel operations instead of
@@ -1231,17 +1326,30 @@ func _render_actions() -> void:
 		# Selection metadata is server-owned JSON.  Do not coerce booleans or
 		# floating-point values into an ID while deciding whether an action is
 		# restricted; dispatch uses the same fail-closed identity validation.
-		var attack_action := {"label": "Attack this planet", "command": "combat.attack_planet", "context_id": "planet_id", "mutating": true}
+		var attack_action := {
+			"label": "Attack this planet", "command": "combat.attack_planet",
+			"context_id": "planet_id", "mutating": true,
+			"form_notice": "Choose whether to enslave colonists on successful capture. The server enforces alignment and population rules.",
+			"fields": [["enslave_colonists", "boolean", "Enslave colonists on successful capture", "false"]],
+		}
 		actions.append(attack_action)
 		var selected_metadata: Dictionary = _selection.get("data", {})
 		if selected_metadata.has("planet_id") and _authoritative_selection_id(selected_metadata, "planet_id") == null:
 			_add_unavailable("Selected planet has no valid planet ID; server actions are unavailable.")
 	elif _active_category == "PORT":
+		var selected_port_id: Variant = _authoritative_selection_id(_selection.get("data", {}), "port_id")
+		var ship_snapshot: Variant = _snapshot.get("ship", {})
+		var ported_value: Variant = ship_snapshot.get("ported", null) if ship_snapshot is Dictionary else null
 		actions = [
 			{"label": "Dock · open port screen", "command": "port.info", "context_id": "port_id", "fixed": {}},
 			{"label": "Request commodity quote", "command": "trade.quote", "context_id": "port_id", "fields": [["commodity", FIELD_TEXT, "Commodity code or name", ""], ["quantity", FIELD_INT, "Quantity", "1"]]},
 			{"label": "Shipyard · choose eligible hull", "command": "shipyard.list", "requires_shipyard_dock": true},
 		]
+		if typeof(selected_port_id) == TYPE_INT:
+			if typeof(ported_value) == TYPE_INT and int(ported_value) == int(selected_port_id):
+				actions.append({"label": "Undock from selected port", "command": "dock.status", "fixed": {"action": "undock"}, "mutating": true})
+			else:
+				actions.append({"label": "Dock at selected port", "command": "dock.status", "fixed": {"action": "dock"}, "mutating": true})
 	elif _active_category == "SHIP":
 		var ship_data: Dictionary = _selection.get("data", {})
 		# Keep the command rail fail-closed until the selected object carries a
@@ -1336,6 +1444,10 @@ func _is_docked_at_shipyard() -> bool:
 	var docked_port_id := int(ship.get("ported", 0))
 	if docked_port_id <= 0:
 		return false
+	var current_sector_id := int(_snapshot.get("hud", {}).get("sector_id", 0))
+	if (int(_confirmed_port_context.get("port_id", 0)) == docked_port_id
+			and int(_confirmed_port_context.get("sector_id", 0)) == current_sector_id):
+		return int(_confirmed_port_context.get("type", -1)) in [9, 10]
 	var sector: Dictionary = _snapshot.get("sector", {})
 	for port in sector.get("ports", []):
 		if not (port is Dictionary):
@@ -1351,6 +1463,10 @@ func _is_docked_at_supported_hardware() -> bool:
 	var docked_port_id := int(ship.get("ported", 0))
 	if docked_port_id <= 0:
 		return false
+	var current_sector_id := int(_snapshot.get("hud", {}).get("sector_id", 0))
+	if (int(_confirmed_port_context.get("port_id", 0)) == docked_port_id
+			and int(_confirmed_port_context.get("sector_id", 0)) == current_sector_id):
+		return int(_confirmed_port_context.get("type", -1)) in [9, 10]
 	var sector: Dictionary = _snapshot.get("sector", {})
 	for port in sector.get("ports", []):
 		if port is Dictionary and int(port.get("id", port.get("port_id", 0))) == docked_port_id:
@@ -1493,6 +1609,15 @@ func _authoritative_selection_id(source: Dictionary, preferred_key: String = "")
 	return selected_id if selected_id > 0 else null
 
 func _choose_action(action: Dictionary) -> void:
+	if bool(action.get("local_feedback", false)):
+		command_requested.emit("feedback.open", {}, str(action.get("label", "Report Bug / Suggest Improvement")), false)
+		return
+	if bool(action.get("local_feedback_status", false)):
+		command_requested.emit("feedback.status.open", {}, str(action.get("label", "Check feedback report status")), false)
+		return
+	if bool(action.get("local_feedback_error", false)):
+		command_requested.emit("feedback.error.open", {}, str(action.get("label", "Report This Error")), false)
+		return
 	if bool(action.get("local_reduced_motion", false)):
 		reduced_motion_toggle_requested.emit()
 		return
@@ -1558,7 +1683,7 @@ func _choose_action(action: Dictionary) -> void:
 			command_requested.emit(str(action["command"]), data, str(action["label"]), true)
 			return
 		if action.get("mutating", false):
-			_form_action = action
+			_form_action = action.duplicate(true)
 			_form_fields.clear()
 			_form_dialog.dialog_text = "Send %s? The server remains authoritative." % str(action.get("label", "this command"))
 			_form_dialog.get_label().visible = true
@@ -1570,7 +1695,7 @@ func _choose_action(action: Dictionary) -> void:
 		return
 	if bool(action.get("idempotency", false)):
 		data["idempotency_key"] = str(Time.get_ticks_usec())
-	_form_action = action
+	_form_action = action.duplicate(true)
 	_form_fields.clear()
 	for child in _inline_form_content.get_children():
 		child.queue_free()
@@ -1639,6 +1764,7 @@ func _confirm_logout() -> void:
 func _submit_form() -> void:
 	var data: Dictionary = get_meta("pending_data", {}).duplicate(true)
 	var password_values: Dictionary = {}
+	var bank_order_form := str(_form_action.get("command", "")) == "bank.orders.create"
 	for key in _form_fields:
 		var control: Control = _form_fields[key]
 		if control is CheckBox:
@@ -1648,6 +1774,8 @@ func _submit_form() -> void:
 			if str(_field_type(key)) != "password":
 				text = text.strip_edges()
 			if text.is_empty():
+				if bank_order_form and key in ["weekday", "day_of_month"]:
+					continue
 				_add_unavailable("Every visible field must be completed before sending.")
 				return
 			if str(_field_type(key)) in [FIELD_INT, FIELD_NONNEGATIVE_INT]:
@@ -1660,6 +1788,24 @@ func _submit_form() -> void:
 				data[key] = text
 				if str(_field_type(key)) == "password":
 					password_values[key] = text
+	if bank_order_form:
+		var frequency := str(data.get("frequency", "")).to_lower()
+		if frequency not in ["daily", "weekly", "monthly"]:
+			_add_unavailable("Choose daily, weekly, or monthly for a standing order.")
+			return
+		if frequency == "weekly":
+			if not data.has("weekday") or int(data["weekday"]) < 1 or int(data["weekday"]) > 7:
+				_add_unavailable("Weekly orders require an ISO weekday from 1 (Monday) through 7 (Sunday).")
+				return
+			data.erase("day_of_month")
+		elif frequency == "monthly":
+			if not data.has("day_of_month") or int(data["day_of_month"]) < 1 or int(data["day_of_month"]) > 31:
+				_add_unavailable("Monthly orders require a day of month from 1 through 31.")
+				return
+			data.erase("weekday")
+		else:
+			data.erase("weekday")
+			data.erase("day_of_month")
 	if str(_form_action.get("command", "")) == "auth.change_password":
 		if password_values.get("new_password", "") != password_values.get("confirm_password", ""):
 			_add_unavailable("Password change cancelled: the new passwords do not match.")

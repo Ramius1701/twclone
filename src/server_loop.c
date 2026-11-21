@@ -37,6 +37,7 @@
 #include "server_ships.h"
 #include "common.h"
 #include "server_envelope.h"
+#include "server_feedback.h"
 #include "server_players.h"
 #include "server_ports.h"
 #include "server_auth.h"
@@ -109,6 +110,8 @@ extern int cmd_insurance_claim_file (client_ctx_t * ctx, json_t * root);
 extern int cmd_player_get_topics (client_ctx_t * ctx, json_t * root);
 extern int cmd_player_set_topics (client_ctx_t * ctx, json_t * root);
 extern int cmd_sys_cron_planet_tick_once (client_ctx_t * ctx, json_t * root);
+extern int cmd_sys_cron_npc_step_once (client_ctx_t * ctx, json_t * root);
+extern int cmd_sys_cron_advance_to (client_ctx_t *ctx, json_t *root);
 extern int cmd_equity_dividend_set (client_ctx_t * ctx, json_t * root);
 extern int cmd_trade_accept (client_ctx_t * ctx, json_t * root);
 extern int cmd_trade_cancel (client_ctx_t * ctx, json_t * root);
@@ -417,6 +420,10 @@ static const command_entry_t k_command_registry[] = {
   {"fine.list", cmd_fine_list, "List player outstanding fines",
    schema_fine_list, 0, false, NULL},
   {"fine.pay", cmd_fine_pay, "Pay an outstanding fine", schema_fine_pay, 0, false, NULL},
+  {"feedback.diagnostics", cmd_feedback_diagnostics, "Get sanitised report diagnostics", schema_placeholder, 0, false, NULL},
+  {"feedback.preview", cmd_feedback_preview, "Preview sanitised feedback publication", schema_placeholder, 0, false, NULL},
+  {"feedback.status", cmd_feedback_status, "Get player feedback status", schema_placeholder, 0, false, NULL},
+  {"feedback.submit", cmd_feedback_submit, "Submit a bug report or suggestion", schema_placeholder, 0, false, NULL},
   {"insurance.policies.list", cmd_insurance_policies_list,
    "List player insurance policies", schema_insurance_policies_list, 0, false, NULL},
   {"insurance.policies.buy", cmd_insurance_policies_buy,
@@ -433,6 +440,9 @@ static const command_entry_t k_command_registry[] = {
    schema_citadel_upgrade, 0, false, NULL},
   {"combat.attack", cmd_combat_attack, "Attack a target",
    schema_combat_attack, 0, false, NULL},
+  {"combat.fire_photon", cmd_combat_fire_photon,
+   "Fire a photon missile into an adjacent sector",
+   schema_combat_fire_photon, 0, false, NULL},
   {"combat.attack_planet", cmd_combat_attack_planet, "Attack a planet",
    schema_combat_attack_planet, 0, false, NULL},
   {"combat.deploy_fighters", cmd_combat_deploy_fighters, "Deploy fighters",
@@ -551,6 +561,9 @@ static const command_entry_t k_command_registry[] = {
    "Create a genesis planet", schema_planet_genesis_create, 0, false, NULL},
   {"planet.harvest", cmd_planet_harvest, "Harvest from a planet",
    schema_planet_harvest, 0, false, NULL},
+  {"planet.port.construct", cmd_planet_port_construct,
+   "Start StarPort construction using planetary materials",
+   schema_planet_port_construct, 0, false, NULL},
   {"planet.trade.port", cmd_planet_trade_port,
    "Bulk-sell planetary commodities to a local port",
    schema_planet_trade_port, 0, false, NULL},
@@ -651,6 +664,8 @@ static const command_entry_t k_command_registry[] = {
   {"port.info", cmd_trade_port_info, "Port prices/stock in sector",
    schema_port_info, 0, false, NULL},
   {"port.rob", cmd_port_rob, "Attempt to rob a port", schema_port_rob, 0, false, NULL},
+  {"port.upgrade", cmd_port_upgrade, "Upgrade port commodity capacity", schema_port_upgrade, 0, false, NULL},
+  {"combat.attack.port", cmd_combat_attack_port, "Attack a StarPort", schema_combat_attack_port, 0, false, NULL},
   {"port.status", cmd_trade_port_info, "Port status", schema_port_status, 0, false, NULL},
   {"s2s.event.relay", cmd_s2s_event_relay, "S2S event relay",
    schema_placeholder, CMD_FLAG_HIDDEN, false, NULL},
@@ -700,6 +715,15 @@ static const command_entry_t k_command_registry[] = {
    schema_placeholder, CMD_FLAG_HIDDEN, false, NULL},
   {"sys.cron.planet_tick_once", cmd_sys_cron_planet_tick_once,
    "Trigger planet cron tasks", NULL, 0, false, NULL},
+  {"sys.cron.npc_step_once", cmd_sys_cron_npc_step_once,
+   "Trigger one authoritative NPC scheduler step", NULL, CMD_FLAG_HIDDEN,
+   false, NULL},
+  {"sys.cron.slave_unrest_once", cmd_sys_cron_slave_unrest_once,
+   "Trigger one authoritative slave unrest scheduler step", NULL,
+   CMD_FLAG_HIDDEN, false, NULL},
+  {"sys.cron.advance_to", cmd_sys_cron_advance_to,
+   "Advance real due scheduler handlers to an isolated QA epoch", NULL,
+   CMD_FLAG_HIDDEN, false, NULL},
   {"sys.cron.citadel_reap_once", cmd_sys_cron_citadel_reap_once,
    "Trigger citadel construction reaper", NULL, 0, false, NULL},
   {"sys.raw_sql_exec", cmd_sys_raw_sql_exec,

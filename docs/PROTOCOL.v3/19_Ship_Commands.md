@@ -148,6 +148,8 @@ With no arguments, list hulls available at the shipyard where the player is
 docked. The `shipyard.list_v1` response includes `sector_id`, `is_shipyard`,
 `current_ship` (`type`, `base_price`, `trade_in_value`), and an `available`
 array with each hull's prices, eligibility, and any restriction reasons.
+Each available hull includes its integer `type_id`, which is the value to send
+as `new_type_id` when purchasing or upgrading to that hull.
 It also includes `used_available`, a list of persistent used hulls at the
 facility. Entries identify `used_inventory_id`, the original `ship_id`, name,
 type, original hull value, retained-equipment value and current resale price.
@@ -158,6 +160,10 @@ Upgrade the active ship while docked at a shipyard. Args:
 `{ "new_type_id": 2, "new_ship_name": "Merchant Vessel" }`.
 On success, `shipyard.upgraded_v1` acknowledges `ship_id`, `new_type_id`,
 `new_ship_name`, and `credits_spent`. Failures retain the existing error codes.
+The active hold capacity after an upgrade is at least the new hull's
+`shiptypes.initialholds`; previously installed capacity is retained when it is
+higher and the new hull's `maxholds` eligibility check still applies. This
+allows an escape pod with zero holds to recover into a usable replacement hull.
 The same command also accepts `{ "used_inventory_id": 17 }` to purchase a
 listed used hull. Price is
 `floor((original_hull_value + retained_equipment_value) * factor_bp / 10000)`;

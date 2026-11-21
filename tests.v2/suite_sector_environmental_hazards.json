@@ -57,15 +57,15 @@
       "name": "Position and repair test ship",
       "command": "sys.raw_sql_exec",
       "user": "admin",
-      "data": { "sql": "UPDATE ships SET sector_id = 1, hull = 100, shields = 100, fighters = 20 WHERE ship_id = (SELECT ship_id FROM players WHERE name = 'hazard_victim')" },
+      "data": { "sql": "UPDATE ships SET sector_id = 1, type_id = 1, holds = 20, hull = 100, shields = 100, fighters = 20, ore = 0, organics = 0, equipment = 0, slaves = 0, weapons = 0, drugs = 0, colonists = 0 WHERE ship_id = (SELECT ship_id FROM players WHERE name = 'hazard_victim')" },
       "expect": { "status": "ok" }
     },
     {
       "name": "Capture shield level before entry",
-      "command": "combat.status",
+      "command": "ship.status",
       "user": "hazard_victim",
       "expect": { "status": "ok" },
-      "save": { "shields_before": "data.shields" }
+      "save": { "shields_before": "data.ship.shields" }
     },
     {
       "name": "Warp into multi-hazard sector",
@@ -89,11 +89,11 @@
     },
     {
       "name": "Environmental damage persisted",
-      "command": "combat.status",
+      "command": "ship.status",
       "user": "hazard_victim",
       "expect": { "status": "ok" },
       "asserts": [
-        { "path": "data.shields", "op": "<", "value": "@shields_before" }
+        { "path": "data.ship.shields", "op": "<", "value": "@shields_before" }
       ]
     },
     {
@@ -104,10 +104,31 @@
       "expect": { "status": "ok" }
     },
     {
+      "name": "Clear prior normalized cargo before transwarp fixture",
+      "command": "sys.raw_sql_exec",
+      "user": "admin",
+      "data": { "sql": "DELETE FROM ship_cargo WHERE ship_id = (SELECT ship_id FROM players WHERE name = 'hazard_victim')" },
+      "expect": { "status": "ok" }
+    },
+    {
       "name": "Enable transwarp and restore defenses",
       "command": "sys.raw_sql_exec",
       "user": "admin",
-      "data": { "sql": "UPDATE ships SET sector_id = 1, hull = 100, shields = 100, fighters = 20, has_transwarp = TRUE WHERE ship_id = (SELECT ship_id FROM players WHERE name = 'hazard_victim')" },
+      "data": { "sql": "UPDATE ships SET sector_id = 1, type_id = 1, holds = 20, hull = 100, shields = 100, fighters = 20, has_transwarp = TRUE WHERE ship_id = (SELECT ship_id FROM players WHERE name = 'hazard_victim')" },
+      "expect": { "status": "ok" }
+    },
+    {
+      "name": "Provide a friendly destination fighter for transwarp homing",
+      "command": "sys.raw_sql_exec",
+      "user": "admin",
+      "data": { "sql": "INSERT INTO sector_assets (sector_id, owner_id, corporation_id, asset_type, quantity, offensive_setting, ttl) SELECT @{hazard_sector_id}, player_id, 0, 2, 1, 2, 0 FROM players WHERE name='hazard_victim';" },
+      "expect": { "status": "ok" }
+    },
+    {
+      "name": "Seed authoritative Fuel Ore for transwarp",
+      "command": "sys.raw_sql_exec",
+      "user": "admin",
+      "data": { "sql": "INSERT INTO ship_cargo (ship_id, commodity_code, quantity) SELECT ship_id, 'ORE', 3 FROM players WHERE name='hazard_victim' ON CONFLICT (ship_id, commodity_code) DO UPDATE SET quantity=3;" },
       "expect": { "status": "ok" }
     },
     {

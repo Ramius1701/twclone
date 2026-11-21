@@ -11,6 +11,7 @@
 
 // local includes
 #include "server_cron.h"
+#include "server_engine.h"
 #include "server_log.h"
 #include "common.h"
 #include "server_players.h"
@@ -19,6 +20,7 @@
 #include "server_planets.h"
 #include "repo_citadel.h"
 #include "game_db.h"
+#include "db/repo/repo_engine.h"
 #include "server_config.h"
 #include "repo_market.h"	// For market order helpers
 #include "repo_cmd.h"		// For bank helpers
@@ -1070,11 +1072,13 @@ h_planet_growth (db_t *db, int64_t now_s)
 
     // --- NEW: Update commodity quantities in entity_stock based on planet_production ---
 
-    if (db_cron_planet_update_production_stock (db, now_s) != 0)
+    int production_rc = db_cron_planet_update_production_stock (db, now_s);
+    if (production_rc != 0)
 
       {
 
-        LOGE ("planet_growth (commodities exec) failed");
+        LOGE ("planet_growth (commodities exec) failed with code %d",
+              production_rc);
 
         // Continue or return? Original returned rc.
 
@@ -1299,8 +1303,11 @@ h_traps_process (db_t *db, int64_t now_s)
 int
 h_npc_step (db_t *db, int64_t now_s)
 {
-  (void) now_s;
-  int64_t now_ms = (int64_t) monotonic_millis ();
+  /* Cron passes the scheduler's authoritative time.  Keeping the epoch in
+   * milliseconds lets NPC actions participate in deterministic QA advances;
+   * the live scheduler still passes current wall-clock time. */
+  int64_t now_ms = now_s > 0 && now_s <= INT64_MAX / 1000
+    ? now_s * 1000 : 0;
 
 
   if (iss_init_once () == 1)
@@ -1361,6 +1368,38 @@ cmd_sys_cron_planet_tick_once (client_ctx_t *ctx, json_t *root)
 
   send_response_ok_take (ctx, root, "sys.cron.planet_tick_once.success",
 			 NULL);
+  return 0;
+}
+
+int
+cmd_sys_cron_npc_step_once (client_ctx_t *ctx, json_t *root)
+{
+  if (ctx->player_id <= 0 ||
+      auth_player_get_type (ctx->player_id) != PLAYER_TYPE_SYSOP)
+    {
+      send_response_refused_steal (ctx, root, ERR_PERMISSION_DENIED,
+                                   "Permission denied", NULL);
+      return 0;
+    }
+
+  db_t *db = game_db_get_handle ();
+  if (!db)
+    {
+      send_response_error (ctx, root, ERR_SERVER_ERROR,
+                           "Database unavailable");
+      return 0;
+    }
+
+  /* Acceptance/operations counterpart to the scheduled `npc_step` handler.
+   * It executes the same authoritative handler and leaves due-time policy to
+   * cron_tasks; it is restricted to SysOps like the existing planet tick. */
+  if (h_npc_step (db, (int64_t) time (NULL)) != 0)
+    {
+      send_response_error (ctx, root, ERR_SERVER_ERROR,
+                           "NPC cron step failed.");
+      return 0;
+    }
+  send_response_ok_take (ctx, root, "sys.cron.npc_step_once.success", NULL);
   return 0;
 }
 
@@ -2114,11 +2153,102 @@ h_daily_slave_unrest (db_t *db, int64_t now_s)
   int rc = db_cron_apply_slave_unrest (
     db, now_s, g_cfg.planet_slave_unrest_interval_days,
     g_cfg.planet_slave_unrest_stoppage_cycles,
-    g_cfg.planet_slave_unrest_population_loss);
+    g_cfg.planet_slave_unrest_population_loss_percent);
   if (rc != 0)
     LOGE ("daily_slave_unrest: evaluation failed: %d", rc);
   unlock (db, "daily_slave_unrest");
   return rc;
+}
+
+int
+cmd_sys_cron_slave_unrest_once (client_ctx_t *ctx, json_t *root)
+{
+  if (!ctx || ctx->player_id <= 0
+      || auth_player_get_type (ctx->player_id) != PLAYER_TYPE_SYSOP)
+    {
+      send_response_refused_steal (ctx, root, ERR_PERMISSION_DENIED,
+                                   "Permission denied", NULL);
+      return 0;
+    }
+  db_t *db = game_db_get_handle ();
+  if (!db)
+    {
+      send_response_error (ctx, root, ERR_SERVER_ERROR,
+                           "Database unavailable");
+      return 0;
+    }
+  int rc = h_daily_slave_unrest (db, (int64_t) time (NULL));
+  if (rc != 0)
+    {
+      send_response_error (ctx, root, ERR_SERVER_ERROR,
+                           "Slave unrest cron tick failed");
+      return 0;
+    }
+  send_response_ok_take (ctx, root, "sys.cron.slave_unrest_once.success",
+                         NULL);
+  return 0;
+}
+
+int
+cmd_sys_cron_advance_to (client_ctx_t *ctx, json_t *root)
+{
+  if (!ctx || ctx->player_id <= 0
+      || auth_player_get_type (ctx->player_id) != PLAYER_TYPE_SYSOP)
+    {
+      send_response_refused_steal (ctx, root, ERR_PERMISSION_DENIED,
+                                   "Permission denied", NULL);
+      return 0;
+    }
+  db_t *db = game_db_get_handle ();
+  int enabled = 0;
+  if (!db || repo_engine_get_config_int
+      (db, "test.deterministic_scheduler_enabled", &enabled) != 0
+      || enabled != 1)
+    {
+      send_response_error (ctx, root, ERR_PERMISSION_DENIED,
+        "Deterministic scheduler is disabled; enable it only in isolated QA.");
+      return 0;
+    }
+  json_t *data = json_object_get (root, "data");
+  json_t *now_value = data ? json_object_get (data, "now_s") : NULL;
+  json_t *days_value = data ? json_object_get (data, "advance_days") : NULL;
+  json_t *confirm = data ? json_object_get (data, "confirm") : NULL;
+  int64_t wall_now = (int64_t) time (NULL);
+  int64_t now_s = 0;
+  if (json_is_integer (days_value))
+    {
+      int64_t days = (int64_t) json_integer_value (days_value);
+      if (days < 1 || days > 30)
+        days = 0;
+      else
+        now_s = wall_now + days * 86400;
+    }
+  else if (json_is_integer (now_value))
+    now_s = (int64_t) json_integer_value (now_value);
+  if (!json_is_true (confirm) || now_s <= wall_now
+      || now_s > wall_now + 31LL * 86400)
+    {
+      send_response_error (ctx, root, ERR_INVALID_ARG,
+        "Require confirm=true and advance_days 1..30 or an epoch within 31 days.");
+      return 0;
+    }
+  int tasks_run = server_engine_run_due_cron_tasks (db, now_s, 256);
+  if (tasks_run < 0)
+    {
+      send_response_error (ctx, root, ERR_DB_QUERY_FAILED,
+                           "Could not advance deterministic scheduler.");
+      return 0;
+    }
+  json_t *resp = json_pack ("{s:I,s:i}", "now_s", (json_int_t) now_s,
+                            "tasks_run", tasks_run);
+  if (!resp)
+    {
+      send_response_error (ctx, root, ERR_NOMEM,
+                           "Could not build scheduler response.");
+      return 0;
+    }
+  send_response_ok_take (ctx, root, "sys.cron.advance_to.success", &resp);
+  return 0;
 }
 
 
@@ -3096,4 +3226,175 @@ h_market_state_decay (db_t *db, int64_t now_s)
 
   unlock (db, "market_state_decay");
   return 0;
+}
+
+typedef struct
+{
+  int64_t id;
+  int planet_id;
+  int sector_id;
+  int port_class;
+  int completed;
+  int required;
+  int delivery_amount;
+  int interval_seconds;
+} port_construction_due_t;
+
+int
+h_port_construction_tick (db_t *db, int64_t now_s)
+{
+  if (!db || now_s <= 0) return -1;
+  db_error_t err = {0};
+  db_res_t *res = NULL;
+  port_construction_due_t due[64];
+  int count = 0;
+  if (!db_tx_begin (db, DB_TX_DEFAULT, &err)) return -1;
+  if (!db_query (db,
+       "SELECT construction_id,planet_id,sector_id,port_class,deliveries_completed,deliveries_required,delivery_amount,delivery_interval_seconds "
+       "FROM planet_port_constructions WHERE status='building' AND next_delivery_at<=to_timestamp({1}) "
+       "ORDER BY next_delivery_at,construction_id LIMIT 64 FOR UPDATE SKIP LOCKED",
+       (db_bind_t[]){db_bind_i64 (now_s)}, 1, &res, &err))
+    goto port_construction_failed;
+  while (count < 64 && db_res_step (res, &err))
+    {
+      due[count].id = db_res_col_i64 (res, 0, &err);
+      due[count].planet_id = db_res_col_i32 (res, 1, &err);
+      due[count].sector_id = db_res_col_i32 (res, 2, &err);
+      due[count].port_class = db_res_col_i32 (res, 3, &err);
+      due[count].completed = db_res_col_i32 (res, 4, &err);
+      due[count].required = db_res_col_i32 (res, 5, &err);
+      due[count].delivery_amount = db_res_col_i32 (res, 6, &err);
+      due[count].interval_seconds = db_res_col_i32 (res, 7, &err);
+      count++;
+    }
+  db_res_finalize (res); res = NULL;
+  if (err.code) goto port_construction_failed;
+
+  const char *codes[3] = {"ORE", "ORG", "EQU"};
+  const int class_modes[8][3] = {
+    {0,1,1}, {0,0,1}, {1,0,0}, {1,0,1},
+    {1,1,0}, {0,1,0}, {1,1,1}, {0,0,0}
+  }; /* Historical port type IDs 1..8: SBB, SSB, BSS, BSB, BBS, SBS, BBB, SSS. */
+  for (int i = 0; i < count; i++)
+    {
+      bool occupied = false;
+      if (!db_query (db,
+           "SELECT 1 FROM ports WHERE sector_id={1} AND is_active=TRUE LIMIT 1",
+           (db_bind_t[]){db_bind_i32 (due[i].sector_id)}, 1, &res, &err))
+        goto port_construction_failed;
+      occupied = db_res_step (res, &err);
+      db_res_finalize (res); res = NULL;
+      if (err.code) goto port_construction_failed;
+      if (occupied)
+        {
+          if (!db_exec (db,
+               "UPDATE planet_port_constructions SET next_delivery_at=to_timestamp({1}+delivery_interval_seconds) WHERE construction_id={2}",
+               (db_bind_t[]){db_bind_i64 (now_s), db_bind_i64 (due[i].id)}, 2, &err))
+            goto port_construction_failed;
+          continue;
+        }
+
+      int stock[3] = {0,0,0};
+      if (!db_query (db,
+           "SELECT commodity_code,quantity FROM entity_stock WHERE entity_type='planet' AND entity_id={1} AND commodity_code IN ('ORE','ORG','EQU') ORDER BY commodity_code FOR UPDATE",
+           (db_bind_t[]){db_bind_i32 (due[i].planet_id)}, 1, &res, &err))
+        goto port_construction_failed;
+      while (db_res_step (res, &err))
+        {
+          const char *code = db_res_col_text (res, 0, &err);
+          int qty = db_res_col_i32 (res, 1, &err);
+          for (int c = 0; c < 3; c++)
+            if (code && strcmp (code, codes[c]) == 0) stock[c] = qty;
+        }
+      db_res_finalize (res); res = NULL;
+      if (err.code) goto port_construction_failed;
+      bool supplied = true;
+      for (int c = 0; c < 3; c++)
+        if (stock[c] < due[i].delivery_amount) supplied = false;
+      if (!supplied)
+        {
+          if (!db_exec (db,
+               "UPDATE planet_port_constructions SET next_delivery_at=to_timestamp({1}+delivery_interval_seconds) WHERE construction_id={2}",
+               (db_bind_t[]){db_bind_i64 (now_s), db_bind_i64 (due[i].id)}, 2, &err))
+            goto port_construction_failed;
+          continue;
+        }
+      for (int c = 0; c < 3; c++)
+        if (!db_exec (db,
+             "UPDATE entity_stock SET quantity=quantity-{1},last_updated_ts={2} WHERE entity_type='planet' AND entity_id={3} AND commodity_code={4} AND quantity>={1}",
+             (db_bind_t[]){db_bind_i32 (due[i].delivery_amount), db_bind_i64 (now_s),
+                           db_bind_i32 (due[i].planet_id), db_bind_text ((char *) codes[c])},
+             4, &err))
+          goto port_construction_failed;
+
+      int deliveries_done = due[i].completed + 1;
+      if (deliveries_done < due[i].required)
+        {
+          if (!db_exec (db,
+               "UPDATE planet_port_constructions SET deliveries_completed={1},next_delivery_at=to_timestamp({2}+delivery_interval_seconds) WHERE construction_id={3}",
+               (db_bind_t[]){db_bind_i32 (deliveries_done), db_bind_i64 (now_s),
+                             db_bind_i64 (due[i].id)}, 3, &err))
+            goto port_construction_failed;
+          continue;
+        }
+
+      int port_size = g_cfg.port_size > 0 ? g_cfg.port_size : 5;
+      int64_t capacity = (int64_t) port_size * 1000;
+      char name[96];
+      snprintf (name, sizeof name, "Class %d StarPort", due[i].port_class);
+      if (!db_exec (db,
+           "INSERT INTO ports(number,name,sector_id,is_active,size,techlevel,petty_cash,type,porttype_id,durability,defensive_strength) "
+           "VALUES({1},{2},{1},TRUE,{3},0,50000,{4},(SELECT porttype_id FROM porttypes WHERE code='CLASS0'),"
+           "COALESCE((SELECT value::integer FROM v3_port_economy_rules WHERE rule_key='port_durability'),10000),"
+           "COALESCE((SELECT value::integer FROM v3_port_economy_rules WHERE rule_key='port_defensive_strength'),1000))",
+           (db_bind_t[]){db_bind_i32 (due[i].sector_id), db_bind_text (name),
+                         db_bind_i32 (port_size), db_bind_i32 (due[i].port_class)}, 4, &err))
+        goto port_construction_failed;
+      if (!db_query (db,"SELECT currval(pg_get_serial_sequence('ports','port_id'))",
+                     NULL,0,&res,&err) || !db_res_step (res,&err))
+        goto port_construction_failed;
+      int port_id = db_res_col_i32 (res,0,&err);
+      db_res_finalize (res); res = NULL;
+      if (err.code || port_id <= 0) goto port_construction_failed;
+      for (int c = 0; c < 3; c++)
+        {
+          int buy = class_modes[due[i].port_class - 1][c];
+          const char *mode = buy ? "buy" : "sell";
+          int64_t initial_stock = buy ? 0 : (capacity * 75) / 100;
+          if (!db_exec (db,
+               "INSERT INTO port_trade(port_id,maxproduct,capacity_level,commodity,mode) VALUES({1},{2},0,{3},{4})",
+               (db_bind_t[]){db_bind_i32 (port_id),db_bind_i64 (capacity),
+                             db_bind_text ((char *)codes[c]),db_bind_text ((char *)mode)},4,&err)
+              || !db_exec (db,
+               "INSERT INTO entity_stock(entity_type,entity_id,commodity_code,quantity,price) "
+               "SELECT 'port',{1},{2},{3},base_price FROM commodities WHERE code={2}",
+               (db_bind_t[]){db_bind_i32 (port_id),db_bind_text ((char *)codes[c]),
+                             db_bind_i64 (initial_stock)},3,&err))
+            goto port_construction_failed;
+        }
+      if (!db_exec (db,
+           "UPDATE planet_port_constructions SET deliveries_completed={1},status='completed',port_id={2},completed_at=to_timestamp({3}) WHERE construction_id={4}",
+           (db_bind_t[]){db_bind_i32 (deliveries_done),db_bind_i32 (port_id),
+                         db_bind_i64 (now_s),db_bind_i64 (due[i].id)},4,&err))
+        goto port_construction_failed;
+      json_t *event = json_pack ("{s:I,s:i,s:i,s:i}", "construction_id",
+          (json_int_t)due[i].id,"planet_id",due[i].planet_id,"sector_id",
+          due[i].sector_id,"port_id",port_id);
+      if (!event || db_log_engine_event (now_s,"port.construction.completed.v1",
+                                         "player",0,due[i].sector_id,event,db)!=0)
+        { if (event) json_decref (event); goto port_construction_failed; }
+      json_decref (event);
+    }
+  if (!db_tx_commit (db, &err)) goto port_construction_failed;
+  /* Cron handler return values follow the engine contract: zero means the
+   * transaction completed successfully. The processed-row count is internal;
+   * returning it made every non-empty construction batch look like a failed
+   * scheduler task after its transaction had already committed. */
+  return 0;
+
+port_construction_failed:
+  if (res) db_res_finalize (res);
+  db_tx_rollback (db, &err);
+  LOGE ("StarPort construction tick rolled back: %s", err.message);
+  return -1;
 }

@@ -2248,7 +2248,7 @@ db_get_port_id_by_sector (db_t *db, int sid)
      dock.status protocol does not carry a port id, so selecting an arbitrary
      row could bypass StarDock-only behaviour such as limpet decontamination. */
   const char *sql_template =
-    "SELECT port_id FROM ports WHERE sector_id = {1} "
+    "SELECT port_id FROM ports WHERE sector_id = {1} AND is_active=TRUE "
     "ORDER BY CASE WHEN type = 9 THEN 0 ELSE 1 END, port_id LIMIT 1;";
   char sql[256];
   sql_build(db, sql_template, sql, sizeof sql);
@@ -2294,7 +2294,7 @@ db_get_sector_info (int sid,
   int rc = -1;
   // Using sector_ops view for aggregation
   const char *sql = "SELECT s.name, 1 as safe_zone, "
-                    "(SELECT COUNT(*) FROM ports WHERE sector_id={1}) as pc, "
+                    "(SELECT COUNT(*) FROM ports WHERE sector_id={1} AND is_active=TRUE) as pc, "
                     "(SELECT COUNT(*) FROM ships WHERE sector_id={1}) as sc, "
                     "(SELECT COUNT(*) FROM planets WHERE sector_id={1}) as plc, "
                     "s.beacon "
@@ -2682,7 +2682,7 @@ db_sector_info_json (db_t *db, int sector_id, json_t **out)
   /* 2) Counts */
   const char *sql_counts =
     "SELECT "
-    "  (SELECT COUNT(*) FROM ports WHERE sector_id={1}) as pc, "
+    "  (SELECT COUNT(*) FROM ports WHERE sector_id={1} AND is_active=TRUE) as pc, "
     "  (SELECT COUNT(*) FROM ships WHERE sector_id={1}) as sc, "
     "  (SELECT COUNT(*) FROM planets WHERE sector_id={1}) as plc;";
 
@@ -3194,7 +3194,7 @@ db_ports_at_sector_json (db_t *db, int sid, json_t **out)
   db_error_t err = {0};
   int rc = -1;
 
-  const char *sql_template = "SELECT port_id, name, type FROM ports WHERE sector_id = {1};";
+  const char *sql_template = "SELECT port_id, name, type FROM ports WHERE sector_id = {1} AND is_active=TRUE;";
   char sql[256];
   sql_build(db, sql_template, sql, sizeof sql);
 
@@ -3826,24 +3826,28 @@ db_notice_mark_seen (db_t *db, int notice_id, int player_id)
     }
   db_error_t err;
   
-  const char *sql_template =
-    "INSERT INTO notice_seen (notice_id, player_id, seen_at) VALUES ({1}, {2}, %s);";
+  /* Multiple game-server loops may deliver the same durable notice at once.
+     Catching a unique violation in PostgreSQL is not sufficient inside the
+     caller's transaction: the transaction stays aborted. Use an atomic
+     conflict-safe insert instead. */
+  const char *ignore_clause = sql_insert_ignore_clause(db);
+  if (!ignore_clause)
+    return ERR_DB;
+
+  char sql_template[512];
+  snprintf (sql_template, sizeof sql_template,
+            "INSERT INTO notice_seen (notice_id, player_id, seen_at) VALUES ({1}, {2}, %s) %s;",
+            sql_now_expr(db), ignore_clause);
 
   char sql_dialect[512];
-  sql_build(db, sql_template, sql_dialect, sizeof sql_dialect);
-
-  char sql[512];
-  snprintf(sql, sizeof sql, sql_dialect, sql_now_expr(db));
+  sql_build (db, sql_template, sql_dialect, sizeof sql_dialect);
 
   if (!db_exec (db,
-                sql,
+                sql_dialect,
                 (db_bind_t[]){db_bind_i64 (notice_id), db_bind_i64 (player_id)},
                 2,
                 &err))
     {
-      if (err.code == ERR_DB_CONSTRAINT) {
-        return 0; // DO NOTHING
-      }
       return err.code;
     }
   return 0;
@@ -3942,7 +3946,7 @@ db_sector_scan_core (db_t *db, int sector_id, json_t **out_obj)
   /* Rich scan query using sector_ops view logic or subqueries */
   const char *sql =
     "SELECT s.sector_id, s.name, 1 as safe_zone, "
-    "(SELECT COUNT(*) FROM ports WHERE sector_id={1}) as port_count, "
+    "(SELECT COUNT(*) FROM ports WHERE sector_id={1} AND is_active=TRUE) as port_count, "
     "(SELECT COUNT(*) FROM ships WHERE sector_id={1}) as ship_count, "
     "(SELECT COUNT(*) FROM planets WHERE sector_id={1}) as planet_count, "
     "s.beacon as beacon_text "
@@ -4863,7 +4867,8 @@ db_player_info_json (db_t *db, int player_id, json_t **out_json)
     "       s.ship_id, s.name as ship_name, s.type_id as ship_type, "
     "       s.holds, s.fighters, s.shields, s.onplanet, s.ported, "
     "       sec.name as sector_name, "
-    "       s.ore, s.equipment, s.organics, s.slaves, s.drugs, s.weapons, s.colonists "
+    "       s.ore, s.equipment, s.organics, s.slaves, s.drugs, s.weapons, s.colonists, "
+    "       COALESCE(s.combat_disabled_until,0) "
     "FROM players p "
     "LEFT JOIN ships s ON p.ship_id = s.ship_id "
     "LEFT JOIN sectors sec ON p.sector_id = sec.sector_id "
@@ -4924,6 +4929,8 @@ db_player_info_json (db_t *db, int player_id, json_t **out_json)
       json_object_set_new (ship, "shields", json_integer (db_res_col_i32 (res, 11, &err)));
       json_object_set_new (ship, "onplanet", json_integer (db_res_col_i32 (res, 12, &err)));
       json_object_set_new (ship, "ported", json_integer (db_res_col_i32 (res, 13, &err)));
+      json_object_set_new (ship, "combat_disabled_until",
+                           json_integer (db_res_col_i64 (res, 22, &err)));
       
       /* Build cargo array from commodity columns (columns 15-20) */
       json_t *cargo = json_array ();

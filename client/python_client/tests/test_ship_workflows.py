@@ -24,6 +24,39 @@ def test_selected_ship_inspection_uses_authoritative_id_and_response(
     assert ctx.state["last_rpc"]["status"] == "ok"
 
 
+def test_mine_deployment_sends_selected_mine_type_not_fighter_mode(
+    ctx_factory, fake_conn, monkeypatch
+):
+    ctx = ctx_factory(sector={"id": 404})
+    fake_conn.queue("combat.deploy_mines", {
+        "status": "ok", "type": "combat.mines.deployed",
+        "data": {"asset_id": 9, "count_added": 3, "total_now": 3},
+    })
+    answers = iter(["3", "1"])
+    monkeypatch.setattr("builtins.input", lambda *_: next(answers))
+    monkeypatch.setattr(client, "refresh_sector_and_display", lambda _ctx: True)
+
+    client.deploy_mines_flow(ctx)
+
+    assert fake_conn.calls == [{
+        "command": "combat.deploy_mines",
+        "data": {"amount": 3, "mine_type": "armid"},
+    }]
+
+
+def test_mine_deployment_rejects_unknown_type_without_rpc(
+    ctx_factory, fake_conn, monkeypatch, capsys
+):
+    ctx = ctx_factory(sector={"id": 404})
+    answers = iter(["3", "toll"])
+    monkeypatch.setattr("builtins.input", lambda *_: next(answers))
+
+    client.deploy_mines_flow(ctx)
+
+    assert fake_conn.calls == []
+    assert "Invalid mine type" in capsys.readouterr().out
+
+
 def test_selected_ship_inspection_refusal_does_not_claim_cached_details(
     ctx_factory, fake_conn, monkeypatch, capsys
 ):
@@ -46,7 +79,7 @@ def test_selected_ship_inspection_refusal_does_not_claim_cached_details(
 def test_selected_ship_inspection_rejects_untyped_success(
     ctx_factory, fake_conn, monkeypatch, capsys
 ):
-    ctx = ctx_factory(sector={"id": 7, "ships": [{"id": 88, "name": "Visible"}]})
+    ctx = ctx_factory(sector={"id": 7, "ships": [{"ship_id": 88, "name": "Visible"}]})
     ctx.player_info = {"player": {"ship_id": 1, "name": "Pilot"}}
     fake_conn.queue("ship.inspect", {"status": "ok", "data": {
         "ship": {"ship_id": 88, "name": "Untrusted"},
@@ -111,10 +144,10 @@ def test_contradictory_ship_ids_are_not_used_for_ownership_actions(
     assert "Ambiguous" not in output
 
 
-def test_selected_ship_sale_is_visible_but_requires_authoritative_roster(
+def test_selected_ship_sale_is_visible_but_unavailable_without_server_handler(
     ctx_factory, fake_conn, monkeypatch, capsys
 ):
-    ctx = ctx_factory(sector={"id": 7, "ships": [{"id": 88, "name": "Hauler"}]})
+    ctx = ctx_factory(sector={"id": 7, "ships": [{"ship_id": 88, "name": "Hauler"}]})
     ctx.player_info = {"player": {"ship_id": 1, "name": "Pilot"}}
     answers = iter(["1", "v", "y", "q"])
     monkeypatch.setattr("builtins.input", lambda *_: next(answers))
@@ -122,7 +155,7 @@ def test_selected_ship_sale_is_visible_but_requires_authoritative_roster(
     client.enter_ship_menu(ctx)
 
     assert fake_conn.calls == [{"command": "ship.list", "data": {}}]
-    assert "requires a valid server-authoritative ship roster" in capsys.readouterr().out
+    assert "valid server-authoritative ship roster" in capsys.readouterr().out
 
 
 def test_selected_ship_transfer_uses_authoritative_receipt_and_refreshes(
@@ -135,10 +168,10 @@ def test_selected_ship_transfer_uses_authoritative_receipt_and_refreshes(
         "status": "ok", "type": "ship.transfer.response",
         "data": {"ship_id": 88, "from_player_id": 1, "target_player_id": 42},
     })
-    fake_conn.queue("player.my_info", {"status": "ok", "type": "player.info", "data": {"player_id": 1}})
+    fake_conn.queue("player.my_info", {"status": "ok", "type": "player.info", "data": {"player": {"id": 1, "ship_id": 1}}})
     fake_conn.queue("ship.status", {"status": "ok", "type": "ship.status", "data": {"ship": {"id": 1}}})
     fake_conn.queue("move.describe_sector", {"status": "ok", "type": "sector.info", "data": {"id": 7, "ships": []}})
-    fake_conn.queue("ship.list", {"status": "ok", "type": "ship.list.response", "data": {"ships": []}})
+    fake_conn.queue("ship.list", {"status": "ok", "type": "ship.list.response", "data": {"ships": [{"ship_id": 1, "name": "Escape Pod", "active": True}]}})
     answers = iter(["1", "t", "y", "42", "q"])
     monkeypatch.setattr("builtins.input", lambda *_: next(answers))
 
@@ -152,6 +185,9 @@ def test_selected_ship_transfer_uses_authoritative_receipt_and_refreshes(
 def test_ship_transfer_rejects_schema_mismatched_receipt_ids_and_refreshes_roster(
     ctx_factory, fake_conn, monkeypatch, capsys
 ):
+    ctx = ctx_factory()
+    ctx.state["player_id"] = 3
+    ctx.player_info = {"player": {"id": 3, "ship_id": 12}}
     roster = {"status": "ok", "type": "ship.list.response", "data": {"ships": [
         {"ship_id": 88, "name": "Hauler", "active": False},
     ]}}
@@ -160,13 +196,20 @@ def test_ship_transfer_rejects_schema_mismatched_receipt_ids_and_refreshes_roste
         "ship_id": True, "target_player_id": 42,
     }})
     fake_conn.queue("ship.list", roster)
+    fake_conn.queue("player.my_info", {"status": "ok", "type": "player.info",
+                                       "data": {"player": {"id": 3, "ship_id": 12}}})
+    fake_conn.queue("ship.status", {"status": "ok", "type": "ship.status",
+                                     "data": {"ship": {"id": 12}}})
+    fake_conn.queue("move.describe_sector", {"status": "ok", "type": "sector.info",
+                                              "data": {"id": 7}})
     answers = iter(["1", "42", "y"])
     monkeypatch.setattr("builtins.input", lambda *_: next(answers))
 
-    client.ship_transfer_flow(ctx_factory())
+    client.ship_transfer_flow(ctx)
 
     assert [call["command"] for call in fake_conn.calls] == [
-        "ship.list", "ship.transfer", "ship.list", "player.my_info", "ship.status", "move.describe_sector",
+        "ship.list", "ship.transfer", "ship.list", "player.my_info",
+        "ship.status", "move.describe_sector",
     ]
     output = capsys.readouterr().out
     assert "was not confirmed" in output
@@ -265,10 +308,11 @@ def test_transfer_cargo_connection_loss_reconciles_without_claiming_outcome(
     ctx = ctx_factory(sector={"id": 7, "ships": [{"id": 12}, {"id": 88}]})
     ctx.player_info = {"player": {"ship_id": 12}}
     original_rpc = fake_conn.rpc
+    attempted_commands = []
 
     def disconnect_after_transfer(command, data):
         if command == "ship.transfer_cargo":
-            fake_conn.calls.append({"command": command, "data": data})
+            attempted_commands.append(command)
             raise ConnectionError("server disconnected")
         return original_rpc(command, data)
 
@@ -286,8 +330,9 @@ def test_transfer_cargo_connection_loss_reconciles_without_claiming_outcome(
     output = capsys.readouterr().out
     assert "outcome is uncertain after connection loss" in output
     assert "confirmed by server" not in output
+    assert attempted_commands == ["ship.transfer_cargo"]
     assert [call["command"] for call in fake_conn.calls] == [
-        "ship.transfer_cargo", "ship.status", "move.describe_sector",
+        "ship.status", "move.describe_sector",
     ]
     assert ctx.last_sector_desc["id"] == 7
 
@@ -431,6 +476,42 @@ def test_shipyard_upgrade_refreshes_independently_and_preserves_refused_sector(
     output = capsys.readouterr().out
     assert "displayed credits may be stale" in output
     assert "displayed sector may be stale" in output
+
+
+def test_used_shipyard_purchase_uses_listed_identity_price_and_refreshes(
+    ctx_factory, fake_conn, monkeypatch, capsys
+):
+    ctx = ctx_factory(sector={"id": 7, "port": {"id": 3}})
+    fake_conn.queue("shipyard.list", {
+        "status": "ok", "type": "shipyard.list_v1", "data": {
+            "used_available": [{"used_inventory_id": 91, "ship_id": 42,
+                                "name": "Retained Scout", "ship_type": "Scout",
+                                "price": 12345, "hull_value": 10000,
+                                "installed_equipment_value": 5431}],
+        },
+    })
+    fake_conn.queue("shipyard.upgrade", {
+        "status": "ok", "type": "shipyard.upgraded_v1",
+        "data": {"ship_id": 42, "new_type_id": 2,
+                 "new_ship_name": "Retained Scout", "credits_spent": 12345,
+                 "used_inventory_id": 91},
+    })
+    fake_conn.queue("player.my_info", {"status": "ok", "type": "player.info", "data": {"player": {"credits": 9000}}})
+    fake_conn.queue("ship.status", {"status": "ok", "type": "ship.status", "data": {"ship": {"id": 42, "hull": 73}}})
+    fake_conn.queue("move.describe_sector", {"status": "ok", "type": "sector.info", "data": {"sector_id": 7, "name": "Shipyard"}})
+    answers = iter(["1", "y"])
+    monkeypatch.setattr("builtins.input", lambda *_: next(answers))
+
+    client.shipyard_used_purchase_flow(ctx)
+
+    assert [call["command"] for call in fake_conn.calls] == [
+        "shipyard.list", "shipyard.upgrade", "player.my_info", "ship.status",
+        "move.describe_sector",
+    ]
+    assert fake_conn.calls[1]["data"] == {"used_inventory_id": 91}
+    assert ctx.last_sector_desc["id"] == 7
+    output = capsys.readouterr().out
+    assert "existing ship 42" in output
 
 
 def test_shipyard_upgrade_rejects_untyped_success_and_refreshes_authoritative_state(
@@ -673,25 +754,25 @@ def test_jettison_requires_confirmation_and_refreshes_authoritative_cargo(
 ):
     ctx = ctx_factory()
     fake_conn.queue("ship.info", {"status": "ok", "data": {"ship": {
-        "cargo": [{"commodity": "weapons", "quantity": 5}],
+        "cargo": [{"commodity": "ore", "quantity": 5}],
     }}})
-    fake_conn.queue("trade.jettison", {"status": "ok", "data": {"remaining_cargo": [
-        {"commodity": "weapons", "quantity": 2},
+    fake_conn.queue("ship.jettison", {"status": "ok", "data": {"remaining_cargo": [
+        {"commodity": "ore", "quantity": 2},
     ]}})
     fake_conn.queue("player.my_info", {"status": "ok", "data": {"player": {"credits": 100}}})
     fake_conn.queue("ship.status", {"status": "ok", "data": {"ship": {
-            "id": 7, "holds": 20, "cargo": [{"commodity": "weapons", "quantity": 2}],
+            "id": 7, "holds": 20, "cargo": [{"commodity": "ore", "qty": 2}],
     }}})
-    answers = iter(["WPN", "3", "y"])
+    answers = iter(["ORE", "3", "y"])
     prompts = []
     monkeypatch.setattr("builtins.input", lambda prompt: (prompts.append(prompt), next(answers))[1])
 
     client.jettison_cargo_flow(ctx)
 
     assert [call["command"] for call in fake_conn.calls] == [
-        "ship.info", "trade.jettison", "player.my_info", "ship.status",
+        "ship.info", "ship.jettison", "player.my_info", "ship.status",
     ]
-    assert fake_conn.calls[1]["data"] == {"commodity": "WPN", "quantity": 3}
+    assert fake_conn.calls[1]["data"] == {"commodity": "ORE", "quantity": 3}
     assert any("spend 1 turn" in prompt for prompt in prompts)
     assert "Successfully jettisoned" in capsys.readouterr().out
     assert ctx.hud.cargo_used == 2
@@ -824,6 +905,7 @@ def test_ship_transfer_selects_only_from_authoritative_owned_roster(
 ):
     ctx = ctx_factory()
     ctx.state["player_id"] = 3
+    ctx.player_info = {"player": {"id": 3, "ship_id": 12}}
     roster = {
         "status": "ok", "type": "ship.list.response",
         "data": {"ships": [
@@ -923,8 +1005,6 @@ def test_ship_transfer_refresh_rejects_foreign_player_and_active_ship_records(
     """A transfer receipt must not hydrate refresh data for another session."""
     ctx = ctx_factory()
     ctx.state["player_id"] = 3
-    from dataclasses import replace
-
     ctx.hud = replace(ctx.hud, ship_id=1)
     ctx.player_info = {"player": {"id": 3, "ship_id": 1}}
     fake_conn.queue("player.my_info", {

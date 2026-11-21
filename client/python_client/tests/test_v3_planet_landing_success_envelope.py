@@ -14,22 +14,21 @@ def test_explicit_landing_success_type_refreshes_hud_before_surface(
         "data": {"planet_id": 77},
     })
     fake_conn.queue("player.my_info", {
-        "status": "ok", "type": "player.info",
+        "status": "ok",
         "data": {"player": {"id": 3, "ship_id": 9, "turns_remaining": 39, "credits": "1200.00"}},
     })
     fake_conn.queue("ship.status", {
-        "status": "ok", "type": "ship.status",
-        "data": {"ship": {"id": 9, "hull": 100, "onplanet": 77}},
+        "status": "ok",
+        "type": "ship.status",
+        "data": {"ship": {"ship_id": 9, "hull": 100, "onplanet": 1}},
     })
+    fake_conn.queue("move.describe_sector", {"status": "ok", "type": "sector.info", "data": {"sector_id": 17, "planets": [{"planet_id": 77}]}})
     fake_conn.queue("planet.info", {
-        "status": "ok", "type": "planet.info",
+        "status": "ok",
         "data": {"planet": {"planet_id": 77, "sector_id": 17}},
     })
     monkeypatch.setattr("builtins.input", lambda *_: "")
 
-    fake_conn.queue("move.describe_sector", {
-        "status": "ok", "type": "sector.info", "data": {"id": 17},
-    })
     client.land_flow(ctx)
 
     assert ctx.state["on_planet"] is True

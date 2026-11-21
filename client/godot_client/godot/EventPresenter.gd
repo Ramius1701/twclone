@@ -20,6 +20,12 @@ static func notification_for(event: Dictionary) -> String:
 	var data = event.get("data", {})
 	if event_type.is_empty() or not data is Dictionary:
 		return ""
+	if event_type == "combat.photon_ship_disabled.v1":
+		var ship_id: Variant = data.get("ship_id", null)
+		var disabled_until: Variant = data.get("disabled_until", null)
+		if ship_id is int and ship_id > 0 and disabled_until is int and disabled_until > 0:
+			return "Combat · Photon disabled ship %d until %d" % [ship_id, disabled_until]
+		return ""
 	if event_type in ["system.notice", "system.notice_v1"]:
 		var title := str(data.get("title", "Server notice")).strip_edges()
 		var body := str(data.get("body", "")).strip_edges()
@@ -36,8 +42,12 @@ static func notification_for(event: Dictionary) -> String:
 		return ""
 	if category == "combat" and event_type == "combat.hit":
 		return _combat_hit(data)
+	if category == "combat" and event_type == "player.port_strike.v1":
+		return _port_strike(data)
 	if category == "combat" and event_type == "player.attack_planet.v1":
 		return _planet_attack(data)
+	if category == "combat" and event_type == "player.capture_planet.v1":
+		return _planet_capture(data)
 	if category == "combat" and event_type in ["combat.hit.fighters", "combat.hit.quasar", "combat.hit.environment", "combat.limpet.attached", "combat.planet_landing_defense.v1"]:
 		return _defense_hit(event_type, data)
 	if category == "chat":
@@ -64,6 +74,25 @@ static func _planet_attack(data: Dictionary) -> String:
 	var planet_loss: Variant = data.get("planet_loss", null)
 	if planet_loss is int and planet_loss >= 0:
 		summary += " · planet fighters lost: %d" % planet_loss
+	return "Combat · " + summary
+
+static func _planet_capture(data: Dictionary) -> String:
+	var summary := "Planet captured"
+	var planet_id: Variant = data.get("planet_id", null)
+	if typeof(planet_id) == TYPE_INT and int(planet_id) > 0:
+		summary += " · planet %d" % int(planet_id)
+	var previous_owner: Variant = data.get("previous_owner", null)
+	if typeof(previous_owner) == TYPE_INT and int(previous_owner) > 0:
+		summary += " · previous owner %d" % int(previous_owner)
+	return "Combat · " + summary
+
+static func _port_strike(data: Dictionary) -> String:
+	var summary := "StarPort attack"
+	for field in [["damage", "damage"], ["retaliation", "retaliation"], ["durability_remaining", "durability remaining"]]:
+		if _authoritative_int(data.get(field[0], null)) and int(data[field[0]]) >= 0:
+			summary += " · %s: %d" % [field[1], int(data[field[0]])]
+	if typeof(data.get("destroyed", null)) == TYPE_BOOL and bool(data.get("destroyed")):
+		summary += " · port destroyed"
 	return "Combat · " + summary
 
 static func _combat_hit(data: Dictionary) -> String:
@@ -105,7 +134,7 @@ static func _defense_hit(event_type: String, data: Dictionary) -> String:
 	for field in [["damage", "damage"], ["shields_lost", "shields lost"], ["fighters_lost", "fighters lost"], ["hull_lost", "hull lost"]]:
 		if _authoritative_int(data.get(field[0], null)):
 			summary += " · %s: %d" % [field[1], int(data[field[0]])]
-	if data.get("destroyed") == true:
+	if typeof(data.get("destroyed", null)) == TYPE_BOOL and data.get("destroyed"):
 		summary += " · ship destroyed"
 	return "Combat · " + summary
 

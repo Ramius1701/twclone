@@ -4,6 +4,7 @@
 #include <jansson.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include "common.h"
 #include "db/db_api.h"
 
 typedef int (*cron_handler_fn) (db_t *, int64_t);
@@ -18,6 +19,8 @@ int h_daily_turn_reset (db_t * db, int64_t now_s);
 int h_terra_replenish (db_t * db, int64_t now_s);
 int h_daily_market_settlement (db_t * db, int64_t now_s);
 int h_daily_slave_unrest (db_t *db, int64_t now_s);
+int cmd_sys_cron_slave_unrest_once (client_ctx_t *ctx, json_t *root);
+int cmd_sys_cron_advance_to (client_ctx_t *ctx, json_t *root);
 int h_shield_regen_tick (db_t * db, int64_t now_s);
 int h_daily_news_compiler (db_t * db, int64_t now_s);
 int h_cleanup_old_news (db_t * db, int64_t now_s);
@@ -27,6 +30,7 @@ int h_tavern_notice_expiry_cron (db_t * db, int64_t now_s);
 int h_loan_shark_interest_cron (db_t * db, int64_t now_s);
 int h_daily_stock_price_recalculation (db_t * db, int64_t now_s);
 int h_port_economy_tick (db_t * db, int64_t now_s);
+int h_port_construction_tick (db_t * db, int64_t now_s);
 int h_planet_market_tick (db_t * db, int64_t now_s);
 int h_reset_turns_for_player (db_t * db, int64_t now_s);
 int h_daily_corp_tax (db_t * db, int64_t now_s);

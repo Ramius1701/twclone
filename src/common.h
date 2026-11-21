@@ -50,6 +50,9 @@ typedef struct
   int connection_counted;
   time_t request_window_start;
   int request_count;
+  /* Sector whose toll fighters were explicitly refused on this movement. */
+  int toll_refused_sector_id;
+  int toll_paid_sector_id;
 
   /* --- bulk execution capture --- */
   json_t *captured_envelopes;	// If non-NULL, responses are appended here instead of sent
@@ -95,9 +98,11 @@ typedef enum
 #endif // ASSET_TYPE_T_DEFINED
 typedef enum
 {
-  OFFENSE_TOLL = 1,
+  /* Values are part of the persisted sector_assets.offensive_setting contract.
+   * Mode 3 is toll collection in the V3 protocol and existing world fixtures. */
+  OFFENSE_ATTACK = 1,
   OFFENSE_DEFEND = 2,
-  OFFENSE_ATTACK = 3
+  OFFENSE_TOLL = 3
 } offense_type_t;
 #ifndef START_FIGHTERS
 #define START_FIGHTERS 20

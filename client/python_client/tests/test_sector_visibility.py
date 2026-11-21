@@ -47,10 +47,13 @@ def test_sector_normalization_does_not_coerce_malformed_port_presence():
 def test_sector_normalization_keeps_only_authoritative_adjacent_ids():
     sector = normalize_sector({
         "sector_id": 12,
-        "adjacent_sectors": [13, True, 14.0, "15", {"to_sector": 16}, 0, -1],
+        "adjacent_sectors": [
+            13, True, 14.0, "15", {"to_sector": 16},
+            {"to_sector": True}, {"to_sector": "17"}, 0, -1,
+        ],
     })
 
-    assert sector["adjacent"] == [13]
+    assert sector["adjacent"] == [13, 16]
     assert sector["knowledge"]["adjacent"] is True
 
 
@@ -198,6 +201,22 @@ def test_refused_port_info_clears_previous_inventory_and_context(ctx_factory, fa
     ))
     assert "commodities" not in ctx.last_sector_desc["port"]
     assert "available only in its sector" in capsys.readouterr().out
+
+
+def test_stardock_port_info_exposes_shipyard_menu_capability(ctx_factory, fake_conn):
+    ctx = ctx_factory(sector={"id": 216, "port": {"present": True, "id": 207}})
+    fake_conn.queue("port.info", {
+        "status": "ok", "type": "trade.port_info",
+        "data": {"port": {"id": 207, "sector": 216, "type": 9,
+                           "commodities": []}},
+    })
+
+    client.ctx_refresh_port_context(ctx)
+
+    flags = client._get_menu_flags(ctx)
+    assert ctx.state["is_stardock"] is True
+    assert ctx.state["is_shipyard_port"] is True
+    assert flags["has_shipyard_access"] is True
 
 
 def test_port_info_wrong_response_type_does_not_repopulate_visibility_cache(

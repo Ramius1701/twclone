@@ -27,11 +27,11 @@
       "expect": { "status": "ok" }
     },
     {
-      "name": "Rig: Prepare a remote port",
+      "name": "Rig: Move StarDock away from the local test port",
       "command": "sys.raw_sql_exec",
       "user": "admin",
       "data": {
-        "sql": "UPDATE ports SET sector_id = 2 WHERE port_id = 2;"
+        "sql": "UPDATE ports SET sector_id = (SELECT s.sector_id FROM sectors s WHERE NOT EXISTS (SELECT 1 FROM ports occupied WHERE occupied.sector_id = s.sector_id) ORDER BY s.sector_id DESC LIMIT 1) WHERE port_id = 9;"
       },
       "expect": { "status": "ok" }
     },
@@ -41,6 +41,15 @@
       "user": "admin",
       "data": {
         "sql": "UPDATE ports SET sector_id = 1 WHERE port_id = 1;"
+      },
+      "expect": { "status": "ok" }
+    },
+    {
+      "name": "Rig: Put the remote test port in sector two",
+      "command": "sys.raw_sql_exec",
+      "user": "admin",
+      "data": {
+        "sql": "UPDATE ports SET sector_id = 2 WHERE port_id = 2;"
       },
       "expect": { "status": "ok" }
     },
@@ -103,7 +112,7 @@
       "expect": { "status": "ok", "type": "sector.scan" },
       "asserts": [
         { "path": "data.ports.*[port_id=1].name", "op": "==", "value": { "sql_int": "SELECT name FROM ports WHERE port_id = 1" } },
-        { "path": "data.ports.*[port_id=1].type", "op": "==", "value": null }
+        { "path": "data.ports.*[port_id=1].type", "op": "not_exists" }
       ]
     },
     {
@@ -170,6 +179,16 @@
       "expect": { "status": "ok" }
     },
     {
+      "name": "Rig: Select a hidden sector outside known adjacent exits",
+      "command": "sys.raw_sql_exec",
+      "user": "admin",
+      "data": {
+        "sql": "SELECT s.sector_id FROM sectors s WHERE s.sector_id NOT IN (1,2) AND NOT EXISTS (SELECT 1 FROM sector_warps w WHERE w.from_sector IN (1,2) AND w.to_sector=s.sector_id) AND NOT EXISTS (SELECT 1 FROM player_visited_sectors v WHERE v.player_id=@{information_visibility_user_player_id} AND v.sector_id=s.sector_id) ORDER BY s.sector_id LIMIT 1;"
+      },
+      "expect": { "status": "ok" },
+      "save": { "hidden_sector_id": "data.rows.0.0" }
+    },
+    {
       "name": "Pathfind can use a visited adjacent sector",
       "user": "information_visibility_user",
       "command": "move.pathfind",
@@ -180,7 +199,7 @@
       "name": "Pathfind does not reveal an unvisited sector",
       "user": "information_visibility_user",
       "command": "move.pathfind",
-      "data": { "from_sector_id": 1, "to_sector_id": 3 },
+      "data": { "from_sector_id": 1, "to_sector_id": "@{hidden_sector_id}" },
       "expect": { "status": "error", "error_code": 403 }
     },
     {

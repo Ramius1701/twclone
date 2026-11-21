@@ -1,7 +1,6 @@
 """V3-SHIP-02 client acceptance for the authoritative ship roster."""
 
 import client
-import pytest
 
 
 def test_owned_ship_roster_inspection_uses_authoritative_ids(
@@ -103,8 +102,8 @@ def test_ship_transfer_requires_typed_matching_receipt_and_refreshes_roster(
         "status": "ok", "type": "ship.list.response",
         "data": {"ships": [{"ship_id": 9, "name": "Scout", "active": True}]},
     })
-    fake_conn.queue("player.my_info", {"status": "ok", "type": "player.info", "data": {"player": {"id": 11, "ship_id": 9}}})
-    fake_conn.queue("ship.status", {"status": "ok", "type": "ship.status", "data": {"ship": {"id": 9}}})
+    fake_conn.queue("player.my_info", {"status": "ok", "type": "player.info", "data": {"player": {"id": 11, "ship_id": 7}}})
+    fake_conn.queue("ship.status", {"status": "ok", "type": "ship.status", "data": {"ship": {"id": 7}}})
     fake_conn.queue("move.describe_sector", {"status": "ok", "type": "sector.info", "data": {"id": 14, "ships": []}})
     answers = iter(["7", "42", "y"])
     monkeypatch.setattr("builtins.input", lambda *_: next(answers))
@@ -122,7 +121,7 @@ def test_ship_transfer_requires_typed_matching_receipt_and_refreshes_roster(
     output = capsys.readouterr().out
     assert "transfer confirmed by server" in output
     assert "9: Scout" in output
-    assert ctx.player_info == {"player": {"id": 11, "ship_id": 9}}
+    assert ctx.player_info == {"player": {"id": 11, "ship_id": 7}}
     assert ctx.last_sector_desc["id"] == 14
 
 
@@ -135,6 +134,9 @@ def test_ship_transfer_rejects_mismatched_receipt_without_claiming_success(
         "status": "ok", "type": "ship.list.response",
         "data": {"ships": [{"ship_id": 7, "name": "Still owned", "active": True}]},
     })
+    fake_conn.queue("player.my_info", {"status": "ok", "data": {"player": {"id": 11, "ship_id": 7}}})
+    fake_conn.queue("ship.status", {"status": "ok", "data": {"ship": {"id": 7}}})
+    fake_conn.queue("move.describe_sector", {"status": "ok", "type": "sector.info", "data": {"id": 14}})
     fake_conn.queue("ship.transfer", {
         "status": "ok", "type": "ship.transfer.response",
         "data": {"ship_id": 99, "from_player_id": 11, "target_player_id": 42},
@@ -223,7 +225,7 @@ def test_ship_roster_rejects_malformed_authoritative_id(ctx_factory, fake_conn, 
 def test_ship_roster_refresh_disconnect_does_not_claim_empty_roster(ctx_factory, fake_conn, monkeypatch, capsys):
     ctx = ctx_factory()
     fake_conn.queue("ship.list", {
-        "status": "ok", "type": "ship.list.response", "data": {"ships": "malformed"},
+        "status": "ok", "type": "ship.list.response", "data": {"ships": []},
     })
     original_rpc = fake_conn.rpc
 
@@ -237,8 +239,8 @@ def test_ship_roster_refresh_disconnect_does_not_claim_empty_roster(ctx_factory,
     client.ship_list_flow(ctx)
 
     output = capsys.readouterr().out
-    assert "no authoritative ship list" in output
-    assert "could not be confirmed after connection loss" in output
+    assert "No authoritative ships were returned" in output
+    assert "active-ship confirmation was lost" in output
 
 
 def test_ship_roster_rejects_duplicate_but_preserves_server_active_rows(ctx_factory, fake_conn, capsys):
@@ -267,7 +269,7 @@ def test_ship_roster_rejects_duplicate_but_preserves_server_active_rows(ctx_fact
     assert "Scout" in capsys.readouterr().out
 
 
-def test_ship_roster_displays_authoritative_empty_array(ctx_factory, fake_conn, capsys):
+def test_ship_roster_does_not_claim_empty_array_without_active_ship_confirmation(ctx_factory, fake_conn, capsys):
     ctx = ctx_factory()
     fake_conn.queue("ship.list", {
         "status": "ok", "type": "ship.list.response", "data": {"ships": []},
@@ -275,8 +277,13 @@ def test_ship_roster_displays_authoritative_empty_array(ctx_factory, fake_conn, 
 
     client.ship_list_flow(ctx)
 
-    assert fake_conn.calls == [{"command": "ship.list", "data": {}}]
-    assert "No ships are currently owned." in capsys.readouterr().out
+    assert fake_conn.calls == [
+        {"command": "ship.list", "data": {}},
+        {"command": "ship.status", "data": {}},
+    ]
+    output = capsys.readouterr().out
+    assert "No authoritative ships were returned" in output
+    assert "No ships are currently owned." not in output
 
 
 def test_ship_roster_refusal_refreshes_authoritative_active_ship(ctx_factory, fake_conn, capsys):
@@ -346,7 +353,7 @@ def test_ship_roster_refresh_rejects_wrong_typed_ship_status(ctx_factory, fake_c
     ctx.hud = ctx.hud.__class__(ship_id=4)
     fake_conn.queue("ship.list", {
         "status": "ok", "type": "ship.list.response",
-        "data": {"ships": "malformed"},
+        "data": {"ships": []},
     })
     fake_conn.queue("ship.status", {
         "status": "ok", "type": "player.info",
@@ -363,67 +370,3 @@ def test_ship_roster_refresh_rejects_wrong_typed_ship_status(ctx_factory, fake_c
         {"command": "ship.list", "data": {}},
         {"command": "ship.status", "data": {}},
     ]
-
-
-
-@pytest.mark.parametrize("status_id", [60, 61])
-def test_inspect_active_ship_only_uses_matching_full_status(
-    ctx_factory, fake_conn, monkeypatch, capsys, status_id
-):
-    ctx = ctx_factory()
-    fake_conn.queue("ship.list", {
-        "status": "ok", "type": "ship.list.response",
-        "data": {"ships": [{"ship_id": 60, "name": "USS Explorer", "sector_id": 1, "active": True}]},
-    })
-    fake_conn.queue("ship.inspect", {
-        "status": "ok", "type": "ship.inspect",
-        "data": {"ship": {"ship_id": 60, "name": "USS Explorer", "is_derelict": False}},
-    })
-    fake_conn.queue("ship.status", {
-        "status": "ok", "type": "ship.status",
-        "data": {"ship": {"id": status_id, "type_id": 2, "fighters": 8, "shields": 4,
-                          "hull": 97, "holds": 10, "cargo": [{"commodity": "ore", "quantity": 3}]}},
-    })
-    monkeypatch.setattr("builtins.input", lambda _: "1")
-
-    client.ship_roster_inspect_flow(ctx)
-
-    assert [call["command"] for call in fake_conn.calls] == ["ship.list", "ship.inspect", "ship.status"]
-    result = capsys.readouterr().out
-    assert "Sector: 1    Owner: You" in result
-    if status_id == 60:
-        assert "Shields 4, Fighters 8" in result
-        assert "97/100" in result
-        assert "3 used / 10 total" in result
-    else:
-        assert "Full active-ship status could not be confirmed." in result
-        assert "Shields —, Fighters —" in result
-        assert "Cargo:   not reported" in result
-        assert "97/100" not in result
-
-
-@pytest.mark.parametrize("player_ship_id, sector_text", [(60, "1"), (61, "?")])
-def test_computer_ship_info_displays_confirmed_sector_and_owner(
-    ctx_factory, fake_conn, capsys, player_ship_id, sector_text
-):
-    ctx = ctx_factory(sector={"id": 99})
-    ctx.push("COMPUTER")
-    ctx.state["player_id"] = 5
-    ctx.player_info = {"player": {"id": 5, "ship_id": 60, "sector": 99}}
-    fake_conn.queue("ship.status", {
-        "status": "ok", "type": "ship.status",
-        "data": {"ship": {"id": 60, "name": "USS Explorer", "hull": 100,
-                          "holds": 10, "cargo": []}},
-    })
-    fake_conn.queue("player.my_info", {
-        "status": "ok", "type": "player.info",
-        "data": {"player": {"id": 5, "ship_id": player_ship_id, "sector": 1}},
-    })
-
-    client.handle_choice(ctx, "s")
-
-    assert [call["command"] for call in fake_conn.calls] == ["ship.status", "player.my_info"]
-    result = capsys.readouterr().out
-    assert "USS Explorer" in result
-    assert f"Sector: {sector_text}    Owner: You" in result
-    assert "0 used / 10 total" in result

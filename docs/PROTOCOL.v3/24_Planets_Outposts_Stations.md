@@ -1,13 +1,21 @@
 # 24. Planets, Outposts, & Stations
 
-Canonical product decisions: [`../V3_GAMEPLAY_DECISIONS.md`](../V3_GAMEPLAY_DECISIONS.md); Exchange accounting: [`../V3_GALACTIC_EXCHANGE_CONTRACT.md`](../V3_GALACTIC_EXCHANGE_CONTRACT.md).
+Canonical product decisions: [`../V3_GAMEPLAY_SPEC.md`](../V3_GAMEPLAY_SPEC.md); Exchange accounting: [`../V3_GALACTIC_EXCHANGE_CONTRACT.md`](../V3_GALACTIC_EXCHANGE_CONTRACT.md).
 
 ## 1. Planet Interaction
 
 ### `planet.land`
 Land on a planet (if within range).
 **Args**: `{ "planet_id": 123 }`
-**Response**: `{ "status": "landed", "planet_id": 123 }`
+**Success response**: `type: "planet.land.success"`; `data` contains
+`{ "message": "Landed successfully.", "planet_id": 123 }`. The client must
+match the returned planet ID to the requested ID and then confirm the active
+ship's `onplanet` field through the authoritative player/ship/sector refresh
+before exposing planet actions. In `ship.status`, `onplanet` is an integer
+boolean (`0` in space, `1` landed); the matching planet identity is
+`player.info.data.player.last_planet_id`. Clients must also confirm that the
+refreshed ship ID matches `player.info.data.player.ship_id`. A stale last
+planet ID while `onplanet` is `0` does not authorize surface actions.
 
 The planet owner and authorized members of its owning corporation land without
 hostile-fire checks. An unauthorized attempt resolves active atmosphere Quasar
@@ -37,7 +45,13 @@ so a ship can leave after collecting colonists.
 
 ### `planet.launch`
 Launch from a planet.
-**Response**: `{ "status": "launched", "in_space": true }`
+**Success response**: `type: "planet.launch.success"`; `data` contains
+`{ "message": "Launched successfully.", "sector_id": 12, "hazards": [] }`.
+`sector_id` is the server-confirmed destination. The client closes the planet
+surface on this typed success receipt and refreshes authoritative player,
+active-ship and sector state before enabling further actions. Entry hazards may
+be included in `data.hazards`; a ship destroyed during entry returns an error
+with terminal hazard data instead of this success response.
 
 ### `planet.info`
 Get detailed information about a planet after landing or when authorized as its
@@ -221,18 +235,20 @@ stoppage, slave production output is zero; colonist production continues under
 existing rules.
 
 Slave morale is permanently low and cannot be improved by treatment or
-management. Unrest is deterministic, may stop production and reduce slave
-population, and cannot change ownership. It must be driven by persisted engine
-state, never random rolls or random loss quantities. Unrest interval, stoppage
-duration and population-loss parameters are not assigned defaults here; no
-unrest event may be activated until SysOp policy values and deterministic
-allocation of losses across assigned/unassigned population are configured.
-SysOps can persist the interval (`planet.slave_unrest_interval_days`),
-stoppage duration (`planet.slave_unrest_stoppage_cycles`) and fixed loss
-(`planet.slave_unrest_population_loss`). A value of zero means unset/disabled;
-it is not an active rule. No scheduler currently consumes these settings, and
-the loss-allocation policy remains unresolved. See
-`29_SysOp_Commands.md` and `V3_GAMEPLAY_DECISIONS.md`.
+management. Daily unrest is deterministic, persisted and cannot change
+ownership. The approved V3 daily policy evaluates every 24 game-hours, stops
+slave production for one production cycle, and loses 1% of the current slave
+population per qualifying daily event. The percentage is converted to integer
+population units by floor; assignment losses use deterministic largest-
+remainder allocation and conserve the exact integer loss. Empty populations
+do not create loss events. This daily event is distinct from production-cycle
+unrest: cycle disruption skips only that cycle and causes no population loss.
+The daily policy uses the existing persisted POP-05 scheduler; it does not add
+a second scheduler. Its SysOp settings default to the approved values
+(`planet.slave_unrest_interval_days=1`,
+`planet.slave_unrest_stoppage_cycles=1`,
+`planet.slave_unrest_population_loss_percent=1`). See
+`29_SysOp_Commands.md` and `V3_GAMEPLAY_SPEC.md`.
 
 Evil-aligned players may purchase slaves or enslave colonists during a
 successful planetary conquest. Neutral players may inherit slaves through
@@ -304,7 +320,7 @@ Transfer cargo/colonists between ship and planet.
 Planet commodity balances are read and written through `entity_stock`. A commodity is transferable only when the planet has a matching `planet_goods` row; that row's `max_capacity` is the storage limit. `planet.info.goods` reports the server-confirmed quantity and configured capacity. Colonists remain a population field and are not stored as a commodity balance.
 
 ### `planet.colonists.get` / `planet.colonists.set`
-Read the number of unassigned planet colonists and the ship's available holds, then move colonists between the landed player's ship and the planet. A drop-off adds colonists to the unassigned pool; it does not automatically start production.
+Read the number of unassigned planet colonists and the ship's available holds, then move colonists between the landed player's active ship and the planet. Both pickup and drop-off require that ship to be landed on the requested planet. The ship-cargo update and planet population update commit atomically; failures preserve both sides. A drop-off adds colonists to the unassigned pool; it does not automatically start production. Terra permits pickup only.
 
 Universe setup seeds Terra (planet 1) in sector 1 with unassigned colonists. There is no separate colonist purchase command; to collect the starting population, land on Terra and use the pickup transfer. The daily `terra_replenish` task restores Terra's commodity stock, not its colonist population.
 
@@ -320,7 +336,7 @@ Set the target number of colonists working in each production job on the planet 
 }
 ```
 
-Workers above planet-class capacity or beyond the available colony population are rejected. The difference from the previous assignments is returned to or taken from the unassigned pool. Every 10-minute planet growth tick grows a non-empty colony toward its class population cap and adds new colonists to the unassigned pool; the same tick applies class production multipliers and updates stored goods. The client should show assignments and estimated output separately from confirmed stock.
+Workers above planet-class capacity or beyond the available colony population are rejected. The difference from the previous assignments is returned to or taken from the unassigned pool. Every 10-minute planet growth tick grows a non-empty colony toward its class population cap and adds new colonists to the unassigned pool. For ORE/ORG/EQU, class rows in `planet_production.workers_per_unit` specify the number of assigned workers required for one unit per tick. Integer labor remainders persist per planet and commodity. Built-in class defaults are the noncanonical, versioned twclone V3 values in `V3_GAMEPLAY_SPEC.md`; custom classes may configure their own rate. The approved slave multiplier is applied after normal output is calculated. Fighter production remains a separate citadel-gated contract. The client should show assignments and estimated output separately from confirmed stock.
 
 ### `planet.genesis_create`
 Create a new planet using a Genesis Torpedo. Requires a Genesis Torpedo on the player's ship.

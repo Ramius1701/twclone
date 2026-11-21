@@ -134,10 +134,13 @@ cmd_hardware_list (client_ctx_t *ctx, json_t *root)
   // 3. Fetch current ship state and shiptype capabilities
   int current_holds = 0, current_fighters = 0, current_shields = 0;
   int current_genesis = 0, current_detonators = 0, current_probes = 0;
+  int current_mines = 0, current_limpets = 0, current_photons = 0;
+  int current_beacons = 0;
   int current_cloaks = 0;	// cloaking_devices in ships table
   int has_transwarp = 0, has_planet_scanner = 0, has_long_range_scanner = 0;
   int max_holds = 0, max_fighters = 0, max_shields = 0;
   int max_genesis = 0, max_detonators_st = 0, max_probes_st = 0;	// _st suffix for shiptype limits
+  int max_mines = 0, max_limpets = 0, max_photons = 0, max_beacons = 0;
   int can_transwarp = 0, can_planet_scan = 0, can_long_range_scan = 0;
   // Get ship current state
   db_res_t *res_state = NULL;
@@ -170,6 +173,14 @@ cmd_hardware_list (client_ctx_t *ctx, json_t *root)
       can_transwarp = (int) db_res_col_i64 (res_state, 16, &err);
       can_planet_scan = (int) db_res_col_i64 (res_state, 17, &err);
       can_long_range_scan = (int) db_res_col_i64 (res_state, 18, &err);
+      current_mines = (int) db_res_col_i64 (res_state, 20, &err);
+      current_limpets = (int) db_res_col_i64 (res_state, 21, &err);
+      current_photons = (int) db_res_col_i64 (res_state, 22, &err);
+      current_beacons = (int) db_res_col_i64 (res_state, 23, &err);
+      max_mines = (int) db_res_col_i64 (res_state, 24, &err);
+      max_limpets = (int) db_res_col_i64 (res_state, 25, &err);
+      max_photons = (int) db_res_col_i64 (res_state, 26, &err);
+      max_beacons = (int) db_res_col_i64 (res_state, 27, &err);
     }
   db_res_finalize (res_state);
 
@@ -253,6 +264,34 @@ cmd_hardware_list (client_ctx_t *ctx, json_t *root)
 
 	      max_purchase = MAX (0, limit - current_probes);
 	    }
+          else if (strcasecmp (code, "MINES") == 0)
+            {
+              int limit = max_mines;
+              if (max_per_ship_hw >= 0 && max_per_ship_hw < limit)
+                limit = max_per_ship_hw;
+              max_purchase = MAX (0, limit - current_mines);
+            }
+          else if (strcasecmp (code, "LIMPETS") == 0)
+            {
+              int limit = max_limpets;
+              if (max_per_ship_hw >= 0 && max_per_ship_hw < limit)
+                limit = max_per_ship_hw;
+              max_purchase = MAX (0, limit - current_limpets);
+            }
+          else if (strcasecmp (code, "PHOTONS") == 0)
+            {
+              int limit = max_photons;
+              if (max_per_ship_hw >= 0 && max_per_ship_hw < limit)
+                limit = max_per_ship_hw;
+              max_purchase = MAX (0, limit - current_photons);
+            }
+          else if (strcasecmp (code, "BEACONS") == 0)
+            {
+              int limit = max_beacons;
+              if (max_per_ship_hw >= 0 && max_per_ship_hw < limit)
+                limit = max_per_ship_hw;
+              max_purchase = MAX (0, limit - current_beacons);
+            }
 	  else
 	    {
 	      item_supported = false;	// Unknown special item
@@ -972,6 +1011,10 @@ cmd_shipyard_list (client_ctx_t *ctx, json_t *root)
             }
         }
 
+      /* The player-facing upgrade workflow must send this exact catalogue
+       * identity back as shipyard.upgrade.new_type_id. Names and prices are
+       * display fields and are not safe substitutes. */
+      json_object_set_new (ship_obj, "type_id", json_integer (ship_type_id));
       json_object_set_new (ship_obj, "type", json_string (type_name));
       json_object_set_new (ship_obj, "name", json_string (type_name));	// Using type_name as name for now
       json_object_set_new (ship_obj, "base_price",
@@ -1725,7 +1768,7 @@ check_loan_default (db_t *db, int player_id, int current_time)
   int due_date = 0;
   int is_defaulted = 0;
   if (get_player_loan
-      (db, player_id, &principal, NULL, &due_date, &is_defaulted) == DB_OK)
+      (db, player_id, &principal, NULL, &due_date, &is_defaulted))
     {
       if (is_defaulted == 0 && current_time > due_date && principal > 0)
 	{
@@ -2861,7 +2904,7 @@ cmd_tavern_loan_take (client_ctx_t *ctx, json_t *root)
 
   if (get_player_loan
       (db, ctx->player_id, &current_loan_principal, NULL, NULL,
-       NULL) == DB_OK && current_loan_principal > 0)
+       NULL) && current_loan_principal > 0)
     {
       send_response_error (ctx, root, ERR_TAVERN_LOAN_OUTSTANDING,
 			   "You already have an outstanding loan.");
@@ -2954,10 +2997,10 @@ cmd_tavern_loan_pay (client_ctx_t *ctx, json_t *root)
   int current_loan_is_defaulted = 0;
 
 
-  if (get_player_loan
+  if (!get_player_loan
       (db, ctx->player_id, &current_loan_principal,
        &current_loan_interest_rate, &current_loan_due_date,
-       &current_loan_is_defaulted) != DB_OK || current_loan_principal <= 0)
+       &current_loan_is_defaulted) || current_loan_principal <= 0)
     {
       send_response_error (ctx, root, ERR_TAVERN_NO_LOAN,
 			   "You do not have an outstanding loan.");

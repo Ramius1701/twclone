@@ -95,6 +95,8 @@ config_set_defaults (void)
   g_cfg.shipyard_require_hardware_compat = 1;
   g_cfg.shipyard_tax_bp = 1000;
   g_cfg.planet_market_buy_order_expiry_seconds = 86400;
+  g_cfg.photon_effect_duration_seconds = 600;
+  g_cfg.toll_fighter_rate = 1;
   g_cfg.illegal_allowed_neutral = 1;
   g_cfg.illegal_min_experience = 400;
   /* --- Internal / Other defaults --- */
@@ -695,6 +697,24 @@ apply_db (db_t *db)
 	      else
 	        LOGW ("[config] Invalid planet market buy order expiry; using 86400 seconds.");
 	    }
+          else if (strcmp (key, "combat.photon_effect_duration_seconds") == 0)
+            {
+              int duration = 600;
+              cfg_parse_int (val, type, &duration);
+              if (duration >= 1 && duration <= 86400)
+                g_cfg.photon_effect_duration_seconds = duration;
+              else
+                LOGW ("[config] Invalid photon effect duration; using 600 seconds.");
+            }
+	  else if (strcmp (key, "combat.toll_credits_per_fighter") == 0)
+	    {
+	      int rate = 1;
+	      cfg_parse_int (val, type, &rate);
+	      if (rate >= 0 && rate <= 1000000)
+	        g_cfg.toll_fighter_rate = rate;
+	      else
+	        LOGW ("[config] Invalid toll fighter rate; using 1 credit.");
+	    }
 	  else if (strcmp (key, "illegal_allowed_neutral") == 0)
 	    {
 	      cfg_parse_int (val, type, &g_cfg.illegal_allowed_neutral);
@@ -783,11 +803,12 @@ apply_db (db_t *db)
 	      if (cfg_parse_int64 (val, type, &setting) == 0 && setting >= 0)
 		g_cfg.planet_slave_unrest_stoppage_cycles = setting;
 	    }
-	  else if (strcmp (key, "planet.slave_unrest_population_loss") == 0)
+	  else if (strcmp (key, "planet.slave_unrest_population_loss_percent") == 0)
 	    {
 	      int64_t setting = 0;
-	      if (cfg_parse_int64 (val, type, &setting) == 0 && setting >= 0)
-		g_cfg.planet_slave_unrest_population_loss = setting;
+	      if (cfg_parse_int64 (val, type, &setting) == 0
+                  && setting >= 0 && setting <= 100)
+		g_cfg.planet_slave_unrest_population_loss_percent = setting;
 	    }
 	  else if (strcmp (key, "starter_shiptype_name") == 0)
 	    {
@@ -1180,6 +1201,8 @@ config_load (void)
   c->shipyard_sale_factor_bp = g_cfg.shipyard_sale_factor_bp;
   c->galactic_exchange_liquidity_credits = g_cfg.galactic_exchange_liquidity_credits;
   c->shipyard_used_resale_factor_bp = g_cfg.shipyard_used_resale_factor_bp;
+  c->photon_effect_duration_seconds = g_cfg.photon_effect_duration_seconds;
+  c->toll_fighter_rate = g_cfg.toll_fighter_rate;
   /* Keep the runtime starter-ship policy in the legacy config view used by
    * player provisioning.  Without this copy, spawn_starter_ship() receives
    * an empty type name even though g_cfg has the configured value. */

@@ -88,7 +88,7 @@ def test_ship_repair_refusal_refreshes_authoritative_credits_and_hull(
     assert "Insufficient credits" in capsys.readouterr().out
 
 
-def test_shipyard_sale_requires_authoritative_active_ship(
+def test_shipyard_sale_is_visible_but_does_not_call_unimplemented_server_handler(
     ctx_factory, fake_conn, menus, capsys
 ):
     ctx = ctx_factory()
@@ -97,4 +97,4 @@ def test_shipyard_sale_requires_authoritative_active_ship(
     client.dispatch_action(ctx, options["s"]["action"])
 
     assert fake_conn.calls == [{"command": "player.my_info", "data": {}}]
-    assert "requires an authoritative active-ship ID" in capsys.readouterr().out
+    assert "Shipyard sale requires an authoritative active-ship ID" in capsys.readouterr().out

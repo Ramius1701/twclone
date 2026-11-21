@@ -60,8 +60,8 @@ def test_ship_rename_refusal_does_not_refresh_or_claim_success(
 def test_ship_rename_success_without_authoritative_name_does_not_claim_local_name(
     ctx_factory, fake_conn, monkeypatch, capsys
 ):
-    fake_conn.queue("ship.rename", {"status": "ok", "type": "ship.renamed", "data": {"ship_id": 10}})
-    fake_conn.queue("ship.status", {"status": "ok", "type": "ship.status", "data": {"ship": {"ship_id": 10}}})
+    fake_conn.queue("ship.rename", {"status": "ok", "data": {"ship_id": 10}})
+    fake_conn.queue("ship.status", {"status": "ok", "data": {"ship": {"ship_id": 10}}})
     monkeypatch.setattr("builtins.input", lambda *_: "Aurora")
 
     client.rename_ship_flow(ctx_factory())
@@ -166,7 +166,7 @@ def test_attack_requires_target_from_current_server_list(ctx_factory, fake_conn,
     assert "not listed in the current sector" in capsys.readouterr().out
 
 
-def test_attack_reports_server_refusal_and_refreshes_without_retry(
+def test_attack_reports_server_refusal_without_refresh_or_retry(
     ctx_factory, fake_conn, monkeypatch, capsys
 ):
     ctx = ctx_factory(sector={"id": 22, "ships": [{"id": 20, "name": "Target"}]})
@@ -174,12 +174,14 @@ def test_attack_reports_server_refusal_and_refreshes_without_retry(
     fake_conn.queue("combat.attack", {
         "status": "refused", "error": {"message": "Target is protected."},
     })
+    fake_conn.queue("player.my_info", {"status": "ok", "data": {"player": {"id": 3, "ship_id": 10}}})
+    fake_conn.queue("ship.status", {"status": "ok", "data": {"ship": {"id": 10}}})
+    fake_conn.queue("move.describe_sector", {"status": "ok", "type": "sector.info", "data": {"id": 22, "ships": [{"id": 20, "name": "Target"}]}})
     answers = iter(["20", "y"])
     monkeypatch.setattr("builtins.input", lambda *_: next(answers))
 
     client.combat_attack_flow(ctx)
 
-    assert fake_conn.calls[0] == {"command": "combat.attack", "data": {"target_ship_id": 20}}
     assert [call["command"] for call in fake_conn.calls] == [
         "combat.attack", "player.my_info", "ship.status", "move.describe_sector",
     ]

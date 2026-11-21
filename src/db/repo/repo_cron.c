@@ -12,8 +12,10 @@
 #include "db/db_api.h"
 #include "db/sql_driver.h"
 #include "planet_fighter_production.h"
+#include "slave_unrest_cycle.h"
 #include "../../slave_population.h"
 #include "errors.h"
+#include "../../server_log.h"
 
 /* ==================================================================== */
 /* CRON HELPERS (Migrated from server_cron.c)                           */
@@ -369,34 +371,20 @@ db_cron_try_lock (db_t *db, const char *name, int64_t now_s)
   /* 3. Attempt to acquire/refresh lock */
 
   char sql_ins[512];
+  const char *insert_tmpl = db_backend (db) == DB_BACKEND_POSTGRES
+    ? "INSERT INTO locks(lock_name, owner, until_ms) VALUES({1}, {2}, {3}) ON CONFLICT (lock_name) DO NOTHING"
+    : "INSERT IGNORE INTO locks(lock_name, owner, until_ms) VALUES({1}, {2}, {3})";
+  if (sql_build (db, insert_tmpl, sql_ins, sizeof sql_ins) != 0)
+    return 0;
+  db_bind_t ins_params[] = { db_bind_text (name), db_bind_text(g_engine_uuid),
+                             db_bind_i64 (until_ms) };
+  int64_t inserted = 0;
+  if (!db_exec_rows_affected (db, sql_ins, ins_params, 3, &inserted, &err))
+    return 0;
 
-  sql_build(db, "INSERT INTO locks(lock_name, owner, until_ms) VALUES({1}, {2}, {3});", sql_ins, sizeof(sql_ins));
-
-  db_bind_t ins_params[] = { db_bind_text (name), db_bind_text(g_engine_uuid), db_bind_i64 (until_ms) };
-
-  if (!db_exec (db, sql_ins, ins_params, 3, &err)) {
-
-      if (err.code == ERR_DB_CONSTRAINT) {
-
-          /* Double check if we own it (concurrent write) */
-
-          sql_build(db, "UPDATE locks SET until_ms = {3} WHERE lock_name={1} AND owner={2};", sql_ins, sizeof(sql_ins));
-
-          int64_t rows = 0;
-
-          if (db_exec_rows_affected(db, sql_ins, ins_params, 3, &rows, &err) && rows > 0) return 1;
-
-          return 0;
-
-      }
-
-      return 0;
-
-  }
-
-
-
-  return 1;
+  /* Conflict means a concurrent invocation already owns the lock, including
+   * one from this server process. Never refresh an in-flight lock here. */
+  return inserted == 1;
 
 }
 
@@ -1169,10 +1157,12 @@ db_cron_planet_update_production_stock (db_t *db, int64_t now_s)
   {
     int64_t planet_id, fighters, remainder, last_tick, production_last_tick;
     int64_t citadel_level;
+    int64_t unrest_level;
     int64_t fighter_factor, fighter_capacity;
     int64_t weapons_workers;
     char commodity[16];
     int64_t quantity, stock_capacity, net_delta, normal_output, consumption;
+    int64_t next_worker_remainder;
     bool slave_population, unrest_stopped;
   } production_row_t;
 
@@ -1198,17 +1188,29 @@ db_cron_planet_update_production_stock (db_t *db, int64_t now_s)
     "COALESCE(p.fighter_production_remainder, 0), "
     "COALESCE(p.fighter_production_last_tick, -1), "
     "COALESCE(p.production_last_tick, -1), p.population_type, "
+    "COALESCE(p.slave_unrest_level, 0), "
     "COALESCE(p.slave_unrest_stopped, FALSE), "
     "COALESCE(c.level, p.citadel_level, 0), "
     "COALESCE(pt.fighterProduction, 0), COALESCE(pt.maxfighters, 0), "
     "COALESCE(p.colonists_weapons, 0), "
     "pp.commodity_code, COALESCE(es.quantity, 0), pg.max_capacity, "
     "COALESCE(pp.base_prod_rate, 0) + CASE pp.commodity_code "
-    "WHEN 'ORE' THEN p.colonists_ore "
-    "WHEN 'ORG' THEN p.colonists_org * COALESCE(pt.organicsProduction, 0) "
-    "WHEN 'EQU' THEN p.colonists_eq * COALESCE(pt.equipmentProduction, 0) "
+    "WHEN 'ORE' THEN CASE WHEN pp.workers_per_unit > 0 THEN "
+    "FLOOR((COALESCE(p.colonists_ore,0)+COALESCE(p.ore_production_remainder,0))/NULLIF(pp.workers_per_unit,0)) "
+    "ELSE p.colonists_ore END "
+    "WHEN 'ORG' THEN CASE WHEN pp.workers_per_unit > 0 THEN "
+    "FLOOR((COALESCE(p.colonists_org,0)+COALESCE(p.organics_production_remainder,0))/NULLIF(pp.workers_per_unit,0)) "
+    "ELSE p.colonists_org * COALESCE(pt.organicsProduction, 0) END "
+    "WHEN 'EQU' THEN CASE WHEN pp.workers_per_unit > 0 THEN "
+    "FLOOR((COALESCE(p.colonists_eq,0)+COALESCE(p.equipment_production_remainder,0))/NULLIF(pp.workers_per_unit,0)) "
+    "ELSE p.colonists_eq * COALESCE(pt.equipmentProduction, 0) END "
     "WHEN 'FUE' THEN p.colonists_unassigned * COALESCE(pt.fuelProduction, 0) "
-    "ELSE p.colonists_unassigned END, COALESCE(pp.base_cons_rate, 0) "
+    "ELSE p.colonists_unassigned END, COALESCE(pp.base_cons_rate, 0), "
+    "CASE pp.commodity_code WHEN 'ORE' THEN "
+    "(COALESCE(p.colonists_ore,0)+COALESCE(p.ore_production_remainder,0)) % NULLIF(pp.workers_per_unit,0) "
+    "WHEN 'ORG' THEN (COALESCE(p.colonists_org,0)+COALESCE(p.organics_production_remainder,0)) % NULLIF(pp.workers_per_unit,0) "
+    "WHEN 'EQU' THEN (COALESCE(p.colonists_eq,0)+COALESCE(p.equipment_production_remainder,0)) % NULLIF(pp.workers_per_unit,0) "
+    "ELSE 0 END "
     "FROM planets p JOIN planet_production pp ON p.type = pp.planet_type_id "
     "JOIN planet_goods pg ON pg.planet_id = p.planet_id AND pg.commodity = pp.commodity_code "
     "LEFT JOIN entity_stock es ON es.entity_type = 'planet' AND es.entity_id = p.planet_id AND es.commodity_code = pp.commodity_code "
@@ -1217,7 +1219,7 @@ db_cron_planet_update_production_stock (db_t *db, int64_t now_s)
     "WHERE COALESCE(p.production_last_tick, -1) < {1} AND "
     "(pp.base_prod_rate > 0 OR pp.base_cons_rate > 0 OR p.colonists_ore > 0 OR p.colonists_org > 0 OR p.colonists_eq > 0 OR p.colonists_weapons > 0 OR p.colonists_unassigned > 0) "
     "ORDER BY p.planet_id, pp.commodity_code FOR UPDATE OF p";
-  char select_sql[2048];
+  char select_sql[4096];
   if (sql_build (db, select_template, select_sql, sizeof select_sql) != 0)
     {
       db_tx_rollback (db, &err);
@@ -1260,22 +1262,24 @@ db_cron_planet_update_production_stock (db_t *db, int64_t now_s)
       const char *population_type = db_res_col_text (res, 5, &err);
       row->slave_population = population_type
         && strcmp (population_type, "SLAVE") == 0;
-      row->unrest_stopped = db_res_col_bool (res, 6, &err);
-      row->citadel_level = db_res_col_i64 (res, 7, &err);
-      row->fighter_factor = db_res_col_i64 (res, 8, &err);
-      row->fighter_capacity = db_res_col_i64 (res, 9, &err);
-      row->weapons_workers = db_res_col_i64 (res, 10, &err);
-      const char *commodity = db_res_col_text (res, 11, &err);
+      row->unrest_level = db_res_col_i64 (res, 6, &err);
+      row->unrest_stopped = db_res_col_bool (res, 7, &err);
+      row->citadel_level = db_res_col_i64 (res, 8, &err);
+      row->fighter_factor = db_res_col_i64 (res, 9, &err);
+      row->fighter_capacity = db_res_col_i64 (res, 10, &err);
+      row->weapons_workers = db_res_col_i64 (res, 11, &err);
+      const char *commodity = db_res_col_text (res, 12, &err);
       if (!commodity || strlen (commodity) >= sizeof row->commodity)
         {
           err.code = -1;
           break;
         }
       strcpy (row->commodity, commodity);
-      row->quantity = db_res_col_i64 (res, 12, &err);
-      row->stock_capacity = db_res_col_i64 (res, 13, &err);
-      row->normal_output = db_res_col_i64 (res, 14, &err);
-      row->consumption = db_res_col_i64 (res, 15, &err);
+      row->quantity = db_res_col_i64 (res, 13, &err);
+      row->stock_capacity = db_res_col_i64 (res, 14, &err);
+      row->normal_output = db_res_col_i64 (res, 15, &err);
+      row->next_worker_remainder = db_res_col_i64 (res, 17, &err);
+      row->consumption = db_res_col_i64 (res, 16, &err);
       int64_t effective_output = slave_population_effective_output
         (row->normal_output, row->commodity, row->slave_population,
          row->unrest_stopped);
@@ -1334,12 +1338,64 @@ db_cron_planet_update_production_stock (db_t *db, int64_t now_s)
           }
 
       planet_fighter_plan_t fighter_plan = {0};
+      slave_unrest_cycle_t unrest_cycle = slave_unrest_cycle_evaluate
+        ((int) planet->unrest_level, planet->slave_population,
+         planet->planet_id, now_s / 600);
+      int unrest_before = (int) planet->unrest_level;
+      if (planet->unrest_stopped)
+        {
+          /* POP-05's persistent stoppage remains authoritative; it already
+           * suppresses this cycle and has its own daily recovery/loss event. */
+          unrest_cycle.level_after = unrest_before;
+          unrest_cycle.probability_percent = 0;
+          unrest_cycle.disrupted = false;
+        }
+      const char *unrest_event_sql =
+        "INSERT INTO planet_slave_production_events "
+        "(planet_id,production_tick,unrest_before,unrest_after,"
+        "disruption_probability,disruption_roll,disrupted) "
+        "VALUES ({1},{2},{3},{4},{5},{6},{7}) ON CONFLICT "
+        "(planet_id,production_tick) DO NOTHING";
+      char unrest_event_stmt[768];
+      if (sql_build (db, unrest_event_sql, unrest_event_stmt,
+                     sizeof unrest_event_stmt) != 0
+          || !db_exec (db, unrest_event_stmt,
+               (db_bind_t[]){db_bind_i64 (planet->planet_id),
+                 db_bind_i64 (now_s / 600), db_bind_i64 (unrest_before),
+                 db_bind_i64 (unrest_cycle.level_after),
+                 db_bind_i64 (unrest_cycle.probability_percent),
+                 db_bind_i64 (unrest_cycle.roll_percent),
+                 db_bind_bool (unrest_cycle.disrupted)}, 7, &err)
+          || !db_exec (db,
+               "UPDATE planets SET slave_unrest_level={1} WHERE planet_id={2}",
+               (db_bind_t[]){db_bind_i64 (unrest_cycle.level_after),
+                             db_bind_i64 (planet->planet_id)}, 2, &err))
+        {
+          free (rows);
+          db_tx_rollback (db, &err);
+          return err.code ? err.code : ERR_DB_EXEC_FAILED;
+        }
+      if (unrest_cycle.disrupted)
+        for (size_t i = begin; i < end; i++)
+          rows[i].net_delta = -rows[i].consumption;
+
       if (planet->citadel_level >= 1 && planet->fighter_factor > 0)
         fighter_plan = planet_fighter_plan (
           planet->citadel_level, planet->weapons_workers,
           planet->fighter_factor, equipment_available, planet->fighters,
           planet->fighter_capacity, planet->remainder, now_s / 600,
           planet->last_tick);
+      if (unrest_cycle.disrupted && planet->citadel_level >= 1
+          && planet->fighter_factor > 0)
+        {
+          /* Skip only this cycle's fighter output. Keep fractional labor and
+           * advance its tick so a disrupted cycle is not banked for replay. */
+          fighter_plan.fighters_added = 0;
+          fighter_plan.equipment_consumed = 0;
+          fighter_plan.remainder = planet->remainder;
+          fighter_plan.last_tick = now_s / 600;
+          fighter_plan.duplicate_tick = false;
+        }
 
       for (size_t i = begin; i < end; i++)
         {
@@ -1358,9 +1414,33 @@ db_cron_planet_update_production_stock (db_t *db, int64_t now_s)
                                       db_bind_i64 (now_s)},
                         4, &err))
             {
+              LOGE ("planet production stock settlement failed planet=%lld commodity=%s: %s",
+                    (long long) row->planet_id, row->commodity, err.message);
               free (rows);
               db_tx_rollback (db, &err);
               return err.code ? err.code : -1;
+            }
+
+          if (row->next_worker_remainder >= 0 && !unrest_cycle.disrupted
+              && !planet->unrest_stopped)
+            {
+              const char *remainder_sql =
+                "UPDATE planets SET ore_production_remainder = CASE WHEN {1}='ORE' THEN {2} ELSE ore_production_remainder END, "
+                "organics_production_remainder = CASE WHEN {1}='ORG' THEN {2} ELSE organics_production_remainder END, "
+                "equipment_production_remainder = CASE WHEN {1}='EQU' THEN {2} ELSE equipment_production_remainder END "
+                "WHERE planet_id={3};";
+              if (!db_exec (db, remainder_sql,
+                            (db_bind_t[]){db_bind_text (row->commodity),
+                                          db_bind_i64 (row->next_worker_remainder),
+                                          db_bind_i64 (row->planet_id)},
+                            3, &err))
+                {
+                  LOGE ("planet production remainder update failed planet=%lld commodity=%s: %s",
+                        (long long) row->planet_id, row->commodity, err.message);
+                  free (rows);
+                  db_tx_rollback (db, &err);
+                  return err.code ? err.code : -1;
+                }
             }
 
           int64_t produced_quantity = quantity - row->quantity;
@@ -1378,6 +1458,8 @@ db_cron_planet_update_production_stock (db_t *db, int64_t now_s)
                                           db_bind_i64 (now_s)},
                             4, &err))
                 {
+                  LOGE ("planet production activity insert failed planet=%lld commodity=%s: %s",
+                        (long long) row->planet_id, row->commodity, err.message);
                   free (rows);
                   db_tx_rollback (db, &err);
                   return err.code ? err.code : -1;
@@ -1409,6 +1491,9 @@ db_cron_planet_update_production_stock (db_t *db, int64_t now_s)
            2, &affected, &err)
           || affected != 1)
         {
+          LOGE ("planet production tick update failed planet=%lld affected=%lld: %s",
+                (long long) planet->planet_id, (long long) affected,
+                err.message);
           free (rows);
           db_tx_rollback (db, &err);
           return err.code ? err.code : -1;
@@ -2824,9 +2909,9 @@ db_cron_planet_get_production_overview_json (db_t *db, int planet_id,
   const char *query =
     "SELECT pp.commodity_code, "
     "COALESCE(pp.base_prod_rate,0) + CASE pp.commodity_code "
-    "WHEN 'ORE' THEN COALESCE(p.colonists_ore,0) "
-    "WHEN 'ORG' THEN COALESCE(p.colonists_org,0)*COALESCE(pt.organicsProduction,0) "
-    "WHEN 'EQU' THEN COALESCE(p.colonists_eq,0)*COALESCE(pt.equipmentProduction,0) "
+    "WHEN 'ORE' THEN CASE WHEN pp.workers_per_unit>0 THEN FLOOR((COALESCE(p.colonists_ore,0)+COALESCE(p.ore_production_remainder,0))/NULLIF(pp.workers_per_unit,0)) ELSE COALESCE(p.colonists_ore,0) END "
+    "WHEN 'ORG' THEN CASE WHEN pp.workers_per_unit>0 THEN FLOOR((COALESCE(p.colonists_org,0)+COALESCE(p.organics_production_remainder,0))/NULLIF(pp.workers_per_unit,0)) ELSE COALESCE(p.colonists_org,0)*COALESCE(pt.organicsProduction,0) END "
+    "WHEN 'EQU' THEN CASE WHEN pp.workers_per_unit>0 THEN FLOOR((COALESCE(p.colonists_eq,0)+COALESCE(p.equipment_production_remainder,0))/NULLIF(pp.workers_per_unit,0)) ELSE COALESCE(p.colonists_eq,0)*COALESCE(pt.equipmentProduction,0) END "
     "ELSE 0 END, COALESCE(pp.base_cons_rate,0), p.population_type, "
     "COALESCE(p.slave_unrest_stopped,FALSE) "
     "FROM planets p JOIN planet_production pp ON pp.planet_type_id=p.type "
@@ -2908,10 +2993,10 @@ int
 db_cron_apply_slave_unrest (db_t *db, int64_t now_s,
                             int64_t interval_days,
                             int64_t stoppage_cycles,
-                            int64_t population_loss)
+                            int64_t population_loss_percent)
 {
   if (!db || now_s <= 0 || interval_days < 0 || stoppage_cycles < 0
-      || population_loss < 0)
+      || population_loss_percent < 0 || population_loss_percent > 100)
     return ERR_INVALID_ARG;
   db_error_t err = {0};
   if (!db_tx_begin (db, DB_TX_DEFAULT, &err))
@@ -2972,7 +3057,8 @@ db_cron_apply_slave_unrest (db_t *db, int64_t now_s,
           r->stopped = false;
         }
       /* Zero is the deliberate unset/disabled configuration sentinel. */
-      if (interval_days == 0 || stoppage_cycles == 0 || population_loss == 0)
+      if (interval_days == 0 || stoppage_cycles == 0
+          || population_loss_percent == 0)
         continue;
       if (interval_days > INT64_MAX / 86400
           || stoppage_cycles > INT64_MAX / 600)
@@ -3000,9 +3086,27 @@ db_cron_apply_slave_unrest (db_t *db, int64_t now_s,
             { err.code = ERR_DB_CONSTRAINT; goto unrest_fail; }
           bucket_total += r->bucket[b];
         }
-      if (bucket_total <= 0) continue;
-      int64_t loss = population_loss < bucket_total
-        ? population_loss : bucket_total;
+      if (bucket_total == 0)
+        {
+          /* Empty slave worlds have no qualifying unrest loss event. Advance
+           * their persisted evaluation deadline so the due row is not scanned
+           * on every engine tick. */
+          if (r->next_at > INT64_MAX - interval_s)
+            { err.code = ERR_INVALID_ARG; goto unrest_fail; }
+          if (!db_exec (db,
+                "UPDATE planets SET slave_unrest_next_at={1} WHERE planet_id={2} AND COALESCE(slave_unrest_next_at,0)={3}",
+                (db_bind_t[]){db_bind_i64 (r->next_at + interval_s),
+                  db_bind_i64 (r->planet_id), db_bind_i64 (r->next_at)}, 3,
+                &err))
+            goto unrest_fail;
+          continue;
+        }
+      /* The approved 1% is settled in integer population units. Fractional
+       * people are discarded using the game's existing integer-floor rule;
+       * the largest-remainder helper then conserves the exact integer loss
+       * across assignment buckets. */
+      __int128 loss_product = (__int128) bucket_total * population_loss_percent;
+      int64_t loss = (int64_t) (loss_product / 100);
       int64_t split[5] = {0};
       if (!slave_population_split_loss (r->bucket, 5, loss, split))
         { err.code = ERR_DB_CONSTRAINT; goto unrest_fail; }
@@ -3013,12 +3117,12 @@ db_cron_apply_slave_unrest (db_t *db, int64_t now_s,
       int64_t next_at = r->next_at + interval_s;
       const char *event_tmpl =
         "INSERT INTO planet_slave_unrest_events(planet_id,scheduled_at,"
-        "stoppage_until,configured_population_loss,applied_population_loss)"
+        "stoppage_until,configured_population_loss_percent,applied_population_loss)"
         " VALUES({1},{2},{3},{4},{5})";
       if (sql_build (db, event_tmpl, sql, sizeof sql) != 0
           || !db_exec (db, sql,
                 (db_bind_t[]){db_bind_i64 (r->planet_id),db_bind_i64 (r->next_at),
-                  db_bind_i64 (stopped_until),db_bind_i64 (population_loss),
+                  db_bind_i64 (stopped_until),db_bind_i64 (population_loss_percent),
                   db_bind_i64 (loss)}, 5, &err))
         goto unrest_fail;
       const char *update_tmpl =

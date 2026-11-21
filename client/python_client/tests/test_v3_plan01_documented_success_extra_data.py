@@ -13,19 +13,17 @@ def test_typed_landing_response_keeps_nested_id_when_data_is_present(
         "data": {"planet_id": 77, "message": "Landing accepted"},
     })
     fake_conn.queue("player.my_info", {
-        "status": "ok", "type": "player.info", "data": {"player": {"id": 3, "ship_id": 9, "turns_remaining": 39}},
+        "status": "ok", "data": {"player": {"id": 3, "ship_id": 9, "turns": 39}},
     })
     fake_conn.queue("ship.status", {
-        "status": "ok", "type": "ship.status", "data": {"ship": {"id": 9, "onplanet": 77}},
+        "status": "ok", "type": "ship.status", "data": {"ship": {"id": 9, "onplanet": 1}},
     })
+    fake_conn.queue("move.describe_sector", {"status": "ok", "type": "sector.info", "data": {"sector_id": 17, "planets": [{"planet_id": 77}]}})
     fake_conn.queue("planet.info", {
-        "status": "ok", "type": "planet.info", "data": {"planet": {"planet_id": 77, "sector_id": 17}},
+        "status": "ok", "data": {"planet": {"planet_id": 77, "sector_id": 17}},
     })
     monkeypatch.setattr("builtins.input", lambda *_: "")
 
-    fake_conn.queue("move.describe_sector", {
-        "status": "ok", "type": "sector.info", "data": {"id": 17},
-    })
     client.land_flow(ctx)
 
     assert ctx.state["on_planet"] is True

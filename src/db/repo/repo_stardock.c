@@ -495,7 +495,7 @@ int repo_stardock_get_port_by_sector(db_t *db, int32_t sector_id, int32_t *out_p
 int repo_stardock_get_ship_state(db_t *db, int32_t ship_id, db_res_t **out_res)
 {
     /* SQL_VERBATIM: Q2 */
-    const char *sql = "SELECT s.holds, s.fighters, s.shields, s.genesis, s.detonators, s.probes, s.cloaking_devices, s.has_transwarp, s.has_planet_scanner, s.has_long_range_scanner, st.maxholds, st.maxfighters, st.maxshields, st.maxgenesis, st.max_detonators, st.max_probes, st.can_transwarp, st.can_planet_scan, st.can_long_range_scan, st.max_cloaks FROM ships s JOIN shiptypes st ON s.type_id = st.shiptypes_id WHERE s.ship_id = {1};";
+    const char *sql = "SELECT s.holds, s.fighters, s.shields, s.genesis, s.detonators, s.probes, s.cloaking_devices, s.has_transwarp, s.has_planet_scanner, s.has_long_range_scanner, st.maxholds, st.maxfighters, st.maxshields, st.maxgenesis, st.max_detonators, st.max_probes, st.can_transwarp, st.can_planet_scan, st.can_long_range_scan, st.max_cloaks, s.mines, s.limpets, s.photons, s.beacons, st.maxmines, st.maxlimpets, st.maxphotons, st.maxbeacons FROM ships s JOIN shiptypes st ON s.type_id = st.shiptypes_id WHERE s.ship_id = {1};";
     char sql_converted[1024];
     sql_build(db, sql, sql_converted, sizeof(sql_converted));
     db_error_t err;
@@ -850,7 +850,11 @@ int repo_stardock_upgrade_ship(db_t *db, int32_t new_type_id, const char *new_na
         return ERR_DB_BUSY;
     }
 
-    const char *ship_sql = "UPDATE ships SET type_id = {1}, name = {2} WHERE ship_id = {3};";
+    /* A replacement hull must carry at least its standard starting hold
+     * capacity. Preserve already purchased capacity when it is higher, and
+     * rely on the command's target-hull eligibility check to keep it within
+     * maxholds. This is essential when recovering from a zero-hold escape pod. */
+    const char *ship_sql = "UPDATE ships SET type_id = {1}, name = {2}, holds = GREATEST(COALESCE(holds, 0), (SELECT COALESCE(initialholds, 0) FROM shiptypes WHERE shiptypes_id = {1})) WHERE ship_id = {3};";
     if (sql_build(db, ship_sql, sql_converted, sizeof(sql_converted)) != 0) {
         (void)db_tx_rollback(db, &err);
         return ERR_DB_QUERY_FAILED;
@@ -977,6 +981,19 @@ repo_stardock_purchase_used_ship (db_t *db, int32_t player_id,
              (db_bind_t[]){db_bind_i32 (used_ship_id),db_bind_i32 (player_id)},
              2, &err))
       goto used_fail;
+    /* The used hull becomes the buyer's active ship in the same transaction
+     * as its primary ownership transfer. The deferred active-owner invariant
+     * validates both records at commit. */
+    if (sql_build (db,
+        "UPDATE players SET ship_id={1} WHERE player_id={2} AND ship_id={3}",
+        sql, sizeof sql) != 0)
+      { err.code = ERR_DB_QUERY_FAILED; goto used_fail; }
+    affected = 0;
+    if (!db_exec_rows_affected (db, sql,
+          (db_bind_t[]){db_bind_i32 (used_ship_id),db_bind_i32 (player_id),
+            db_bind_i32 (old_ship_id)}, 3, &affected, &err)
+        || affected != 1)
+      { if (!err.code) err.code = ERR_DB_BUSY; goto used_fail; }
     if (sql_build (db,
         "DELETE FROM shipyard_used_inventory WHERE used_inventory_id={1} "
         "AND ship_id={2} AND port_id={3}", sql, sizeof sql) != 0)
@@ -1279,7 +1296,10 @@ int repo_stardock_update_loan_repayment(db_t *db, int32_t player_id, int64_t new
 int repo_stardock_get_commodity_prices(db_t *db, db_res_t **out_res)
 {
     /* SQL_VERBATIM: Q39 */
-    const char *sql = "SELECT p.sector_id, c.name, pt.mode, pt.maxproduct, (c.base_price * (10000 + c.volatility * (RANDOM() % 200 - 100)) / 10000) AS price "
+    /* Barcharts are a stable public market summary. RANDOM() % is invalid
+       for PostgreSQL's floating-point RANDOM() and is not portable to MySQL;
+       report the authoritative configured base price instead. */
+    const char *sql = "SELECT p.sector_id, c.name, pt.mode, pt.maxproduct, c.base_price AS price "
                       "FROM ports p JOIN port_trade pt ON p.port_id = pt.port_id JOIN commodities c ON c.code = pt.commodity "
                       "ORDER BY price DESC LIMIT 5;";
     char sql_converted[512];

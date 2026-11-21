@@ -1,0 +1,1468 @@
+{
+  "name": "V3 deterministic actual-scheduler economy simulation (30 days)",
+  "description": "Advances due registered server cron handlers through the deterministic QA clock. Captures daily balances, bank and corporation transaction totals by type, planetary and port stocks, population, remainders, reward counts and invariants. No gameplay rates are modified.",
+  "tests": [
+    {
+      "name": "Authenticate isolated SysOp clock operator",
+      "command": "auth.login",
+      "user": "admin",
+      "data": {
+        "username": "System",
+        "passwd": "BOT"
+      },
+      "expect": {
+        "status": "ok"
+      }
+    },
+    {
+      "name": "Seed a bounded populated planet for actual scheduler production",
+      "command": "sys.raw_sql_exec",
+      "user": "admin",
+      "data": {
+        "sql": "UPDATE planets SET population=1000,population_type='COLONIST',colonists_unassigned=0,colonists_ore=1000,colonists_org=0,colonists_eq=0,colonists_weapons=0,ore_production_remainder=0,production_last_tick=-1 WHERE planet_id=900;"
+      },
+      "expect": {
+        "status": "ok"
+      }
+    },
+    {
+      "name": "Configure production using the authoritative planet-class worker rule",
+      "command": "sys.raw_sql_exec",
+      "user": "admin",
+      "data": {
+        "sql": "UPDATE planet_production SET base_prod_rate=0,base_cons_rate=0,workers_per_unit=100 WHERE planet_type_id=(SELECT type FROM planets WHERE planet_id=900) AND commodity_code='ORE';"
+      },
+      "expect": {
+        "status": "ok"
+      }
+    },
+    {
+      "name": "Initialize controlled planetary ORE storage and activity ledger",
+      "command": "sys.raw_sql_exec",
+      "user": "admin",
+      "data": {
+        "sql": "INSERT INTO planet_goods(planet_id,commodity,quantity,max_capacity,production_rate) VALUES(900,'ORE',0,10000,0) ON CONFLICT(planet_id,commodity) DO UPDATE SET quantity=0,max_capacity=10000,production_rate=0;"
+      },
+      "expect": {
+        "status": "ok"
+      }
+    },
+    {
+      "name": "Initialize authoritative planetary inventory",
+      "command": "sys.raw_sql_exec",
+      "user": "admin",
+      "data": {
+        "sql": "INSERT INTO entity_stock(entity_type,entity_id,commodity_code,quantity,price) VALUES('planet',900,'ORE',0,0) ON CONFLICT(entity_type,entity_id,commodity_code) DO UPDATE SET quantity=0;"
+      },
+      "expect": {
+        "status": "ok"
+      }
+    },
+    {
+      "name": "Clear prior activity for the controlled planetary producer",
+      "command": "sys.raw_sql_exec",
+      "user": "admin",
+      "data": {
+        "sql": "DELETE FROM planet_economic_activity WHERE planet_id=900;"
+      },
+      "expect": {
+        "status": "ok"
+      }
+    },
+    {
+      "name": "Prepare an Orion corporation for scheduled NPC activity",
+      "command": "sys.raw_sql_exec",
+      "user": "admin",
+      "data": {
+        "sql": "INSERT INTO corporations(name,owner_id,tag,ship_personality) VALUES ('EXC09 Orion Scheduler QA',107,'ORION','balanced'),('EXC09 Ledger QA',107,'EXC09','balanced') ON CONFLICT (upper(tag)) WHERE tag IS NOT NULL DO NOTHING;"
+      },
+      "expect": {
+        "status": "ok"
+      }
+    },
+    {
+      "name": "Seed a deterministic NPC actor for actual scheduled movement",
+      "command": "sys.raw_sql_exec",
+      "user": "admin",
+      "data": {
+        "sql": "WITH home AS (SELECT center_sector FROM clusters WHERE role='ORION' LIMIT 1), npc AS (INSERT INTO players(name,passwd,sector_id,credits,type,is_npc,commission_id) SELECT 'EXC09 Orion scheduler actor','$argon2id$v=19$m=65536,t=3,p=1$m9e+qkJe5du1SC25jkIB0A$fd2PpiLEjU5d2AXlAf1nznGko41GPU7Z2jxX3gX0QZE',center_sector,100000,2,TRUE,1 FROM home RETURNING player_id), member AS (INSERT INTO corp_members(corporation_id,player_id,role) SELECT c.corporation_id,n.player_id,'Officer' FROM corporations c CROSS JOIN npc n WHERE c.tag='ORION' RETURNING player_id), ship AS (INSERT INTO ships(name,type_id,sector_id,holds,fighters,shields,hull,personality,destroyed) SELECT 'EXC09 Orion scheduler hull',2,center_sector,10,100,0,100,'balanced',FALSE FROM home RETURNING ship_id) INSERT INTO ship_ownership(ship_id,player_id,role_id,is_primary) SELECT s.ship_id,n.player_id,1,TRUE FROM ship s CROSS JOIN npc n;"
+      },
+      "expect": {
+        "status": "ok"
+      }
+    },
+    {
+      "name": "Initialize the corporation treasury measured by daily snapshots",
+      "command": "sys.raw_sql_exec",
+      "user": "admin",
+      "data": {
+        "sql": "INSERT INTO corp_accounts(corp_id,currency,balance) SELECT corporation_id,'CRD',CASE WHEN tag='ORION' THEN 250000 ELSE 125000 END FROM corporations WHERE tag IN ('ORION','EXC09') ON CONFLICT (corp_id) DO UPDATE SET balance=EXCLUDED.balance;"
+      },
+      "expect": {
+        "status": "ok"
+      }
+    },
+    {
+      "name": "Verify the ordinary-player and corporation populations for the 30-day world",
+      "command": "sys.raw_sql_exec",
+      "user": "admin",
+      "data": {
+        "sql": "SELECT (SELECT COUNT(*)>=2 FROM players WHERE is_npc IS DISTINCT FROM TRUE)::int,(SELECT COUNT(*)>=2 FROM corp_accounts)::int,(SELECT COUNT(*)>=2 FROM ports)::int,(SELECT COUNT(*)>=2 FROM planets)::int;"
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.rows.0.0",
+          "op": "==",
+          "value": 1
+        },
+        {
+          "path": "data.rows.0.1",
+          "op": "==",
+          "value": 1
+        },
+        {
+          "path": "data.rows.0.2",
+          "op": "==",
+          "value": 1
+        },
+        {
+          "path": "data.rows.0.3",
+          "op": "==",
+          "value": 1
+        }
+      ]
+    },
+    {
+      "name": "Move enabled deadlines into future before activating simulated time",
+      "command": "sys.raw_sql_exec",
+      "user": "admin",
+      "data": {
+        "sql": "UPDATE cron_tasks SET next_due_at=CURRENT_TIMESTAMP+INTERVAL '1 hour' WHERE enabled=TRUE;"
+      },
+      "expect": {
+        "status": "ok"
+      }
+    },
+    {
+      "name": "Enable test-only deterministic scheduler switch",
+      "command": "sys.raw_sql_exec",
+      "user": "admin",
+      "data": {
+        "sql": "INSERT INTO config(key,value,type) VALUES('test.deterministic_scheduler_enabled','1','int') ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,type='int';"
+      },
+      "expect": {
+        "status": "ok"
+      }
+    },
+    {
+      "name": "Advance actual registered scheduler to simulated day 01",
+      "command": "sys.cron.advance_to",
+      "user": "admin",
+      "data": {
+        "advance_days": 1,
+        "confirm": true
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.tasks_run",
+          "op": ">",
+          "value": 0
+        }
+      ]
+    },
+    {
+      "name": "Capture day 01 accounting and invariant snapshot",
+      "command": "sys.raw_sql_exec",
+      "user": "admin",
+      "data": {
+        "sql": "SELECT jsonb_build_object('player_credits',(SELECT COALESCE(SUM(credits),0) FROM players),'corporation_credits',(SELECT COALESCE(SUM(balance),0) FROM corp_accounts),'bank_balances',(SELECT COALESCE(SUM(balance),0) FROM bank_accounts WHERE is_active=TRUE),'planet_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='planet'),'port_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='port'),'planet_population',(SELECT COALESCE(SUM(population),0) FROM planets),'production_remainders',(SELECT COALESCE(SUM(COALESCE(ore_production_remainder,0)+COALESCE(organics_production_remainder,0)+COALESCE(equipment_production_remainder,0)+COALESCE(fighter_production_remainder,0)),0) FROM planets),'ferengi_rewards',(SELECT COUNT(*) FROM ferengi_destruction_rewards),'bank_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT tx_type||':'||direction AS k,SUM(amount) AS total FROM bank_transactions GROUP BY tx_type,direction) f),'corporation_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT kind AS k,SUM(amount) AS total FROM corp_tx GROUP BY kind) c),'planetary_production_events',(SELECT COUNT(*) FROM planet_economic_activity),'planetary_output',(SELECT COALESCE(SUM(quantity),0) FROM planet_economic_activity),'system_liquidity_injections',(SELECT COALESCE(SUM(amount),0) FROM bank_transactions WHERE tx_type IN ('SYSTEM_LIQUIDITY','INSURANCE_GUARANTEE') AND direction='CREDIT'),'npc_action_rows',(SELECT COUNT(*) FROM npc_action_log))::text,CASE WHEN NOT EXISTS(SELECT 1 FROM players WHERE credits<0) AND NOT EXISTS(SELECT 1 FROM corp_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM bank_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM entity_stock WHERE quantity<0) AND NOT EXISTS(SELECT 1 FROM planets WHERE population<0) AND NOT EXISTS(SELECT 1 FROM port_hardware_stock WHERE stock_quantity<0 OR stock_quantity>max_stock) THEN 1 ELSE 0 END;"
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.rows.0.0",
+          "op": "exists",
+          "value": null
+        },
+        {
+          "path": "data.rows.0.1",
+          "op": "equals",
+          "value": 1
+        }
+      ]
+    },
+    {
+      "name": "Assert scheduler production conserves the fixture planet's output",
+      "command": "sys.raw_sql_exec",
+      "user": "admin",
+      "data": {
+        "sql": "SELECT CASE WHEN (SELECT COALESCE(quantity,0) FROM entity_stock WHERE entity_type='planet' AND entity_id=900 AND commodity_code='ORE')=(SELECT COALESCE(SUM(quantity),0) FROM planet_economic_activity WHERE planet_id=900 AND commodity_code='ORE') AND (SELECT COALESCE(SUM(quantity),0) FROM planet_economic_activity WHERE planet_id=900 AND commodity_code='ORE')>0 THEN 1 ELSE 0 END;"
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.rows.0.0",
+          "op": "==",
+          "value": 1
+        }
+      ]
+    },
+    {
+      "name": "Advance actual registered scheduler to simulated day 02",
+      "command": "sys.cron.advance_to",
+      "user": "admin",
+      "data": {
+        "advance_days": 2,
+        "confirm": true
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.tasks_run",
+          "op": ">",
+          "value": 0
+        }
+      ]
+    },
+    {
+      "name": "Capture day 02 accounting and invariant snapshot",
+      "command": "sys.raw_sql_exec",
+      "user": "admin",
+      "data": {
+        "sql": "SELECT jsonb_build_object('player_credits',(SELECT COALESCE(SUM(credits),0) FROM players),'corporation_credits',(SELECT COALESCE(SUM(balance),0) FROM corp_accounts),'bank_balances',(SELECT COALESCE(SUM(balance),0) FROM bank_accounts WHERE is_active=TRUE),'planet_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='planet'),'port_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='port'),'planet_population',(SELECT COALESCE(SUM(population),0) FROM planets),'production_remainders',(SELECT COALESCE(SUM(COALESCE(ore_production_remainder,0)+COALESCE(organics_production_remainder,0)+COALESCE(equipment_production_remainder,0)+COALESCE(fighter_production_remainder,0)),0) FROM planets),'ferengi_rewards',(SELECT COUNT(*) FROM ferengi_destruction_rewards),'bank_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT tx_type||':'||direction AS k,SUM(amount) AS total FROM bank_transactions GROUP BY tx_type,direction) f),'corporation_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT kind AS k,SUM(amount) AS total FROM corp_tx GROUP BY kind) c),'planetary_production_events',(SELECT COUNT(*) FROM planet_economic_activity),'planetary_output',(SELECT COALESCE(SUM(quantity),0) FROM planet_economic_activity),'system_liquidity_injections',(SELECT COALESCE(SUM(amount),0) FROM bank_transactions WHERE tx_type IN ('SYSTEM_LIQUIDITY','INSURANCE_GUARANTEE') AND direction='CREDIT'),'npc_action_rows',(SELECT COUNT(*) FROM npc_action_log))::text,CASE WHEN NOT EXISTS(SELECT 1 FROM players WHERE credits<0) AND NOT EXISTS(SELECT 1 FROM corp_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM bank_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM entity_stock WHERE quantity<0) AND NOT EXISTS(SELECT 1 FROM planets WHERE population<0) AND NOT EXISTS(SELECT 1 FROM port_hardware_stock WHERE stock_quantity<0 OR stock_quantity>max_stock) THEN 1 ELSE 0 END;"
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.rows.0.0",
+          "op": "exists",
+          "value": null
+        },
+        {
+          "path": "data.rows.0.1",
+          "op": "equals",
+          "value": 1
+        }
+      ]
+    },
+    {
+      "name": "Advance actual registered scheduler to simulated day 03",
+      "command": "sys.cron.advance_to",
+      "user": "admin",
+      "data": {
+        "advance_days": 3,
+        "confirm": true
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.tasks_run",
+          "op": ">",
+          "value": 0
+        }
+      ]
+    },
+    {
+      "name": "Capture day 03 accounting and invariant snapshot",
+      "command": "sys.raw_sql_exec",
+      "user": "admin",
+      "data": {
+        "sql": "SELECT jsonb_build_object('player_credits',(SELECT COALESCE(SUM(credits),0) FROM players),'corporation_credits',(SELECT COALESCE(SUM(balance),0) FROM corp_accounts),'bank_balances',(SELECT COALESCE(SUM(balance),0) FROM bank_accounts WHERE is_active=TRUE),'planet_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='planet'),'port_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='port'),'planet_population',(SELECT COALESCE(SUM(population),0) FROM planets),'production_remainders',(SELECT COALESCE(SUM(COALESCE(ore_production_remainder,0)+COALESCE(organics_production_remainder,0)+COALESCE(equipment_production_remainder,0)+COALESCE(fighter_production_remainder,0)),0) FROM planets),'ferengi_rewards',(SELECT COUNT(*) FROM ferengi_destruction_rewards),'bank_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT tx_type||':'||direction AS k,SUM(amount) AS total FROM bank_transactions GROUP BY tx_type,direction) f),'corporation_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT kind AS k,SUM(amount) AS total FROM corp_tx GROUP BY kind) c),'planetary_production_events',(SELECT COUNT(*) FROM planet_economic_activity),'planetary_output',(SELECT COALESCE(SUM(quantity),0) FROM planet_economic_activity),'system_liquidity_injections',(SELECT COALESCE(SUM(amount),0) FROM bank_transactions WHERE tx_type IN ('SYSTEM_LIQUIDITY','INSURANCE_GUARANTEE') AND direction='CREDIT'),'npc_action_rows',(SELECT COUNT(*) FROM npc_action_log))::text,CASE WHEN NOT EXISTS(SELECT 1 FROM players WHERE credits<0) AND NOT EXISTS(SELECT 1 FROM corp_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM bank_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM entity_stock WHERE quantity<0) AND NOT EXISTS(SELECT 1 FROM planets WHERE population<0) AND NOT EXISTS(SELECT 1 FROM port_hardware_stock WHERE stock_quantity<0 OR stock_quantity>max_stock) THEN 1 ELSE 0 END;"
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.rows.0.0",
+          "op": "exists",
+          "value": null
+        },
+        {
+          "path": "data.rows.0.1",
+          "op": "equals",
+          "value": 1
+        }
+      ]
+    },
+    {
+      "name": "Advance actual registered scheduler to simulated day 04",
+      "command": "sys.cron.advance_to",
+      "user": "admin",
+      "data": {
+        "advance_days": 4,
+        "confirm": true
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.tasks_run",
+          "op": ">",
+          "value": 0
+        }
+      ]
+    },
+    {
+      "name": "Capture day 04 accounting and invariant snapshot",
+      "command": "sys.raw_sql_exec",
+      "user": "admin",
+      "data": {
+        "sql": "SELECT jsonb_build_object('player_credits',(SELECT COALESCE(SUM(credits),0) FROM players),'corporation_credits',(SELECT COALESCE(SUM(balance),0) FROM corp_accounts),'bank_balances',(SELECT COALESCE(SUM(balance),0) FROM bank_accounts WHERE is_active=TRUE),'planet_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='planet'),'port_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='port'),'planet_population',(SELECT COALESCE(SUM(population),0) FROM planets),'production_remainders',(SELECT COALESCE(SUM(COALESCE(ore_production_remainder,0)+COALESCE(organics_production_remainder,0)+COALESCE(equipment_production_remainder,0)+COALESCE(fighter_production_remainder,0)),0) FROM planets),'ferengi_rewards',(SELECT COUNT(*) FROM ferengi_destruction_rewards),'bank_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT tx_type||':'||direction AS k,SUM(amount) AS total FROM bank_transactions GROUP BY tx_type,direction) f),'corporation_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT kind AS k,SUM(amount) AS total FROM corp_tx GROUP BY kind) c),'planetary_production_events',(SELECT COUNT(*) FROM planet_economic_activity),'planetary_output',(SELECT COALESCE(SUM(quantity),0) FROM planet_economic_activity),'system_liquidity_injections',(SELECT COALESCE(SUM(amount),0) FROM bank_transactions WHERE tx_type IN ('SYSTEM_LIQUIDITY','INSURANCE_GUARANTEE') AND direction='CREDIT'),'npc_action_rows',(SELECT COUNT(*) FROM npc_action_log))::text,CASE WHEN NOT EXISTS(SELECT 1 FROM players WHERE credits<0) AND NOT EXISTS(SELECT 1 FROM corp_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM bank_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM entity_stock WHERE quantity<0) AND NOT EXISTS(SELECT 1 FROM planets WHERE population<0) AND NOT EXISTS(SELECT 1 FROM port_hardware_stock WHERE stock_quantity<0 OR stock_quantity>max_stock) THEN 1 ELSE 0 END;"
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.rows.0.0",
+          "op": "exists",
+          "value": null
+        },
+        {
+          "path": "data.rows.0.1",
+          "op": "equals",
+          "value": 1
+        }
+      ]
+    },
+    {
+      "name": "Advance actual registered scheduler to simulated day 05",
+      "command": "sys.cron.advance_to",
+      "user": "admin",
+      "data": {
+        "advance_days": 5,
+        "confirm": true
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.tasks_run",
+          "op": ">",
+          "value": 0
+        }
+      ]
+    },
+    {
+      "name": "Capture day 05 accounting and invariant snapshot",
+      "command": "sys.raw_sql_exec",
+      "user": "admin",
+      "data": {
+        "sql": "SELECT jsonb_build_object('player_credits',(SELECT COALESCE(SUM(credits),0) FROM players),'corporation_credits',(SELECT COALESCE(SUM(balance),0) FROM corp_accounts),'bank_balances',(SELECT COALESCE(SUM(balance),0) FROM bank_accounts WHERE is_active=TRUE),'planet_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='planet'),'port_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='port'),'planet_population',(SELECT COALESCE(SUM(population),0) FROM planets),'production_remainders',(SELECT COALESCE(SUM(COALESCE(ore_production_remainder,0)+COALESCE(organics_production_remainder,0)+COALESCE(equipment_production_remainder,0)+COALESCE(fighter_production_remainder,0)),0) FROM planets),'ferengi_rewards',(SELECT COUNT(*) FROM ferengi_destruction_rewards),'bank_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT tx_type||':'||direction AS k,SUM(amount) AS total FROM bank_transactions GROUP BY tx_type,direction) f),'corporation_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT kind AS k,SUM(amount) AS total FROM corp_tx GROUP BY kind) c),'planetary_production_events',(SELECT COUNT(*) FROM planet_economic_activity),'planetary_output',(SELECT COALESCE(SUM(quantity),0) FROM planet_economic_activity),'system_liquidity_injections',(SELECT COALESCE(SUM(amount),0) FROM bank_transactions WHERE tx_type IN ('SYSTEM_LIQUIDITY','INSURANCE_GUARANTEE') AND direction='CREDIT'),'npc_action_rows',(SELECT COUNT(*) FROM npc_action_log))::text,CASE WHEN NOT EXISTS(SELECT 1 FROM players WHERE credits<0) AND NOT EXISTS(SELECT 1 FROM corp_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM bank_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM entity_stock WHERE quantity<0) AND NOT EXISTS(SELECT 1 FROM planets WHERE population<0) AND NOT EXISTS(SELECT 1 FROM port_hardware_stock WHERE stock_quantity<0 OR stock_quantity>max_stock) THEN 1 ELSE 0 END;"
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.rows.0.0",
+          "op": "exists",
+          "value": null
+        },
+        {
+          "path": "data.rows.0.1",
+          "op": "equals",
+          "value": 1
+        }
+      ]
+    },
+    {
+      "name": "Advance actual registered scheduler to simulated day 06",
+      "command": "sys.cron.advance_to",
+      "user": "admin",
+      "data": {
+        "advance_days": 6,
+        "confirm": true
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.tasks_run",
+          "op": ">",
+          "value": 0
+        }
+      ]
+    },
+    {
+      "name": "Capture day 06 accounting and invariant snapshot",
+      "command": "sys.raw_sql_exec",
+      "user": "admin",
+      "data": {
+        "sql": "SELECT jsonb_build_object('player_credits',(SELECT COALESCE(SUM(credits),0) FROM players),'corporation_credits',(SELECT COALESCE(SUM(balance),0) FROM corp_accounts),'bank_balances',(SELECT COALESCE(SUM(balance),0) FROM bank_accounts WHERE is_active=TRUE),'planet_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='planet'),'port_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='port'),'planet_population',(SELECT COALESCE(SUM(population),0) FROM planets),'production_remainders',(SELECT COALESCE(SUM(COALESCE(ore_production_remainder,0)+COALESCE(organics_production_remainder,0)+COALESCE(equipment_production_remainder,0)+COALESCE(fighter_production_remainder,0)),0) FROM planets),'ferengi_rewards',(SELECT COUNT(*) FROM ferengi_destruction_rewards),'bank_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT tx_type||':'||direction AS k,SUM(amount) AS total FROM bank_transactions GROUP BY tx_type,direction) f),'corporation_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT kind AS k,SUM(amount) AS total FROM corp_tx GROUP BY kind) c),'planetary_production_events',(SELECT COUNT(*) FROM planet_economic_activity),'planetary_output',(SELECT COALESCE(SUM(quantity),0) FROM planet_economic_activity),'system_liquidity_injections',(SELECT COALESCE(SUM(amount),0) FROM bank_transactions WHERE tx_type IN ('SYSTEM_LIQUIDITY','INSURANCE_GUARANTEE') AND direction='CREDIT'),'npc_action_rows',(SELECT COUNT(*) FROM npc_action_log))::text,CASE WHEN NOT EXISTS(SELECT 1 FROM players WHERE credits<0) AND NOT EXISTS(SELECT 1 FROM corp_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM bank_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM entity_stock WHERE quantity<0) AND NOT EXISTS(SELECT 1 FROM planets WHERE population<0) AND NOT EXISTS(SELECT 1 FROM port_hardware_stock WHERE stock_quantity<0 OR stock_quantity>max_stock) THEN 1 ELSE 0 END;"
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.rows.0.0",
+          "op": "exists",
+          "value": null
+        },
+        {
+          "path": "data.rows.0.1",
+          "op": "equals",
+          "value": 1
+        }
+      ]
+    },
+    {
+      "name": "Advance actual registered scheduler to simulated day 07",
+      "command": "sys.cron.advance_to",
+      "user": "admin",
+      "data": {
+        "advance_days": 7,
+        "confirm": true
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.tasks_run",
+          "op": ">",
+          "value": 0
+        }
+      ]
+    },
+    {
+      "name": "Capture day 07 accounting and invariant snapshot",
+      "command": "sys.raw_sql_exec",
+      "user": "admin",
+      "data": {
+        "sql": "SELECT jsonb_build_object('player_credits',(SELECT COALESCE(SUM(credits),0) FROM players),'corporation_credits',(SELECT COALESCE(SUM(balance),0) FROM corp_accounts),'bank_balances',(SELECT COALESCE(SUM(balance),0) FROM bank_accounts WHERE is_active=TRUE),'planet_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='planet'),'port_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='port'),'planet_population',(SELECT COALESCE(SUM(population),0) FROM planets),'production_remainders',(SELECT COALESCE(SUM(COALESCE(ore_production_remainder,0)+COALESCE(organics_production_remainder,0)+COALESCE(equipment_production_remainder,0)+COALESCE(fighter_production_remainder,0)),0) FROM planets),'ferengi_rewards',(SELECT COUNT(*) FROM ferengi_destruction_rewards),'bank_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT tx_type||':'||direction AS k,SUM(amount) AS total FROM bank_transactions GROUP BY tx_type,direction) f),'corporation_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT kind AS k,SUM(amount) AS total FROM corp_tx GROUP BY kind) c),'planetary_production_events',(SELECT COUNT(*) FROM planet_economic_activity),'planetary_output',(SELECT COALESCE(SUM(quantity),0) FROM planet_economic_activity),'system_liquidity_injections',(SELECT COALESCE(SUM(amount),0) FROM bank_transactions WHERE tx_type IN ('SYSTEM_LIQUIDITY','INSURANCE_GUARANTEE') AND direction='CREDIT'),'npc_action_rows',(SELECT COUNT(*) FROM npc_action_log))::text,CASE WHEN NOT EXISTS(SELECT 1 FROM players WHERE credits<0) AND NOT EXISTS(SELECT 1 FROM corp_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM bank_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM entity_stock WHERE quantity<0) AND NOT EXISTS(SELECT 1 FROM planets WHERE population<0) AND NOT EXISTS(SELECT 1 FROM port_hardware_stock WHERE stock_quantity<0 OR stock_quantity>max_stock) THEN 1 ELSE 0 END;"
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.rows.0.0",
+          "op": "exists",
+          "value": null
+        },
+        {
+          "path": "data.rows.0.1",
+          "op": "equals",
+          "value": 1
+        }
+      ]
+    },
+    {
+      "name": "Advance actual registered scheduler to simulated day 08",
+      "command": "sys.cron.advance_to",
+      "user": "admin",
+      "data": {
+        "advance_days": 8,
+        "confirm": true
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.tasks_run",
+          "op": ">",
+          "value": 0
+        }
+      ]
+    },
+    {
+      "name": "Capture day 08 accounting and invariant snapshot",
+      "command": "sys.raw_sql_exec",
+      "user": "admin",
+      "data": {
+        "sql": "SELECT jsonb_build_object('player_credits',(SELECT COALESCE(SUM(credits),0) FROM players),'corporation_credits',(SELECT COALESCE(SUM(balance),0) FROM corp_accounts),'bank_balances',(SELECT COALESCE(SUM(balance),0) FROM bank_accounts WHERE is_active=TRUE),'planet_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='planet'),'port_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='port'),'planet_population',(SELECT COALESCE(SUM(population),0) FROM planets),'production_remainders',(SELECT COALESCE(SUM(COALESCE(ore_production_remainder,0)+COALESCE(organics_production_remainder,0)+COALESCE(equipment_production_remainder,0)+COALESCE(fighter_production_remainder,0)),0) FROM planets),'ferengi_rewards',(SELECT COUNT(*) FROM ferengi_destruction_rewards),'bank_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT tx_type||':'||direction AS k,SUM(amount) AS total FROM bank_transactions GROUP BY tx_type,direction) f),'corporation_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT kind AS k,SUM(amount) AS total FROM corp_tx GROUP BY kind) c),'planetary_production_events',(SELECT COUNT(*) FROM planet_economic_activity),'planetary_output',(SELECT COALESCE(SUM(quantity),0) FROM planet_economic_activity),'system_liquidity_injections',(SELECT COALESCE(SUM(amount),0) FROM bank_transactions WHERE tx_type IN ('SYSTEM_LIQUIDITY','INSURANCE_GUARANTEE') AND direction='CREDIT'),'npc_action_rows',(SELECT COUNT(*) FROM npc_action_log))::text,CASE WHEN NOT EXISTS(SELECT 1 FROM players WHERE credits<0) AND NOT EXISTS(SELECT 1 FROM corp_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM bank_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM entity_stock WHERE quantity<0) AND NOT EXISTS(SELECT 1 FROM planets WHERE population<0) AND NOT EXISTS(SELECT 1 FROM port_hardware_stock WHERE stock_quantity<0 OR stock_quantity>max_stock) THEN 1 ELSE 0 END;"
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.rows.0.0",
+          "op": "exists",
+          "value": null
+        },
+        {
+          "path": "data.rows.0.1",
+          "op": "equals",
+          "value": 1
+        }
+      ]
+    },
+    {
+      "name": "Advance actual registered scheduler to simulated day 09",
+      "command": "sys.cron.advance_to",
+      "user": "admin",
+      "data": {
+        "advance_days": 9,
+        "confirm": true
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.tasks_run",
+          "op": ">",
+          "value": 0
+        }
+      ]
+    },
+    {
+      "name": "Capture day 09 accounting and invariant snapshot",
+      "command": "sys.raw_sql_exec",
+      "user": "admin",
+      "data": {
+        "sql": "SELECT jsonb_build_object('player_credits',(SELECT COALESCE(SUM(credits),0) FROM players),'corporation_credits',(SELECT COALESCE(SUM(balance),0) FROM corp_accounts),'bank_balances',(SELECT COALESCE(SUM(balance),0) FROM bank_accounts WHERE is_active=TRUE),'planet_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='planet'),'port_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='port'),'planet_population',(SELECT COALESCE(SUM(population),0) FROM planets),'production_remainders',(SELECT COALESCE(SUM(COALESCE(ore_production_remainder,0)+COALESCE(organics_production_remainder,0)+COALESCE(equipment_production_remainder,0)+COALESCE(fighter_production_remainder,0)),0) FROM planets),'ferengi_rewards',(SELECT COUNT(*) FROM ferengi_destruction_rewards),'bank_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT tx_type||':'||direction AS k,SUM(amount) AS total FROM bank_transactions GROUP BY tx_type,direction) f),'corporation_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT kind AS k,SUM(amount) AS total FROM corp_tx GROUP BY kind) c),'planetary_production_events',(SELECT COUNT(*) FROM planet_economic_activity),'planetary_output',(SELECT COALESCE(SUM(quantity),0) FROM planet_economic_activity),'system_liquidity_injections',(SELECT COALESCE(SUM(amount),0) FROM bank_transactions WHERE tx_type IN ('SYSTEM_LIQUIDITY','INSURANCE_GUARANTEE') AND direction='CREDIT'),'npc_action_rows',(SELECT COUNT(*) FROM npc_action_log))::text,CASE WHEN NOT EXISTS(SELECT 1 FROM players WHERE credits<0) AND NOT EXISTS(SELECT 1 FROM corp_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM bank_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM entity_stock WHERE quantity<0) AND NOT EXISTS(SELECT 1 FROM planets WHERE population<0) AND NOT EXISTS(SELECT 1 FROM port_hardware_stock WHERE stock_quantity<0 OR stock_quantity>max_stock) THEN 1 ELSE 0 END;"
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.rows.0.0",
+          "op": "exists",
+          "value": null
+        },
+        {
+          "path": "data.rows.0.1",
+          "op": "equals",
+          "value": 1
+        }
+      ]
+    },
+    {
+      "name": "Advance actual registered scheduler to simulated day 10",
+      "command": "sys.cron.advance_to",
+      "user": "admin",
+      "data": {
+        "advance_days": 10,
+        "confirm": true
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.tasks_run",
+          "op": ">",
+          "value": 0
+        }
+      ]
+    },
+    {
+      "name": "Capture day 10 accounting and invariant snapshot",
+      "command": "sys.raw_sql_exec",
+      "user": "admin",
+      "data": {
+        "sql": "SELECT jsonb_build_object('player_credits',(SELECT COALESCE(SUM(credits),0) FROM players),'corporation_credits',(SELECT COALESCE(SUM(balance),0) FROM corp_accounts),'bank_balances',(SELECT COALESCE(SUM(balance),0) FROM bank_accounts WHERE is_active=TRUE),'planet_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='planet'),'port_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='port'),'planet_population',(SELECT COALESCE(SUM(population),0) FROM planets),'production_remainders',(SELECT COALESCE(SUM(COALESCE(ore_production_remainder,0)+COALESCE(organics_production_remainder,0)+COALESCE(equipment_production_remainder,0)+COALESCE(fighter_production_remainder,0)),0) FROM planets),'ferengi_rewards',(SELECT COUNT(*) FROM ferengi_destruction_rewards),'bank_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT tx_type||':'||direction AS k,SUM(amount) AS total FROM bank_transactions GROUP BY tx_type,direction) f),'corporation_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT kind AS k,SUM(amount) AS total FROM corp_tx GROUP BY kind) c),'planetary_production_events',(SELECT COUNT(*) FROM planet_economic_activity),'planetary_output',(SELECT COALESCE(SUM(quantity),0) FROM planet_economic_activity),'system_liquidity_injections',(SELECT COALESCE(SUM(amount),0) FROM bank_transactions WHERE tx_type IN ('SYSTEM_LIQUIDITY','INSURANCE_GUARANTEE') AND direction='CREDIT'),'npc_action_rows',(SELECT COUNT(*) FROM npc_action_log))::text,CASE WHEN NOT EXISTS(SELECT 1 FROM players WHERE credits<0) AND NOT EXISTS(SELECT 1 FROM corp_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM bank_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM entity_stock WHERE quantity<0) AND NOT EXISTS(SELECT 1 FROM planets WHERE population<0) AND NOT EXISTS(SELECT 1 FROM port_hardware_stock WHERE stock_quantity<0 OR stock_quantity>max_stock) THEN 1 ELSE 0 END;"
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.rows.0.0",
+          "op": "exists",
+          "value": null
+        },
+        {
+          "path": "data.rows.0.1",
+          "op": "equals",
+          "value": 1
+        }
+      ]
+    },
+    {
+      "name": "Advance actual registered scheduler to simulated day 11",
+      "command": "sys.cron.advance_to",
+      "user": "admin",
+      "data": {
+        "advance_days": 11,
+        "confirm": true
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.tasks_run",
+          "op": ">",
+          "value": 0
+        }
+      ]
+    },
+    {
+      "name": "Capture day 11 accounting and invariant snapshot",
+      "command": "sys.raw_sql_exec",
+      "user": "admin",
+      "data": {
+        "sql": "SELECT jsonb_build_object('player_credits',(SELECT COALESCE(SUM(credits),0) FROM players),'corporation_credits',(SELECT COALESCE(SUM(balance),0) FROM corp_accounts),'bank_balances',(SELECT COALESCE(SUM(balance),0) FROM bank_accounts WHERE is_active=TRUE),'planet_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='planet'),'port_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='port'),'planet_population',(SELECT COALESCE(SUM(population),0) FROM planets),'production_remainders',(SELECT COALESCE(SUM(COALESCE(ore_production_remainder,0)+COALESCE(organics_production_remainder,0)+COALESCE(equipment_production_remainder,0)+COALESCE(fighter_production_remainder,0)),0) FROM planets),'ferengi_rewards',(SELECT COUNT(*) FROM ferengi_destruction_rewards),'bank_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT tx_type||':'||direction AS k,SUM(amount) AS total FROM bank_transactions GROUP BY tx_type,direction) f),'corporation_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT kind AS k,SUM(amount) AS total FROM corp_tx GROUP BY kind) c),'planetary_production_events',(SELECT COUNT(*) FROM planet_economic_activity),'planetary_output',(SELECT COALESCE(SUM(quantity),0) FROM planet_economic_activity),'system_liquidity_injections',(SELECT COALESCE(SUM(amount),0) FROM bank_transactions WHERE tx_type IN ('SYSTEM_LIQUIDITY','INSURANCE_GUARANTEE') AND direction='CREDIT'),'npc_action_rows',(SELECT COUNT(*) FROM npc_action_log))::text,CASE WHEN NOT EXISTS(SELECT 1 FROM players WHERE credits<0) AND NOT EXISTS(SELECT 1 FROM corp_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM bank_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM entity_stock WHERE quantity<0) AND NOT EXISTS(SELECT 1 FROM planets WHERE population<0) AND NOT EXISTS(SELECT 1 FROM port_hardware_stock WHERE stock_quantity<0 OR stock_quantity>max_stock) THEN 1 ELSE 0 END;"
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.rows.0.0",
+          "op": "exists",
+          "value": null
+        },
+        {
+          "path": "data.rows.0.1",
+          "op": "equals",
+          "value": 1
+        }
+      ]
+    },
+    {
+      "name": "Advance actual registered scheduler to simulated day 12",
+      "command": "sys.cron.advance_to",
+      "user": "admin",
+      "data": {
+        "advance_days": 12,
+        "confirm": true
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.tasks_run",
+          "op": ">",
+          "value": 0
+        }
+      ]
+    },
+    {
+      "name": "Capture day 12 accounting and invariant snapshot",
+      "command": "sys.raw_sql_exec",
+      "user": "admin",
+      "data": {
+        "sql": "SELECT jsonb_build_object('player_credits',(SELECT COALESCE(SUM(credits),0) FROM players),'corporation_credits',(SELECT COALESCE(SUM(balance),0) FROM corp_accounts),'bank_balances',(SELECT COALESCE(SUM(balance),0) FROM bank_accounts WHERE is_active=TRUE),'planet_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='planet'),'port_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='port'),'planet_population',(SELECT COALESCE(SUM(population),0) FROM planets),'production_remainders',(SELECT COALESCE(SUM(COALESCE(ore_production_remainder,0)+COALESCE(organics_production_remainder,0)+COALESCE(equipment_production_remainder,0)+COALESCE(fighter_production_remainder,0)),0) FROM planets),'ferengi_rewards',(SELECT COUNT(*) FROM ferengi_destruction_rewards),'bank_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT tx_type||':'||direction AS k,SUM(amount) AS total FROM bank_transactions GROUP BY tx_type,direction) f),'corporation_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT kind AS k,SUM(amount) AS total FROM corp_tx GROUP BY kind) c),'planetary_production_events',(SELECT COUNT(*) FROM planet_economic_activity),'planetary_output',(SELECT COALESCE(SUM(quantity),0) FROM planet_economic_activity),'system_liquidity_injections',(SELECT COALESCE(SUM(amount),0) FROM bank_transactions WHERE tx_type IN ('SYSTEM_LIQUIDITY','INSURANCE_GUARANTEE') AND direction='CREDIT'),'npc_action_rows',(SELECT COUNT(*) FROM npc_action_log))::text,CASE WHEN NOT EXISTS(SELECT 1 FROM players WHERE credits<0) AND NOT EXISTS(SELECT 1 FROM corp_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM bank_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM entity_stock WHERE quantity<0) AND NOT EXISTS(SELECT 1 FROM planets WHERE population<0) AND NOT EXISTS(SELECT 1 FROM port_hardware_stock WHERE stock_quantity<0 OR stock_quantity>max_stock) THEN 1 ELSE 0 END;"
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.rows.0.0",
+          "op": "exists",
+          "value": null
+        },
+        {
+          "path": "data.rows.0.1",
+          "op": "equals",
+          "value": 1
+        }
+      ]
+    },
+    {
+      "name": "Advance actual registered scheduler to simulated day 13",
+      "command": "sys.cron.advance_to",
+      "user": "admin",
+      "data": {
+        "advance_days": 13,
+        "confirm": true
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.tasks_run",
+          "op": ">",
+          "value": 0
+        }
+      ]
+    },
+    {
+      "name": "Capture day 13 accounting and invariant snapshot",
+      "command": "sys.raw_sql_exec",
+      "user": "admin",
+      "data": {
+        "sql": "SELECT jsonb_build_object('player_credits',(SELECT COALESCE(SUM(credits),0) FROM players),'corporation_credits',(SELECT COALESCE(SUM(balance),0) FROM corp_accounts),'bank_balances',(SELECT COALESCE(SUM(balance),0) FROM bank_accounts WHERE is_active=TRUE),'planet_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='planet'),'port_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='port'),'planet_population',(SELECT COALESCE(SUM(population),0) FROM planets),'production_remainders',(SELECT COALESCE(SUM(COALESCE(ore_production_remainder,0)+COALESCE(organics_production_remainder,0)+COALESCE(equipment_production_remainder,0)+COALESCE(fighter_production_remainder,0)),0) FROM planets),'ferengi_rewards',(SELECT COUNT(*) FROM ferengi_destruction_rewards),'bank_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT tx_type||':'||direction AS k,SUM(amount) AS total FROM bank_transactions GROUP BY tx_type,direction) f),'corporation_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT kind AS k,SUM(amount) AS total FROM corp_tx GROUP BY kind) c),'planetary_production_events',(SELECT COUNT(*) FROM planet_economic_activity),'planetary_output',(SELECT COALESCE(SUM(quantity),0) FROM planet_economic_activity),'system_liquidity_injections',(SELECT COALESCE(SUM(amount),0) FROM bank_transactions WHERE tx_type IN ('SYSTEM_LIQUIDITY','INSURANCE_GUARANTEE') AND direction='CREDIT'),'npc_action_rows',(SELECT COUNT(*) FROM npc_action_log))::text,CASE WHEN NOT EXISTS(SELECT 1 FROM players WHERE credits<0) AND NOT EXISTS(SELECT 1 FROM corp_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM bank_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM entity_stock WHERE quantity<0) AND NOT EXISTS(SELECT 1 FROM planets WHERE population<0) AND NOT EXISTS(SELECT 1 FROM port_hardware_stock WHERE stock_quantity<0 OR stock_quantity>max_stock) THEN 1 ELSE 0 END;"
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.rows.0.0",
+          "op": "exists",
+          "value": null
+        },
+        {
+          "path": "data.rows.0.1",
+          "op": "equals",
+          "value": 1
+        }
+      ]
+    },
+    {
+      "name": "Advance actual registered scheduler to simulated day 14",
+      "command": "sys.cron.advance_to",
+      "user": "admin",
+      "data": {
+        "advance_days": 14,
+        "confirm": true
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.tasks_run",
+          "op": ">",
+          "value": 0
+        }
+      ]
+    },
+    {
+      "name": "Capture day 14 accounting and invariant snapshot",
+      "command": "sys.raw_sql_exec",
+      "user": "admin",
+      "data": {
+        "sql": "SELECT jsonb_build_object('player_credits',(SELECT COALESCE(SUM(credits),0) FROM players),'corporation_credits',(SELECT COALESCE(SUM(balance),0) FROM corp_accounts),'bank_balances',(SELECT COALESCE(SUM(balance),0) FROM bank_accounts WHERE is_active=TRUE),'planet_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='planet'),'port_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='port'),'planet_population',(SELECT COALESCE(SUM(population),0) FROM planets),'production_remainders',(SELECT COALESCE(SUM(COALESCE(ore_production_remainder,0)+COALESCE(organics_production_remainder,0)+COALESCE(equipment_production_remainder,0)+COALESCE(fighter_production_remainder,0)),0) FROM planets),'ferengi_rewards',(SELECT COUNT(*) FROM ferengi_destruction_rewards),'bank_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT tx_type||':'||direction AS k,SUM(amount) AS total FROM bank_transactions GROUP BY tx_type,direction) f),'corporation_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT kind AS k,SUM(amount) AS total FROM corp_tx GROUP BY kind) c),'planetary_production_events',(SELECT COUNT(*) FROM planet_economic_activity),'planetary_output',(SELECT COALESCE(SUM(quantity),0) FROM planet_economic_activity),'system_liquidity_injections',(SELECT COALESCE(SUM(amount),0) FROM bank_transactions WHERE tx_type IN ('SYSTEM_LIQUIDITY','INSURANCE_GUARANTEE') AND direction='CREDIT'),'npc_action_rows',(SELECT COUNT(*) FROM npc_action_log))::text,CASE WHEN NOT EXISTS(SELECT 1 FROM players WHERE credits<0) AND NOT EXISTS(SELECT 1 FROM corp_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM bank_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM entity_stock WHERE quantity<0) AND NOT EXISTS(SELECT 1 FROM planets WHERE population<0) AND NOT EXISTS(SELECT 1 FROM port_hardware_stock WHERE stock_quantity<0 OR stock_quantity>max_stock) THEN 1 ELSE 0 END;"
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.rows.0.0",
+          "op": "exists",
+          "value": null
+        },
+        {
+          "path": "data.rows.0.1",
+          "op": "equals",
+          "value": 1
+        }
+      ]
+    },
+    {
+      "name": "Advance actual registered scheduler to simulated day 15",
+      "command": "sys.cron.advance_to",
+      "user": "admin",
+      "data": {
+        "advance_days": 15,
+        "confirm": true
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.tasks_run",
+          "op": ">",
+          "value": 0
+        }
+      ]
+    },
+    {
+      "name": "Capture day 15 accounting and invariant snapshot",
+      "command": "sys.raw_sql_exec",
+      "user": "admin",
+      "data": {
+        "sql": "SELECT jsonb_build_object('player_credits',(SELECT COALESCE(SUM(credits),0) FROM players),'corporation_credits',(SELECT COALESCE(SUM(balance),0) FROM corp_accounts),'bank_balances',(SELECT COALESCE(SUM(balance),0) FROM bank_accounts WHERE is_active=TRUE),'planet_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='planet'),'port_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='port'),'planet_population',(SELECT COALESCE(SUM(population),0) FROM planets),'production_remainders',(SELECT COALESCE(SUM(COALESCE(ore_production_remainder,0)+COALESCE(organics_production_remainder,0)+COALESCE(equipment_production_remainder,0)+COALESCE(fighter_production_remainder,0)),0) FROM planets),'ferengi_rewards',(SELECT COUNT(*) FROM ferengi_destruction_rewards),'bank_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT tx_type||':'||direction AS k,SUM(amount) AS total FROM bank_transactions GROUP BY tx_type,direction) f),'corporation_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT kind AS k,SUM(amount) AS total FROM corp_tx GROUP BY kind) c),'planetary_production_events',(SELECT COUNT(*) FROM planet_economic_activity),'planetary_output',(SELECT COALESCE(SUM(quantity),0) FROM planet_economic_activity),'system_liquidity_injections',(SELECT COALESCE(SUM(amount),0) FROM bank_transactions WHERE tx_type IN ('SYSTEM_LIQUIDITY','INSURANCE_GUARANTEE') AND direction='CREDIT'),'npc_action_rows',(SELECT COUNT(*) FROM npc_action_log))::text,CASE WHEN NOT EXISTS(SELECT 1 FROM players WHERE credits<0) AND NOT EXISTS(SELECT 1 FROM corp_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM bank_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM entity_stock WHERE quantity<0) AND NOT EXISTS(SELECT 1 FROM planets WHERE population<0) AND NOT EXISTS(SELECT 1 FROM port_hardware_stock WHERE stock_quantity<0 OR stock_quantity>max_stock) THEN 1 ELSE 0 END;"
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.rows.0.0",
+          "op": "exists",
+          "value": null
+        },
+        {
+          "path": "data.rows.0.1",
+          "op": "equals",
+          "value": 1
+        }
+      ]
+    },
+    {
+      "name": "Advance actual registered scheduler to simulated day 16",
+      "command": "sys.cron.advance_to",
+      "user": "admin",
+      "data": {
+        "advance_days": 16,
+        "confirm": true
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.tasks_run",
+          "op": ">",
+          "value": 0
+        }
+      ]
+    },
+    {
+      "name": "Capture day 16 accounting and invariant snapshot",
+      "command": "sys.raw_sql_exec",
+      "user": "admin",
+      "data": {
+        "sql": "SELECT jsonb_build_object('player_credits',(SELECT COALESCE(SUM(credits),0) FROM players),'corporation_credits',(SELECT COALESCE(SUM(balance),0) FROM corp_accounts),'bank_balances',(SELECT COALESCE(SUM(balance),0) FROM bank_accounts WHERE is_active=TRUE),'planet_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='planet'),'port_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='port'),'planet_population',(SELECT COALESCE(SUM(population),0) FROM planets),'production_remainders',(SELECT COALESCE(SUM(COALESCE(ore_production_remainder,0)+COALESCE(organics_production_remainder,0)+COALESCE(equipment_production_remainder,0)+COALESCE(fighter_production_remainder,0)),0) FROM planets),'ferengi_rewards',(SELECT COUNT(*) FROM ferengi_destruction_rewards),'bank_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT tx_type||':'||direction AS k,SUM(amount) AS total FROM bank_transactions GROUP BY tx_type,direction) f),'corporation_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT kind AS k,SUM(amount) AS total FROM corp_tx GROUP BY kind) c),'planetary_production_events',(SELECT COUNT(*) FROM planet_economic_activity),'planetary_output',(SELECT COALESCE(SUM(quantity),0) FROM planet_economic_activity),'system_liquidity_injections',(SELECT COALESCE(SUM(amount),0) FROM bank_transactions WHERE tx_type IN ('SYSTEM_LIQUIDITY','INSURANCE_GUARANTEE') AND direction='CREDIT'),'npc_action_rows',(SELECT COUNT(*) FROM npc_action_log))::text,CASE WHEN NOT EXISTS(SELECT 1 FROM players WHERE credits<0) AND NOT EXISTS(SELECT 1 FROM corp_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM bank_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM entity_stock WHERE quantity<0) AND NOT EXISTS(SELECT 1 FROM planets WHERE population<0) AND NOT EXISTS(SELECT 1 FROM port_hardware_stock WHERE stock_quantity<0 OR stock_quantity>max_stock) THEN 1 ELSE 0 END;"
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.rows.0.0",
+          "op": "exists",
+          "value": null
+        },
+        {
+          "path": "data.rows.0.1",
+          "op": "equals",
+          "value": 1
+        }
+      ]
+    },
+    {
+      "name": "Advance actual registered scheduler to simulated day 17",
+      "command": "sys.cron.advance_to",
+      "user": "admin",
+      "data": {
+        "advance_days": 17,
+        "confirm": true
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.tasks_run",
+          "op": ">",
+          "value": 0
+        }
+      ]
+    },
+    {
+      "name": "Capture day 17 accounting and invariant snapshot",
+      "command": "sys.raw_sql_exec",
+      "user": "admin",
+      "data": {
+        "sql": "SELECT jsonb_build_object('player_credits',(SELECT COALESCE(SUM(credits),0) FROM players),'corporation_credits',(SELECT COALESCE(SUM(balance),0) FROM corp_accounts),'bank_balances',(SELECT COALESCE(SUM(balance),0) FROM bank_accounts WHERE is_active=TRUE),'planet_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='planet'),'port_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='port'),'planet_population',(SELECT COALESCE(SUM(population),0) FROM planets),'production_remainders',(SELECT COALESCE(SUM(COALESCE(ore_production_remainder,0)+COALESCE(organics_production_remainder,0)+COALESCE(equipment_production_remainder,0)+COALESCE(fighter_production_remainder,0)),0) FROM planets),'ferengi_rewards',(SELECT COUNT(*) FROM ferengi_destruction_rewards),'bank_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT tx_type||':'||direction AS k,SUM(amount) AS total FROM bank_transactions GROUP BY tx_type,direction) f),'corporation_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT kind AS k,SUM(amount) AS total FROM corp_tx GROUP BY kind) c),'planetary_production_events',(SELECT COUNT(*) FROM planet_economic_activity),'planetary_output',(SELECT COALESCE(SUM(quantity),0) FROM planet_economic_activity),'system_liquidity_injections',(SELECT COALESCE(SUM(amount),0) FROM bank_transactions WHERE tx_type IN ('SYSTEM_LIQUIDITY','INSURANCE_GUARANTEE') AND direction='CREDIT'),'npc_action_rows',(SELECT COUNT(*) FROM npc_action_log))::text,CASE WHEN NOT EXISTS(SELECT 1 FROM players WHERE credits<0) AND NOT EXISTS(SELECT 1 FROM corp_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM bank_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM entity_stock WHERE quantity<0) AND NOT EXISTS(SELECT 1 FROM planets WHERE population<0) AND NOT EXISTS(SELECT 1 FROM port_hardware_stock WHERE stock_quantity<0 OR stock_quantity>max_stock) THEN 1 ELSE 0 END;"
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.rows.0.0",
+          "op": "exists",
+          "value": null
+        },
+        {
+          "path": "data.rows.0.1",
+          "op": "equals",
+          "value": 1
+        }
+      ]
+    },
+    {
+      "name": "Advance actual registered scheduler to simulated day 18",
+      "command": "sys.cron.advance_to",
+      "user": "admin",
+      "data": {
+        "advance_days": 18,
+        "confirm": true
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.tasks_run",
+          "op": ">",
+          "value": 0
+        }
+      ]
+    },
+    {
+      "name": "Capture day 18 accounting and invariant snapshot",
+      "command": "sys.raw_sql_exec",
+      "user": "admin",
+      "data": {
+        "sql": "SELECT jsonb_build_object('player_credits',(SELECT COALESCE(SUM(credits),0) FROM players),'corporation_credits',(SELECT COALESCE(SUM(balance),0) FROM corp_accounts),'bank_balances',(SELECT COALESCE(SUM(balance),0) FROM bank_accounts WHERE is_active=TRUE),'planet_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='planet'),'port_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='port'),'planet_population',(SELECT COALESCE(SUM(population),0) FROM planets),'production_remainders',(SELECT COALESCE(SUM(COALESCE(ore_production_remainder,0)+COALESCE(organics_production_remainder,0)+COALESCE(equipment_production_remainder,0)+COALESCE(fighter_production_remainder,0)),0) FROM planets),'ferengi_rewards',(SELECT COUNT(*) FROM ferengi_destruction_rewards),'bank_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT tx_type||':'||direction AS k,SUM(amount) AS total FROM bank_transactions GROUP BY tx_type,direction) f),'corporation_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT kind AS k,SUM(amount) AS total FROM corp_tx GROUP BY kind) c),'planetary_production_events',(SELECT COUNT(*) FROM planet_economic_activity),'planetary_output',(SELECT COALESCE(SUM(quantity),0) FROM planet_economic_activity),'system_liquidity_injections',(SELECT COALESCE(SUM(amount),0) FROM bank_transactions WHERE tx_type IN ('SYSTEM_LIQUIDITY','INSURANCE_GUARANTEE') AND direction='CREDIT'),'npc_action_rows',(SELECT COUNT(*) FROM npc_action_log))::text,CASE WHEN NOT EXISTS(SELECT 1 FROM players WHERE credits<0) AND NOT EXISTS(SELECT 1 FROM corp_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM bank_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM entity_stock WHERE quantity<0) AND NOT EXISTS(SELECT 1 FROM planets WHERE population<0) AND NOT EXISTS(SELECT 1 FROM port_hardware_stock WHERE stock_quantity<0 OR stock_quantity>max_stock) THEN 1 ELSE 0 END;"
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.rows.0.0",
+          "op": "exists",
+          "value": null
+        },
+        {
+          "path": "data.rows.0.1",
+          "op": "equals",
+          "value": 1
+        }
+      ]
+    },
+    {
+      "name": "Advance actual registered scheduler to simulated day 19",
+      "command": "sys.cron.advance_to",
+      "user": "admin",
+      "data": {
+        "advance_days": 19,
+        "confirm": true
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.tasks_run",
+          "op": ">",
+          "value": 0
+        }
+      ]
+    },
+    {
+      "name": "Capture day 19 accounting and invariant snapshot",
+      "command": "sys.raw_sql_exec",
+      "user": "admin",
+      "data": {
+        "sql": "SELECT jsonb_build_object('player_credits',(SELECT COALESCE(SUM(credits),0) FROM players),'corporation_credits',(SELECT COALESCE(SUM(balance),0) FROM corp_accounts),'bank_balances',(SELECT COALESCE(SUM(balance),0) FROM bank_accounts WHERE is_active=TRUE),'planet_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='planet'),'port_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='port'),'planet_population',(SELECT COALESCE(SUM(population),0) FROM planets),'production_remainders',(SELECT COALESCE(SUM(COALESCE(ore_production_remainder,0)+COALESCE(organics_production_remainder,0)+COALESCE(equipment_production_remainder,0)+COALESCE(fighter_production_remainder,0)),0) FROM planets),'ferengi_rewards',(SELECT COUNT(*) FROM ferengi_destruction_rewards),'bank_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT tx_type||':'||direction AS k,SUM(amount) AS total FROM bank_transactions GROUP BY tx_type,direction) f),'corporation_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT kind AS k,SUM(amount) AS total FROM corp_tx GROUP BY kind) c),'planetary_production_events',(SELECT COUNT(*) FROM planet_economic_activity),'planetary_output',(SELECT COALESCE(SUM(quantity),0) FROM planet_economic_activity),'system_liquidity_injections',(SELECT COALESCE(SUM(amount),0) FROM bank_transactions WHERE tx_type IN ('SYSTEM_LIQUIDITY','INSURANCE_GUARANTEE') AND direction='CREDIT'),'npc_action_rows',(SELECT COUNT(*) FROM npc_action_log))::text,CASE WHEN NOT EXISTS(SELECT 1 FROM players WHERE credits<0) AND NOT EXISTS(SELECT 1 FROM corp_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM bank_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM entity_stock WHERE quantity<0) AND NOT EXISTS(SELECT 1 FROM planets WHERE population<0) AND NOT EXISTS(SELECT 1 FROM port_hardware_stock WHERE stock_quantity<0 OR stock_quantity>max_stock) THEN 1 ELSE 0 END;"
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.rows.0.0",
+          "op": "exists",
+          "value": null
+        },
+        {
+          "path": "data.rows.0.1",
+          "op": "equals",
+          "value": 1
+        }
+      ]
+    },
+    {
+      "name": "Advance actual registered scheduler to simulated day 20",
+      "command": "sys.cron.advance_to",
+      "user": "admin",
+      "data": {
+        "advance_days": 20,
+        "confirm": true
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.tasks_run",
+          "op": ">",
+          "value": 0
+        }
+      ]
+    },
+    {
+      "name": "Capture day 20 accounting and invariant snapshot",
+      "command": "sys.raw_sql_exec",
+      "user": "admin",
+      "data": {
+        "sql": "SELECT jsonb_build_object('player_credits',(SELECT COALESCE(SUM(credits),0) FROM players),'corporation_credits',(SELECT COALESCE(SUM(balance),0) FROM corp_accounts),'bank_balances',(SELECT COALESCE(SUM(balance),0) FROM bank_accounts WHERE is_active=TRUE),'planet_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='planet'),'port_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='port'),'planet_population',(SELECT COALESCE(SUM(population),0) FROM planets),'production_remainders',(SELECT COALESCE(SUM(COALESCE(ore_production_remainder,0)+COALESCE(organics_production_remainder,0)+COALESCE(equipment_production_remainder,0)+COALESCE(fighter_production_remainder,0)),0) FROM planets),'ferengi_rewards',(SELECT COUNT(*) FROM ferengi_destruction_rewards),'bank_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT tx_type||':'||direction AS k,SUM(amount) AS total FROM bank_transactions GROUP BY tx_type,direction) f),'corporation_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT kind AS k,SUM(amount) AS total FROM corp_tx GROUP BY kind) c),'planetary_production_events',(SELECT COUNT(*) FROM planet_economic_activity),'planetary_output',(SELECT COALESCE(SUM(quantity),0) FROM planet_economic_activity),'system_liquidity_injections',(SELECT COALESCE(SUM(amount),0) FROM bank_transactions WHERE tx_type IN ('SYSTEM_LIQUIDITY','INSURANCE_GUARANTEE') AND direction='CREDIT'),'npc_action_rows',(SELECT COUNT(*) FROM npc_action_log))::text,CASE WHEN NOT EXISTS(SELECT 1 FROM players WHERE credits<0) AND NOT EXISTS(SELECT 1 FROM corp_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM bank_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM entity_stock WHERE quantity<0) AND NOT EXISTS(SELECT 1 FROM planets WHERE population<0) AND NOT EXISTS(SELECT 1 FROM port_hardware_stock WHERE stock_quantity<0 OR stock_quantity>max_stock) THEN 1 ELSE 0 END;"
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.rows.0.0",
+          "op": "exists",
+          "value": null
+        },
+        {
+          "path": "data.rows.0.1",
+          "op": "equals",
+          "value": 1
+        }
+      ]
+    },
+    {
+      "name": "Advance actual registered scheduler to simulated day 21",
+      "command": "sys.cron.advance_to",
+      "user": "admin",
+      "data": {
+        "advance_days": 21,
+        "confirm": true
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.tasks_run",
+          "op": ">",
+          "value": 0
+        }
+      ]
+    },
+    {
+      "name": "Capture day 21 accounting and invariant snapshot",
+      "command": "sys.raw_sql_exec",
+      "user": "admin",
+      "data": {
+        "sql": "SELECT jsonb_build_object('player_credits',(SELECT COALESCE(SUM(credits),0) FROM players),'corporation_credits',(SELECT COALESCE(SUM(balance),0) FROM corp_accounts),'bank_balances',(SELECT COALESCE(SUM(balance),0) FROM bank_accounts WHERE is_active=TRUE),'planet_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='planet'),'port_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='port'),'planet_population',(SELECT COALESCE(SUM(population),0) FROM planets),'production_remainders',(SELECT COALESCE(SUM(COALESCE(ore_production_remainder,0)+COALESCE(organics_production_remainder,0)+COALESCE(equipment_production_remainder,0)+COALESCE(fighter_production_remainder,0)),0) FROM planets),'ferengi_rewards',(SELECT COUNT(*) FROM ferengi_destruction_rewards),'bank_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT tx_type||':'||direction AS k,SUM(amount) AS total FROM bank_transactions GROUP BY tx_type,direction) f),'corporation_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT kind AS k,SUM(amount) AS total FROM corp_tx GROUP BY kind) c),'planetary_production_events',(SELECT COUNT(*) FROM planet_economic_activity),'planetary_output',(SELECT COALESCE(SUM(quantity),0) FROM planet_economic_activity),'system_liquidity_injections',(SELECT COALESCE(SUM(amount),0) FROM bank_transactions WHERE tx_type IN ('SYSTEM_LIQUIDITY','INSURANCE_GUARANTEE') AND direction='CREDIT'),'npc_action_rows',(SELECT COUNT(*) FROM npc_action_log))::text,CASE WHEN NOT EXISTS(SELECT 1 FROM players WHERE credits<0) AND NOT EXISTS(SELECT 1 FROM corp_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM bank_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM entity_stock WHERE quantity<0) AND NOT EXISTS(SELECT 1 FROM planets WHERE population<0) AND NOT EXISTS(SELECT 1 FROM port_hardware_stock WHERE stock_quantity<0 OR stock_quantity>max_stock) THEN 1 ELSE 0 END;"
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.rows.0.0",
+          "op": "exists",
+          "value": null
+        },
+        {
+          "path": "data.rows.0.1",
+          "op": "equals",
+          "value": 1
+        }
+      ]
+    },
+    {
+      "name": "Advance actual registered scheduler to simulated day 22",
+      "command": "sys.cron.advance_to",
+      "user": "admin",
+      "data": {
+        "advance_days": 22,
+        "confirm": true
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.tasks_run",
+          "op": ">",
+          "value": 0
+        }
+      ]
+    },
+    {
+      "name": "Capture day 22 accounting and invariant snapshot",
+      "command": "sys.raw_sql_exec",
+      "user": "admin",
+      "data": {
+        "sql": "SELECT jsonb_build_object('player_credits',(SELECT COALESCE(SUM(credits),0) FROM players),'corporation_credits',(SELECT COALESCE(SUM(balance),0) FROM corp_accounts),'bank_balances',(SELECT COALESCE(SUM(balance),0) FROM bank_accounts WHERE is_active=TRUE),'planet_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='planet'),'port_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='port'),'planet_population',(SELECT COALESCE(SUM(population),0) FROM planets),'production_remainders',(SELECT COALESCE(SUM(COALESCE(ore_production_remainder,0)+COALESCE(organics_production_remainder,0)+COALESCE(equipment_production_remainder,0)+COALESCE(fighter_production_remainder,0)),0) FROM planets),'ferengi_rewards',(SELECT COUNT(*) FROM ferengi_destruction_rewards),'bank_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT tx_type||':'||direction AS k,SUM(amount) AS total FROM bank_transactions GROUP BY tx_type,direction) f),'corporation_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT kind AS k,SUM(amount) AS total FROM corp_tx GROUP BY kind) c),'planetary_production_events',(SELECT COUNT(*) FROM planet_economic_activity),'planetary_output',(SELECT COALESCE(SUM(quantity),0) FROM planet_economic_activity),'system_liquidity_injections',(SELECT COALESCE(SUM(amount),0) FROM bank_transactions WHERE tx_type IN ('SYSTEM_LIQUIDITY','INSURANCE_GUARANTEE') AND direction='CREDIT'),'npc_action_rows',(SELECT COUNT(*) FROM npc_action_log))::text,CASE WHEN NOT EXISTS(SELECT 1 FROM players WHERE credits<0) AND NOT EXISTS(SELECT 1 FROM corp_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM bank_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM entity_stock WHERE quantity<0) AND NOT EXISTS(SELECT 1 FROM planets WHERE population<0) AND NOT EXISTS(SELECT 1 FROM port_hardware_stock WHERE stock_quantity<0 OR stock_quantity>max_stock) THEN 1 ELSE 0 END;"
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.rows.0.0",
+          "op": "exists",
+          "value": null
+        },
+        {
+          "path": "data.rows.0.1",
+          "op": "equals",
+          "value": 1
+        }
+      ]
+    },
+    {
+      "name": "Advance actual registered scheduler to simulated day 23",
+      "command": "sys.cron.advance_to",
+      "user": "admin",
+      "data": {
+        "advance_days": 23,
+        "confirm": true
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.tasks_run",
+          "op": ">",
+          "value": 0
+        }
+      ]
+    },
+    {
+      "name": "Capture day 23 accounting and invariant snapshot",
+      "command": "sys.raw_sql_exec",
+      "user": "admin",
+      "data": {
+        "sql": "SELECT jsonb_build_object('player_credits',(SELECT COALESCE(SUM(credits),0) FROM players),'corporation_credits',(SELECT COALESCE(SUM(balance),0) FROM corp_accounts),'bank_balances',(SELECT COALESCE(SUM(balance),0) FROM bank_accounts WHERE is_active=TRUE),'planet_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='planet'),'port_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='port'),'planet_population',(SELECT COALESCE(SUM(population),0) FROM planets),'production_remainders',(SELECT COALESCE(SUM(COALESCE(ore_production_remainder,0)+COALESCE(organics_production_remainder,0)+COALESCE(equipment_production_remainder,0)+COALESCE(fighter_production_remainder,0)),0) FROM planets),'ferengi_rewards',(SELECT COUNT(*) FROM ferengi_destruction_rewards),'bank_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT tx_type||':'||direction AS k,SUM(amount) AS total FROM bank_transactions GROUP BY tx_type,direction) f),'corporation_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT kind AS k,SUM(amount) AS total FROM corp_tx GROUP BY kind) c),'planetary_production_events',(SELECT COUNT(*) FROM planet_economic_activity),'planetary_output',(SELECT COALESCE(SUM(quantity),0) FROM planet_economic_activity),'system_liquidity_injections',(SELECT COALESCE(SUM(amount),0) FROM bank_transactions WHERE tx_type IN ('SYSTEM_LIQUIDITY','INSURANCE_GUARANTEE') AND direction='CREDIT'),'npc_action_rows',(SELECT COUNT(*) FROM npc_action_log))::text,CASE WHEN NOT EXISTS(SELECT 1 FROM players WHERE credits<0) AND NOT EXISTS(SELECT 1 FROM corp_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM bank_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM entity_stock WHERE quantity<0) AND NOT EXISTS(SELECT 1 FROM planets WHERE population<0) AND NOT EXISTS(SELECT 1 FROM port_hardware_stock WHERE stock_quantity<0 OR stock_quantity>max_stock) THEN 1 ELSE 0 END;"
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.rows.0.0",
+          "op": "exists",
+          "value": null
+        },
+        {
+          "path": "data.rows.0.1",
+          "op": "equals",
+          "value": 1
+        }
+      ]
+    },
+    {
+      "name": "Advance actual registered scheduler to simulated day 24",
+      "command": "sys.cron.advance_to",
+      "user": "admin",
+      "data": {
+        "advance_days": 24,
+        "confirm": true
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.tasks_run",
+          "op": ">",
+          "value": 0
+        }
+      ]
+    },
+    {
+      "name": "Capture day 24 accounting and invariant snapshot",
+      "command": "sys.raw_sql_exec",
+      "user": "admin",
+      "data": {
+        "sql": "SELECT jsonb_build_object('player_credits',(SELECT COALESCE(SUM(credits),0) FROM players),'corporation_credits',(SELECT COALESCE(SUM(balance),0) FROM corp_accounts),'bank_balances',(SELECT COALESCE(SUM(balance),0) FROM bank_accounts WHERE is_active=TRUE),'planet_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='planet'),'port_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='port'),'planet_population',(SELECT COALESCE(SUM(population),0) FROM planets),'production_remainders',(SELECT COALESCE(SUM(COALESCE(ore_production_remainder,0)+COALESCE(organics_production_remainder,0)+COALESCE(equipment_production_remainder,0)+COALESCE(fighter_production_remainder,0)),0) FROM planets),'ferengi_rewards',(SELECT COUNT(*) FROM ferengi_destruction_rewards),'bank_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT tx_type||':'||direction AS k,SUM(amount) AS total FROM bank_transactions GROUP BY tx_type,direction) f),'corporation_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT kind AS k,SUM(amount) AS total FROM corp_tx GROUP BY kind) c),'planetary_production_events',(SELECT COUNT(*) FROM planet_economic_activity),'planetary_output',(SELECT COALESCE(SUM(quantity),0) FROM planet_economic_activity),'system_liquidity_injections',(SELECT COALESCE(SUM(amount),0) FROM bank_transactions WHERE tx_type IN ('SYSTEM_LIQUIDITY','INSURANCE_GUARANTEE') AND direction='CREDIT'),'npc_action_rows',(SELECT COUNT(*) FROM npc_action_log))::text,CASE WHEN NOT EXISTS(SELECT 1 FROM players WHERE credits<0) AND NOT EXISTS(SELECT 1 FROM corp_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM bank_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM entity_stock WHERE quantity<0) AND NOT EXISTS(SELECT 1 FROM planets WHERE population<0) AND NOT EXISTS(SELECT 1 FROM port_hardware_stock WHERE stock_quantity<0 OR stock_quantity>max_stock) THEN 1 ELSE 0 END;"
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.rows.0.0",
+          "op": "exists",
+          "value": null
+        },
+        {
+          "path": "data.rows.0.1",
+          "op": "equals",
+          "value": 1
+        }
+      ]
+    },
+    {
+      "name": "Advance actual registered scheduler to simulated day 25",
+      "command": "sys.cron.advance_to",
+      "user": "admin",
+      "data": {
+        "advance_days": 25,
+        "confirm": true
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.tasks_run",
+          "op": ">",
+          "value": 0
+        }
+      ]
+    },
+    {
+      "name": "Capture day 25 accounting and invariant snapshot",
+      "command": "sys.raw_sql_exec",
+      "user": "admin",
+      "data": {
+        "sql": "SELECT jsonb_build_object('player_credits',(SELECT COALESCE(SUM(credits),0) FROM players),'corporation_credits',(SELECT COALESCE(SUM(balance),0) FROM corp_accounts),'bank_balances',(SELECT COALESCE(SUM(balance),0) FROM bank_accounts WHERE is_active=TRUE),'planet_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='planet'),'port_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='port'),'planet_population',(SELECT COALESCE(SUM(population),0) FROM planets),'production_remainders',(SELECT COALESCE(SUM(COALESCE(ore_production_remainder,0)+COALESCE(organics_production_remainder,0)+COALESCE(equipment_production_remainder,0)+COALESCE(fighter_production_remainder,0)),0) FROM planets),'ferengi_rewards',(SELECT COUNT(*) FROM ferengi_destruction_rewards),'bank_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT tx_type||':'||direction AS k,SUM(amount) AS total FROM bank_transactions GROUP BY tx_type,direction) f),'corporation_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT kind AS k,SUM(amount) AS total FROM corp_tx GROUP BY kind) c),'planetary_production_events',(SELECT COUNT(*) FROM planet_economic_activity),'planetary_output',(SELECT COALESCE(SUM(quantity),0) FROM planet_economic_activity),'system_liquidity_injections',(SELECT COALESCE(SUM(amount),0) FROM bank_transactions WHERE tx_type IN ('SYSTEM_LIQUIDITY','INSURANCE_GUARANTEE') AND direction='CREDIT'),'npc_action_rows',(SELECT COUNT(*) FROM npc_action_log))::text,CASE WHEN NOT EXISTS(SELECT 1 FROM players WHERE credits<0) AND NOT EXISTS(SELECT 1 FROM corp_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM bank_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM entity_stock WHERE quantity<0) AND NOT EXISTS(SELECT 1 FROM planets WHERE population<0) AND NOT EXISTS(SELECT 1 FROM port_hardware_stock WHERE stock_quantity<0 OR stock_quantity>max_stock) THEN 1 ELSE 0 END;"
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.rows.0.0",
+          "op": "exists",
+          "value": null
+        },
+        {
+          "path": "data.rows.0.1",
+          "op": "equals",
+          "value": 1
+        }
+      ]
+    },
+    {
+      "name": "Advance actual registered scheduler to simulated day 26",
+      "command": "sys.cron.advance_to",
+      "user": "admin",
+      "data": {
+        "advance_days": 26,
+        "confirm": true
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.tasks_run",
+          "op": ">",
+          "value": 0
+        }
+      ]
+    },
+    {
+      "name": "Capture day 26 accounting and invariant snapshot",
+      "command": "sys.raw_sql_exec",
+      "user": "admin",
+      "data": {
+        "sql": "SELECT jsonb_build_object('player_credits',(SELECT COALESCE(SUM(credits),0) FROM players),'corporation_credits',(SELECT COALESCE(SUM(balance),0) FROM corp_accounts),'bank_balances',(SELECT COALESCE(SUM(balance),0) FROM bank_accounts WHERE is_active=TRUE),'planet_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='planet'),'port_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='port'),'planet_population',(SELECT COALESCE(SUM(population),0) FROM planets),'production_remainders',(SELECT COALESCE(SUM(COALESCE(ore_production_remainder,0)+COALESCE(organics_production_remainder,0)+COALESCE(equipment_production_remainder,0)+COALESCE(fighter_production_remainder,0)),0) FROM planets),'ferengi_rewards',(SELECT COUNT(*) FROM ferengi_destruction_rewards),'bank_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT tx_type||':'||direction AS k,SUM(amount) AS total FROM bank_transactions GROUP BY tx_type,direction) f),'corporation_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT kind AS k,SUM(amount) AS total FROM corp_tx GROUP BY kind) c),'planetary_production_events',(SELECT COUNT(*) FROM planet_economic_activity),'planetary_output',(SELECT COALESCE(SUM(quantity),0) FROM planet_economic_activity),'system_liquidity_injections',(SELECT COALESCE(SUM(amount),0) FROM bank_transactions WHERE tx_type IN ('SYSTEM_LIQUIDITY','INSURANCE_GUARANTEE') AND direction='CREDIT'),'npc_action_rows',(SELECT COUNT(*) FROM npc_action_log))::text,CASE WHEN NOT EXISTS(SELECT 1 FROM players WHERE credits<0) AND NOT EXISTS(SELECT 1 FROM corp_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM bank_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM entity_stock WHERE quantity<0) AND NOT EXISTS(SELECT 1 FROM planets WHERE population<0) AND NOT EXISTS(SELECT 1 FROM port_hardware_stock WHERE stock_quantity<0 OR stock_quantity>max_stock) THEN 1 ELSE 0 END;"
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.rows.0.0",
+          "op": "exists",
+          "value": null
+        },
+        {
+          "path": "data.rows.0.1",
+          "op": "equals",
+          "value": 1
+        }
+      ]
+    },
+    {
+      "name": "Advance actual registered scheduler to simulated day 27",
+      "command": "sys.cron.advance_to",
+      "user": "admin",
+      "data": {
+        "advance_days": 27,
+        "confirm": true
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.tasks_run",
+          "op": ">",
+          "value": 0
+        }
+      ]
+    },
+    {
+      "name": "Capture day 27 accounting and invariant snapshot",
+      "command": "sys.raw_sql_exec",
+      "user": "admin",
+      "data": {
+        "sql": "SELECT jsonb_build_object('player_credits',(SELECT COALESCE(SUM(credits),0) FROM players),'corporation_credits',(SELECT COALESCE(SUM(balance),0) FROM corp_accounts),'bank_balances',(SELECT COALESCE(SUM(balance),0) FROM bank_accounts WHERE is_active=TRUE),'planet_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='planet'),'port_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='port'),'planet_population',(SELECT COALESCE(SUM(population),0) FROM planets),'production_remainders',(SELECT COALESCE(SUM(COALESCE(ore_production_remainder,0)+COALESCE(organics_production_remainder,0)+COALESCE(equipment_production_remainder,0)+COALESCE(fighter_production_remainder,0)),0) FROM planets),'ferengi_rewards',(SELECT COUNT(*) FROM ferengi_destruction_rewards),'bank_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT tx_type||':'||direction AS k,SUM(amount) AS total FROM bank_transactions GROUP BY tx_type,direction) f),'corporation_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT kind AS k,SUM(amount) AS total FROM corp_tx GROUP BY kind) c),'planetary_production_events',(SELECT COUNT(*) FROM planet_economic_activity),'planetary_output',(SELECT COALESCE(SUM(quantity),0) FROM planet_economic_activity),'system_liquidity_injections',(SELECT COALESCE(SUM(amount),0) FROM bank_transactions WHERE tx_type IN ('SYSTEM_LIQUIDITY','INSURANCE_GUARANTEE') AND direction='CREDIT'),'npc_action_rows',(SELECT COUNT(*) FROM npc_action_log))::text,CASE WHEN NOT EXISTS(SELECT 1 FROM players WHERE credits<0) AND NOT EXISTS(SELECT 1 FROM corp_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM bank_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM entity_stock WHERE quantity<0) AND NOT EXISTS(SELECT 1 FROM planets WHERE population<0) AND NOT EXISTS(SELECT 1 FROM port_hardware_stock WHERE stock_quantity<0 OR stock_quantity>max_stock) THEN 1 ELSE 0 END;"
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.rows.0.0",
+          "op": "exists",
+          "value": null
+        },
+        {
+          "path": "data.rows.0.1",
+          "op": "equals",
+          "value": 1
+        }
+      ]
+    },
+    {
+      "name": "Advance actual registered scheduler to simulated day 28",
+      "command": "sys.cron.advance_to",
+      "user": "admin",
+      "data": {
+        "advance_days": 28,
+        "confirm": true
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.tasks_run",
+          "op": ">",
+          "value": 0
+        }
+      ]
+    },
+    {
+      "name": "Capture day 28 accounting and invariant snapshot",
+      "command": "sys.raw_sql_exec",
+      "user": "admin",
+      "data": {
+        "sql": "SELECT jsonb_build_object('player_credits',(SELECT COALESCE(SUM(credits),0) FROM players),'corporation_credits',(SELECT COALESCE(SUM(balance),0) FROM corp_accounts),'bank_balances',(SELECT COALESCE(SUM(balance),0) FROM bank_accounts WHERE is_active=TRUE),'planet_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='planet'),'port_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='port'),'planet_population',(SELECT COALESCE(SUM(population),0) FROM planets),'production_remainders',(SELECT COALESCE(SUM(COALESCE(ore_production_remainder,0)+COALESCE(organics_production_remainder,0)+COALESCE(equipment_production_remainder,0)+COALESCE(fighter_production_remainder,0)),0) FROM planets),'ferengi_rewards',(SELECT COUNT(*) FROM ferengi_destruction_rewards),'bank_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT tx_type||':'||direction AS k,SUM(amount) AS total FROM bank_transactions GROUP BY tx_type,direction) f),'corporation_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT kind AS k,SUM(amount) AS total FROM corp_tx GROUP BY kind) c),'planetary_production_events',(SELECT COUNT(*) FROM planet_economic_activity),'planetary_output',(SELECT COALESCE(SUM(quantity),0) FROM planet_economic_activity),'system_liquidity_injections',(SELECT COALESCE(SUM(amount),0) FROM bank_transactions WHERE tx_type IN ('SYSTEM_LIQUIDITY','INSURANCE_GUARANTEE') AND direction='CREDIT'),'npc_action_rows',(SELECT COUNT(*) FROM npc_action_log))::text,CASE WHEN NOT EXISTS(SELECT 1 FROM players WHERE credits<0) AND NOT EXISTS(SELECT 1 FROM corp_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM bank_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM entity_stock WHERE quantity<0) AND NOT EXISTS(SELECT 1 FROM planets WHERE population<0) AND NOT EXISTS(SELECT 1 FROM port_hardware_stock WHERE stock_quantity<0 OR stock_quantity>max_stock) THEN 1 ELSE 0 END;"
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.rows.0.0",
+          "op": "exists",
+          "value": null
+        },
+        {
+          "path": "data.rows.0.1",
+          "op": "equals",
+          "value": 1
+        }
+      ]
+    },
+    {
+      "name": "Advance actual registered scheduler to simulated day 29",
+      "command": "sys.cron.advance_to",
+      "user": "admin",
+      "data": {
+        "advance_days": 29,
+        "confirm": true
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.tasks_run",
+          "op": ">",
+          "value": 0
+        }
+      ]
+    },
+    {
+      "name": "Capture day 29 accounting and invariant snapshot",
+      "command": "sys.raw_sql_exec",
+      "user": "admin",
+      "data": {
+        "sql": "SELECT jsonb_build_object('player_credits',(SELECT COALESCE(SUM(credits),0) FROM players),'corporation_credits',(SELECT COALESCE(SUM(balance),0) FROM corp_accounts),'bank_balances',(SELECT COALESCE(SUM(balance),0) FROM bank_accounts WHERE is_active=TRUE),'planet_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='planet'),'port_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='port'),'planet_population',(SELECT COALESCE(SUM(population),0) FROM planets),'production_remainders',(SELECT COALESCE(SUM(COALESCE(ore_production_remainder,0)+COALESCE(organics_production_remainder,0)+COALESCE(equipment_production_remainder,0)+COALESCE(fighter_production_remainder,0)),0) FROM planets),'ferengi_rewards',(SELECT COUNT(*) FROM ferengi_destruction_rewards),'bank_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT tx_type||':'||direction AS k,SUM(amount) AS total FROM bank_transactions GROUP BY tx_type,direction) f),'corporation_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT kind AS k,SUM(amount) AS total FROM corp_tx GROUP BY kind) c),'planetary_production_events',(SELECT COUNT(*) FROM planet_economic_activity),'planetary_output',(SELECT COALESCE(SUM(quantity),0) FROM planet_economic_activity),'system_liquidity_injections',(SELECT COALESCE(SUM(amount),0) FROM bank_transactions WHERE tx_type IN ('SYSTEM_LIQUIDITY','INSURANCE_GUARANTEE') AND direction='CREDIT'),'npc_action_rows',(SELECT COUNT(*) FROM npc_action_log))::text,CASE WHEN NOT EXISTS(SELECT 1 FROM players WHERE credits<0) AND NOT EXISTS(SELECT 1 FROM corp_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM bank_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM entity_stock WHERE quantity<0) AND NOT EXISTS(SELECT 1 FROM planets WHERE population<0) AND NOT EXISTS(SELECT 1 FROM port_hardware_stock WHERE stock_quantity<0 OR stock_quantity>max_stock) THEN 1 ELSE 0 END;"
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.rows.0.0",
+          "op": "exists",
+          "value": null
+        },
+        {
+          "path": "data.rows.0.1",
+          "op": "equals",
+          "value": 1
+        }
+      ]
+    },
+    {
+      "name": "Advance actual registered scheduler to simulated day 30",
+      "command": "sys.cron.advance_to",
+      "user": "admin",
+      "data": {
+        "advance_days": 30,
+        "confirm": true
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.tasks_run",
+          "op": ">",
+          "value": 0
+        }
+      ]
+    },
+    {
+      "name": "Capture day 30 accounting and invariant snapshot",
+      "command": "sys.raw_sql_exec",
+      "user": "admin",
+      "data": {
+        "sql": "SELECT jsonb_build_object('player_credits',(SELECT COALESCE(SUM(credits),0) FROM players),'corporation_credits',(SELECT COALESCE(SUM(balance),0) FROM corp_accounts),'bank_balances',(SELECT COALESCE(SUM(balance),0) FROM bank_accounts WHERE is_active=TRUE),'planet_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='planet'),'port_stock',(SELECT COALESCE(SUM(quantity),0) FROM entity_stock WHERE entity_type='port'),'planet_population',(SELECT COALESCE(SUM(population),0) FROM planets),'production_remainders',(SELECT COALESCE(SUM(COALESCE(ore_production_remainder,0)+COALESCE(organics_production_remainder,0)+COALESCE(equipment_production_remainder,0)+COALESCE(fighter_production_remainder,0)),0) FROM planets),'ferengi_rewards',(SELECT COUNT(*) FROM ferengi_destruction_rewards),'bank_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT tx_type||':'||direction AS k,SUM(amount) AS total FROM bank_transactions GROUP BY tx_type,direction) f),'corporation_flow_by_mechanism',(SELECT COALESCE(jsonb_object_agg(k,total),'{}'::jsonb) FROM (SELECT kind AS k,SUM(amount) AS total FROM corp_tx GROUP BY kind) c),'planetary_production_events',(SELECT COUNT(*) FROM planet_economic_activity),'planetary_output',(SELECT COALESCE(SUM(quantity),0) FROM planet_economic_activity),'system_liquidity_injections',(SELECT COALESCE(SUM(amount),0) FROM bank_transactions WHERE tx_type IN ('SYSTEM_LIQUIDITY','INSURANCE_GUARANTEE') AND direction='CREDIT'),'npc_action_rows',(SELECT COUNT(*) FROM npc_action_log))::text,CASE WHEN NOT EXISTS(SELECT 1 FROM players WHERE credits<0) AND NOT EXISTS(SELECT 1 FROM corp_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM bank_accounts WHERE balance<0) AND NOT EXISTS(SELECT 1 FROM entity_stock WHERE quantity<0) AND NOT EXISTS(SELECT 1 FROM planets WHERE population<0) AND NOT EXISTS(SELECT 1 FROM port_hardware_stock WHERE stock_quantity<0 OR stock_quantity>max_stock) THEN 1 ELSE 0 END;"
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.rows.0.0",
+          "op": "exists",
+          "value": null
+        },
+        {
+          "path": "data.rows.0.1",
+          "op": "equals",
+          "value": 1
+        }
+      ]
+    },
+    {
+      "name": "Verify actual scheduled NPC activity was recorded during the simulation",
+      "command": "sys.raw_sql_exec",
+      "user": "admin",
+      "data": {
+        "sql": "SELECT COUNT(*) FROM npc_action_log WHERE faction='ORION' AND action_type='move' AND status='completed' AND npc_ship_id IN (SELECT ship_id FROM ships WHERE name='EXC09 Orion scheduler hull');"
+      },
+      "expect": {
+        "status": "ok"
+      },
+      "asserts": [
+        {
+          "path": "data.rows.0.0",
+          "op": ">",
+          "value": 0
+        }
+      ]
+    },
+    {
+      "name": "Disable deterministic clock after simulation",
+      "command": "sys.raw_sql_exec",
+      "user": "admin",
+      "data": {
+        "sql": "UPDATE config SET value='0' WHERE key='test.deterministic_scheduler_enabled' AND type='int';"
+      },
+      "expect": {
+        "status": "ok"
+      }
+    }
+  ]
+}

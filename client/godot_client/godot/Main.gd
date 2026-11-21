@@ -28,13 +28,18 @@ var _connection_started := false
 var _authenticated_once := false
 var _pending_game_commands: Dictionary = {}
 var _pending_event_subscriptions: Dictionary = {}
+var _pending_port_attack: Dictionary = {}
+var _toll_offer_dialog: ConfirmationDialog
+var _pending_toll_offer: Dictionary = {}
 var _registration_payload: Dictionary = {}
 var _pending_registration_request_id := ""
 var _warp_refresh_pending := false
 var _command_refresh_pending := false
 var _ship_roster_refresh_after_command := false
+var _pending_ship_transfer_refusal := ""
 var _pending_trade: Dictionary = {}
 var _landed_planet_id := 0
+var _pending_initial_landed_restore := false
 var _pending_landing_surface_id := 0
 var _pending_launch_departure := false
 var _landing_surface_ready := false
@@ -50,6 +55,16 @@ var _autopilot_mode := "continue"
 var _route_total_hops := 0
 var _route_completed_hops := 0
 var _route_current_sector := 0
+var _feedback_form: ConfirmationDialog
+var _feedback_preview: ConfirmationDialog
+var _feedback_result: AcceptDialog
+var _feedback_preview_text: TextEdit
+var _feedback_status_form: ConfirmationDialog
+var _feedback_status_input: LineEdit
+var _feedback_fields: Dictionary = {}
+var _feedback_payload: Dictionary = {}
+var _feedback_requests: Dictionary = {}
+var _last_failed_command: Dictionary = {}
 
 func _ready() -> void:
 	transport = ProtocolTransport.new(15.0, 200)
@@ -59,6 +74,8 @@ func _ready() -> void:
 	transport.transport_connected.connect(_on_transport_connected)
 	transport.transport_disconnected.connect(_on_transport_disconnected)
 	transport.reply_received.connect(_on_transport_reply)
+	_build_toll_offer_ui()
+	_build_feedback_ui()
 	transport.request_timed_out.connect(_on_request_timed_out)
 	transport.request_failed.connect(_on_request_failed)
 	transport.protocol_error.connect(_on_protocol_error)
@@ -219,6 +236,7 @@ func _on_transport_disconnected(reason: String) -> void:
 		_landed_planet_id = 0
 		_landing_surface_ready = false
 		gameplay_view.leave_planet_workflow()
+	_pending_initial_landed_restore = false
 	_pending_launch_departure = false
 	gameplay_view.set_command_busy(false)
 	refresh_coordinator.handle_disconnect()
@@ -239,8 +257,36 @@ func _on_transport_disconnected(reason: String) -> void:
 		log_network("DISCONNECTED", reason)
 
 func _on_transport_reply(request_id: String, response: Dictionary, command: String) -> void:
+	if not command.begins_with("feedback.") and str(response.get("status", "")) in ["error", "refused"]:
+		var error_value = response.get("error", {})
+		_last_failed_command = {"command": command, "status": str(response.get("status", "error")), "error_code": error_value.get("code", null) if error_value is Dictionary else null}
 	print("[AUTH_TRACE] Main received reply command=%s request_id_present=%s response_type=%s" % [command, not request_id.is_empty(), str(response.get("type", ""))])
 	var reply_summary := "command=%s type=%s status=%s request_id_present=%s" % [command, str(response.get("type", "")), str(response.get("status", "")), not request_id.is_empty()]
+	if _feedback_requests.has(request_id):
+		var feedback_stage := str(_feedback_requests[request_id])
+		_feedback_requests.erase(request_id)
+		var feedback_result: Dictionary = Protocol.result_from_response(response)
+		if feedback_result.get("kind") != "ok":
+			gameplay_view.show_notification("Feedback request refused · %s" % str(feedback_result.get("message", "server refused the request")))
+			return
+		var feedback_data := _response_data_dictionary(feedback_result.get("data", {}))
+		if feedback_stage == "preview":
+			_feedback_payload["report_id"] = str(feedback_data.get("report_id", ""))
+			_feedback_preview_text.text = "%s\n\n%s" % [str(feedback_data.get("title", "")), str(feedback_data.get("body", ""))]
+			_feedback_preview.popup_centered(Vector2i(760, 620))
+		elif feedback_stage == "submit":
+			var message := "Report reference: %s\nStatus: %s" % [str(feedback_data.get("report_id", "unavailable")), str(feedback_data.get("state", "pending"))]
+			if feedback_data.has("github_issue_url"):
+				message += "\nGitHub issue: %s" % str(feedback_data["github_issue_url"])
+			_feedback_result.dialog_text = message
+			_feedback_result.popup_centered()
+		elif feedback_stage == "status":
+			var message := "Report reference: %s\nStatus: %s" % [str(feedback_data.get("report_id", "")), str(feedback_data.get("state", "unknown"))]
+			if feedback_data.has("github_issue_url"):
+				message += "\nGitHub issue: %s" % str(feedback_data["github_issue_url"])
+			_feedback_result.dialog_text = message
+			_feedback_result.popup_centered()
+		return
 	if command in ["move.scan", "sector.info"]:
 		log_network("REPLY", "%s response=%s" % [reply_summary, Protocol.diagnostic_json(response)])
 	else:
@@ -272,6 +318,10 @@ func _on_transport_reply(request_id: String, response: Dictionary, command: Stri
 	if _pending_game_commands.has(request_id):
 		var operation: Dictionary = _pending_game_commands[request_id]
 		_pending_game_commands.erase(request_id)
+		if str(operation.get("command", "")) == "combat.attack.port":
+			# A received reply settles this attempt. Timeouts/disconnects retain the
+			# key so an explicit retry after reconnect is idempotent at the server.
+			_pending_port_attack.clear()
 		if operation.get("kind") == "autopilot_status":
 			_finish_autopilot_status(response)
 		elif operation.get("kind") == "tavern_probe":
@@ -286,11 +336,20 @@ func _on_transport_reply(request_id: String, response: Dictionary, command: Stri
 			if planet_result.get("kind") == "ok":
 				var planet_data := _response_data_dictionary(planet_result.get("data", {}))
 				var reported_planet_id := _response_planet_id(planet_data)
-				if reported_planet_id <= 0 or reported_planet_id != _landed_planet_id:
+				var snapshot_value: Variant = client_state.snapshot()
+				var snapshot: Dictionary = snapshot_value if snapshot_value is Dictionary else {}
+				var sector_value: Variant = snapshot.get("sector", {})
+				var sector: Dictionary = sector_value if sector_value is Dictionary else {}
+				var current_sector_id := _authoritative_positive_id(sector.get("id", 0))
+				var reported_planet_sector_id := _authoritative_positive_id(planet_data.get("sector_id", 0))
+				var planet_identity_matches := reported_planet_id > 0 and reported_planet_id == _landed_planet_id
+				var planet_sector_matches: bool = operation.get("kind") != "planet_info" \
+					or (current_sector_id > 0 and reported_planet_sector_id == current_sector_id)
+				if not planet_identity_matches or not planet_sector_matches:
 					_planet_read_refused = true
 					_invalidate_planet_surface_context()
 					var record_kind := "information" if operation.get("kind") == "planet_info" else "colony"
-					gameplay_view.show_notification("Planet %s was not displayed because the response omitted or changed the confirmed planet ID." % record_kind)
+					gameplay_view.show_notification("Planet %s was not displayed because its identity did not match the confirmed planet and current sector." % record_kind)
 				else:
 					if operation.get("kind") == "planet_info":
 						gameplay_view.set_planet_information(planet_data)
@@ -380,8 +439,11 @@ func _on_authenticated() -> void:
 		if not refresh_coordinator.refresh(false, ["player", "ship"]):
 			gameplay_view.show_notification("Unable to refresh player and ship state.")
 		_request_planet_surface_records()
-	elif not refresh_coordinator.refresh():
-		gameplay_view.show_notification("Unable to refresh the current state.")
+	else:
+		_pending_initial_landed_restore = true
+		if not refresh_coordinator.refresh():
+			_pending_initial_landed_restore = false
+			gameplay_view.show_notification("Unable to refresh the current state.")
 
 func _on_authentication_failed(message: String) -> void:
 	login_view.set_overlay_mode(_authenticated_once)
@@ -654,6 +716,7 @@ func _on_request_failed(request_id: String, command: String, result: Dictionary)
 		gameplay_view.show_notification("%s failed · %s" % [str(failed_operation.get("label", command)), str(result.get("message", "request failed"))])
 
 func _on_refresh_failed(snapshot: Dictionary) -> void:
+	_pending_initial_landed_restore = false
 	var freshness: Dictionary = snapshot.get("freshness", {})
 	gameplay_view.show_notification("State is %s. Some sector information may be unavailable." % str(freshness.get("overall", "partially available")))
 	if _warp_refresh_pending:
@@ -661,6 +724,7 @@ func _on_refresh_failed(snapshot: Dictionary) -> void:
 		gameplay_view.set_action_pending(false)
 	if _command_refresh_pending:
 		_command_refresh_pending = false
+		var specific_refresh_failure_presented := false
 		if _ship_roster_refresh_after_command:
 			_ship_roster_refresh_after_command = false
 			# The previous roster is no longer safe to use after an ownership
@@ -668,12 +732,15 @@ func _on_refresh_failed(snapshot: Dictionary) -> void:
 			# actionable while the server state is unknown.
 			gameplay_view.command_menu.set_owned_ship_roster({})
 			gameplay_view.set_command_busy(false)
-			gameplay_view.show_notification("Ownership state was refreshed, but the owned-ship roster could not be confirmed.")
+			var transfer_refusal := _pending_ship_transfer_refusal
+			_pending_ship_transfer_refusal = ""
+			gameplay_view.show_notification("%s%sOwnership state could not be refreshed; the previous roster was cleared." % [transfer_refusal, " · " if not transfer_refusal.is_empty() else ""])
 		if _pending_launch_departure:
 			_pending_launch_departure = false
 			_landing_surface_ready = false
 			gameplay_view.set_command_busy(false)
 			gameplay_view.show_notification("Launch confirmed, but the authoritative refresh was incomplete; keeping planet actions unavailable until state is refreshed.")
+			specific_refresh_failure_presented = true
 		if _pending_landing_surface_id > 0:
 			_pending_landing_surface_id = 0
 			# The landing reply was not enough to make the surface actionable:
@@ -687,12 +754,14 @@ func _on_refresh_failed(snapshot: Dictionary) -> void:
 			# leaving stale planet controls actionable.
 			gameplay_view.leave_planet_workflow()
 			gameplay_view.show_notification("Landing confirmed, but player and ship refresh was incomplete; planet actions remain unavailable until state is refreshed.")
+			specific_refresh_failure_presented = true
 		if _pending_trade.get("refresh_port_after") == true:
 			_pending_trade.erase("refresh_port_after")
 			_request_port_refresh()
 		else:
 			gameplay_view.set_command_busy(false)
-		gameplay_view.show_notification("Command completed, but the refreshed state could not be confirmed.")
+		if not specific_refresh_failure_presented:
+			gameplay_view.show_notification("Command completed, but the refreshed state could not be confirmed.")
 
 func _on_refresh_finished(snapshot: Dictionary) -> void:
 	if _warp_refresh_pending:
@@ -702,6 +771,7 @@ func _on_refresh_finished(snapshot: Dictionary) -> void:
 		_command_refresh_pending = false
 		if _ship_roster_refresh_after_command:
 			_ship_roster_refresh_after_command = false
+			_pending_ship_transfer_refusal = ""
 			gameplay_view.command_menu.set_owned_ship_roster({})
 			_request_ship_roster_refresh()
 			return
@@ -735,15 +805,21 @@ func _on_refresh_finished(snapshot: Dictionary) -> void:
 			# The authoritative ship field stores the landed planet's ID, not a
 			# boolean flag.  Require that exact ID so a stale/contradictory ship
 			# refresh cannot open a different planet surface.
-			var landed_planet_id := _authoritative_positive_id(ship_snapshot.get("onplanet", 0))
-			var ship_on_planet := landed_planet_id == landing_id
+			var onplanet_value: Variant = ship_snapshot.get("onplanet", null)
+			var player_ship_id := _authoritative_positive_id(player_snapshot.get("ship_id", 0))
+			var refreshed_ship_id := _authoritative_positive_id(ship_snapshot.get("id", 0))
+			var player_planet_id := _authoritative_positive_id(player_snapshot.get("last_planet_id", 0))
+			# V3 `ship.status` publishes onplanet as a boolean integer (0/1).
+			# `player.info.last_planet_id` carries the actual planet identity.
+			var ship_on_planet := typeof(onplanet_value) == TYPE_INT and int(onplanet_value) == 1
+			var active_ship_matches := player_ship_id > 0 and refreshed_ship_id == player_ship_id
+			var landed_planet_matches := player_planet_id == landing_id
 			_pending_landing_surface_id = 0
-			if player_fresh and player_identity_matches and ship_fresh and sector_fresh and ship_on_planet and _landed_planet_id == landing_id:
+			if player_fresh and player_identity_matches and ship_fresh and sector_fresh and active_ship_matches and ship_on_planet and landed_planet_matches and _landed_planet_id == landing_id:
 				_landing_surface_ready = true
 				await gameplay_view.play_warp_transition()
 				gameplay_view.enter_planet_workflow(landing_id)
 				gameplay_view.show_notification("Landing confirmed · planet surface opened.")
-				_request_planet_surface_records()
 			else:
 				_landing_surface_ready = false
 				# Freshness alone does not establish that the landing completed. Clear
@@ -760,6 +836,43 @@ func _on_refresh_finished(snapshot: Dictionary) -> void:
 			_request_port_refresh()
 		else:
 			gameplay_view.set_command_busy(false)
+	if _pending_initial_landed_restore and _landed_planet_id <= 0 and _pending_landing_surface_id <= 0:
+		_pending_initial_landed_restore = false
+		_restore_persisted_planet_surface(snapshot)
+
+func _restore_persisted_planet_surface(snapshot: Dictionary) -> void:
+	# A new Godot process has no local landed-planet ID. Reconstruct surface access
+	# only from the authenticated player's fresh identity, active ship, sector,
+	# and the server's persisted last_planet_id/onplanet pair.
+	var freshness_value: Variant = snapshot.get("freshness", {})
+	var freshness: Dictionary = freshness_value if freshness_value is Dictionary else {}
+	if str(freshness.get("player", "")) != ClientState.FRESH \
+			or str(freshness.get("ship", "")) != ClientState.FRESH \
+			or str(freshness.get("sector", "")) != ClientState.FRESH:
+		return
+	var player_value: Variant = snapshot.get("player", {})
+	var ship_value: Variant = snapshot.get("ship", {})
+	var sector_value: Variant = snapshot.get("sector", {})
+	var player: Dictionary = player_value if player_value is Dictionary else {}
+	var ship: Dictionary = ship_value if ship_value is Dictionary else {}
+	var sector: Dictionary = sector_value if sector_value is Dictionary else {}
+	var player_id := _authoritative_positive_id(player.get("id", 0))
+	var session_player_id := _authoritative_positive_id(auth_session.player_id)
+	var player_ship_id := _authoritative_positive_id(player.get("ship_id", 0))
+	var ship_id := _authoritative_positive_id(ship.get("id", 0))
+	var planet_id := _authoritative_positive_id(player.get("last_planet_id", 0))
+	var player_sector := _authoritative_positive_id(player.get("sector_id", player.get("sector", 0)))
+	var current_sector := _authoritative_positive_id(sector.get("id", 0))
+	var onplanet: Variant = ship.get("onplanet", null)
+	if player_id <= 0 or player_id != session_player_id or player_ship_id <= 0 \
+			or player_ship_id != ship_id or planet_id <= 0 or player_sector <= 0 \
+			or player_sector != current_sector or typeof(onplanet) != TYPE_INT \
+			or int(onplanet) != 1:
+		return
+	_landed_planet_id = planet_id
+	_landing_surface_ready = true
+	gameplay_view.enter_planet_workflow(planet_id)
+	gameplay_view.show_notification("Persisted landing confirmed · refreshing the planet surface.")
 
 func _finish_pending_launch_departure(snapshot: Dictionary) -> void:
 	_pending_launch_departure = false
@@ -768,8 +881,9 @@ func _finish_pending_launch_departure(snapshot: Dictionary) -> void:
 	var all_fresh := str(freshness.get("player", "")) == ClientState.FRESH and str(freshness.get("ship", "")) == ClientState.FRESH and str(freshness.get("sector", "")) == ClientState.FRESH
 	if not all_fresh:
 		_landing_surface_ready = false
+		gameplay_view.planet_workflow.set_surface_actionable(false)
 		gameplay_view.set_command_busy(false)
-		gameplay_view.show_notification("Launch confirmed, but the authoritative refresh was incomplete; keeping planet actions unavailable until state is refreshed.")
+		gameplay_view.show_notification("Launch state is uncertain because the authoritative refresh was incomplete; the last confirmed planet remains visible but its actions are disabled until refresh.")
 		return
 	var ship_value: Variant = snapshot.get("ship", {})
 	var ship_snapshot: Dictionary = ship_value if ship_value is Dictionary else {}
@@ -778,16 +892,30 @@ func _finish_pending_launch_departure(snapshot: Dictionary) -> void:
 	# not evidence that departure completed; keep the surface fail-closed.
 	if not ship_snapshot.has("onplanet"):
 		_landing_surface_ready = false
+		gameplay_view.planet_workflow.set_surface_actionable(false)
 		gameplay_view.set_command_busy(false)
-		gameplay_view.show_notification("Launch state was incomplete; keeping the confirmed planet surface until a fresh state is available.")
+		gameplay_view.show_notification("Launch state was incomplete; the last confirmed planet remains visible with actions disabled until refreshed.")
 		return
 	var onplanet: Variant = ship_snapshot.get("onplanet")
-	var onplanet_valid_zero: bool = (typeof(onplanet) == TYPE_INT and int(onplanet) == 0) \
-		or (typeof(onplanet) == TYPE_FLOAT and is_finite(onplanet) and onplanet == 0.0)
-	if not onplanet_valid_zero:
-		_landing_surface_ready = false
+	var player_value: Variant = snapshot.get("player", {})
+	var player_snapshot: Dictionary = player_value if player_value is Dictionary else {}
+	var player_ship_id := _authoritative_positive_id(player_snapshot.get("ship_id", 0))
+	var ship_id := _authoritative_positive_id(ship_snapshot.get("id", 0))
+	var player_planet_id := _authoritative_positive_id(player_snapshot.get("last_planet_id", 0))
+	if typeof(onplanet) == TYPE_INT and int(onplanet) == 1 and player_ship_id > 0 and player_ship_id == ship_id and player_planet_id == _landed_planet_id and _landed_planet_id > 0:
+		# A fresh ship record that still names this exact planet is stronger than
+		# the command acknowledgement: the launch did not complete, so retain the
+		# confirmed surface and allow ordinary actions again.
+		_landing_surface_ready = true
+		gameplay_view.planet_workflow.set_surface_actionable(true)
 		gameplay_view.set_command_busy(false)
-		gameplay_view.show_notification("Launch state was contradictory; keeping the confirmed planet surface until a fresh state is available.")
+		gameplay_view.show_notification("The refreshed ship is still on this planet; surface access remains active.")
+		return
+	if typeof(onplanet) != TYPE_INT or int(onplanet) != 0:
+		_landing_surface_ready = false
+		gameplay_view.planet_workflow.set_surface_actionable(false)
+		gameplay_view.set_command_busy(false)
+		gameplay_view.show_notification("Launch refresh did not confirm departure; the last planet remains visible with actions disabled until state is reconciled.")
 		return
 	_landed_planet_id = 0
 	_landing_surface_ready = false
@@ -824,6 +952,12 @@ func _on_tavern_enter_requested() -> void:
 	gameplay_view.show_notification("Checking for an active tavern in this StarDock sector…")
 
 func _finish_warp_reply(response: Dictionary, destination: int) -> void:
+	if str(response.get("status", "")) == "ok" and str(response.get("type", "")) == "move.toll_offer_v1":
+		if not _show_toll_offer(response, destination, "move.warp"):
+			gameplay_view.set_action_pending(false)
+			gameplay_view.show_notification("Toll passage offer did not match the requested sector · refreshing confirmed state.")
+			_refresh_after_warp_attempt()
+		return
 	var result: Dictionary = Protocol.result_from_response(response)
 	if not _movement_response_type_matches(response, "move.result"):
 		gameplay_view.show_notification("Warp response was not recognized · refreshing confirmed player, ship and sector state.")
@@ -850,7 +984,89 @@ func _finish_warp_reply(response: Dictionary, destination: int) -> void:
 			await gameplay_view.play_warp_transition()
 	else:
 		gameplay_view.show_notification("Warp refused · %s" % str(result.get("message", "The server did not move your ship.")))
-	_refresh_after_warp_attempt()
+	if result.get("kind") == "refused" and not hazards.is_empty():
+		_refresh_after_command(["player", "ship", "sector"])
+	else:
+		_refresh_after_warp_attempt()
+
+func _build_toll_offer_ui() -> void:
+	_toll_offer_dialog = ConfirmationDialog.new()
+	_toll_offer_dialog.title = "Toll fighters demand payment"
+	_toll_offer_dialog.ok_button_text = "PAY TOLL AND PASS"
+	_toll_offer_dialog.exclusive = false
+	_toll_offer_dialog.confirmed.connect(_resolve_toll_offer.bind(true))
+	_toll_offer_dialog.close_requested.connect(_resolve_toll_offer.bind(false))
+	add_child(_toll_offer_dialog)
+	var refuse_button := _toll_offer_dialog.get_cancel_button()
+	refuse_button.text = "REFUSE · HOSTILE ENCOUNTER"
+	refuse_button.pressed.connect(_resolve_toll_offer.bind(false))
+
+func _resolve_toll_offer(accept: bool) -> void:
+	if _pending_toll_offer.is_empty():
+		_toll_offer_dialog.hide()
+		return
+	var offer := _pending_toll_offer.duplicate(true)
+	_pending_toll_offer.clear()
+	_toll_offer_dialog.hide()
+	var destination := _authoritative_positive_id(offer.get("destination", 0))
+	var offer_id := str(offer.get("offer_id", ""))
+	var movement_command := str(offer.get("command", "move.warp"))
+	if destination <= 0 or offer_id.is_empty() or not auth_session.is_authenticated():
+		gameplay_view.set_action_pending(false)
+		gameplay_view.show_notification("Toll response was not sent · reconnect and reconcile your confirmed movement state.")
+		if movement_command == "move.transwarp":
+			_refresh_after_command(["player", "ship", "sector"])
+		else:
+			_refresh_after_warp_attempt()
+		return
+	var request_id: String = transport.request(movement_command, {
+		"to_sector_id": destination,
+		"toll_offer_id": offer_id,
+		"toll_accept": accept,
+	}, auth_session.session_token)
+	if request_id.is_empty():
+		gameplay_view.set_action_pending(false)
+		gameplay_view.show_notification("Toll response could not be sent · refresh confirmed movement state before retrying.")
+		if movement_command == "move.transwarp":
+			_refresh_after_command(["player", "ship", "sector"])
+		else:
+			_refresh_after_warp_attempt()
+		return
+	if movement_command == "move.transwarp":
+		_pending_game_commands[request_id] = {
+			"kind": "command", "command": movement_command,
+			"label": "Transwarp toll passage",
+			"data": {"to_sector_id": destination, "toll_offer_id": offer_id, "toll_accept": accept},
+			"mutating": true,
+		}
+	else:
+		_pending_game_commands[request_id] = {
+			"kind": "warp", "destination": destination,
+			"toll_resolution": "accepted" if accept else "refused",
+		}
+	gameplay_view.show_notification("Toll accepted · awaiting server-confirmed passage." if accept else "Toll refused · awaiting the server's hostile encounter result.")
+
+func _show_toll_offer(response: Dictionary, destination: int, movement_command: String) -> bool:
+	var offer_value: Variant = response.get("data", {})
+	if not offer_value is Dictionary:
+		return false
+	var offer: Dictionary = offer_value
+	var offer_id := str(offer.get("offer_id", ""))
+	var offer_sector := _authoritative_positive_id(offer.get("to_sector_id", offer.get("sector_id", 0)))
+	var fighter_count := _authoritative_positive_id(offer.get("fighter_count", 0))
+	var amount := int(offer.get("amount", -1))
+	var rate := int(offer.get("credits_per_fighter", 0))
+	if offer_id.is_empty() or offer_sector <= 0 or offer_sector != destination or fighter_count <= 0 or amount < 0 or rate < 0:
+		return false
+	_pending_toll_offer = {
+		"offer_id": offer_id, "destination": offer_sector,
+		"fighter_count": fighter_count, "amount": amount, "rate": rate,
+		"command": movement_command,
+	}
+	_toll_offer_dialog.dialog_text = "%d toll fighters demand %d credits (%d credits per fighter) to enter Sector %d. Accept payment and passage, or refuse and face the hostile encounter?" % [fighter_count, amount, rate, offer_sector]
+	_toll_offer_dialog.popup_centered(Vector2i(560, 240))
+	gameplay_view.show_notification("Toll fighters are waiting for your decision · no passage has been authorized yet.")
+	return true
 
 func _movement_response_type_matches(response: Dictionary, expected: String) -> bool:
 	# Successful movement replies must identify their published response schema.
@@ -891,6 +1107,26 @@ func _refresh_after_warp_attempt() -> void:
 		gameplay_view.show_notification("Could not refresh your location. The displayed sector may be stale.")
 
 func _on_command_requested(command: String, data: Dictionary, label: String, mutating: bool) -> void:
+	if command == "feedback.open":
+		if auth_session.is_authenticated():
+			_feedback_form.popup_centered(Vector2i(620, 620))
+		else:
+			gameplay_view.show_notification("Sign in before submitting player feedback.")
+		return
+	if command == "feedback.status.open":
+		_feedback_status_form.popup_centered()
+		return
+	if command == "feedback.error.open":
+		if _last_failed_command.is_empty():
+			gameplay_view.show_notification("There is no recent failed command to report.")
+			return
+		var failed_command := str(_last_failed_command.get("command", "command"))
+		(_feedback_fields["subject"] as LineEdit).text = "Command failed: " + failed_command
+		(_feedback_fields["description"] as TextEdit).text = "The server returned %s (error code %s) for %s." % [str(_last_failed_command.get("status", "error")), str(_last_failed_command.get("error_code", "unknown")), failed_command]
+		(_feedback_fields["expected"] as TextEdit).text = "The command completes according to its documented V3 behaviour."
+		(_feedback_fields["actual"] as TextEdit).text = "The server returned %s (error code %s)." % [str(_last_failed_command.get("status", "error")), str(_last_failed_command.get("error_code", "unknown"))]
+		_feedback_form.popup_centered(Vector2i(620, 620))
+		return
 	# Once the port workflow is open, clicks must never reopen the docking
 	# request behind it. This is a final guard against leaked UI mouse events.
 	if command == "port.info" and is_instance_valid(gameplay_view.port_workflow) and gameplay_view.port_workflow.visible:
@@ -927,6 +1163,14 @@ func _on_command_requested(command: String, data: Dictionary, label: String, mut
 			gameplay_view.show_notification("Interception unavailable · select a valid target in the confirmed current sector.")
 			return
 		data = {"ship_id": intercept_target}
+	if command == "combat.attack.port":
+		var target_port_id := _authoritative_positive_id(data.get("port_id", null))
+		if target_port_id <= 0 or not _sector_snapshot_is_fresh():
+			gameplay_view.show_notification("StarPort attack unavailable · select a port from the freshly confirmed current sector.")
+			return
+		if int(_pending_port_attack.get("port_id", 0)) != target_port_id:
+			_pending_port_attack = {"port_id": target_port_id, "idempotency_key": _new_port_attack_idempotency_key()}
+		data = {"port_id": target_port_id, "idempotency_key": str(_pending_port_attack.get("idempotency_key", ""))}
 	if _route_running and command in ["move.autopilot.start", "move.autopilot.control", "move.autopilot.stop"]:
 		gameplay_view.show_notification("Use the route bar to stop safely after the current confirmed warp; change saved-route controls when idle.")
 		return
@@ -950,6 +1194,115 @@ func _on_command_requested(command: String, data: Dictionary, label: String, mut
 	gameplay_view.set_command_busy(true)
 	if not is_planet_read:
 		gameplay_view.show_notification("%s · waiting for server confirmation." % label)
+
+func _build_feedback_ui() -> void:
+	_feedback_form = ConfirmationDialog.new()
+	_feedback_form.title = "Report Bug / Suggest Improvement"
+	_feedback_form.ok_button_text = "Preview"
+	var form_column := VBoxContainer.new()
+	var kind := OptionButton.new()
+	kind.add_item("Bug report", 0)
+	kind.add_item("Suggestion", 1)
+	var subject := LineEdit.new()
+	subject.placeholder_text = "Short subject"
+	var description := TextEdit.new()
+	description.placeholder_text = "Describe the issue or suggestion"
+	description.custom_minimum_size.y = 100
+	var expected := TextEdit.new()
+	expected.placeholder_text = "Expected behaviour (required for bugs)"
+	expected.custom_minimum_size.y = 65
+	var actual := TextEdit.new()
+	actual.placeholder_text = "Actual behaviour (required for bugs)"
+	actual.custom_minimum_size.y = 65
+	var steps := TextEdit.new()
+	steps.placeholder_text = "Reproduction steps (optional)"
+	steps.custom_minimum_size.y = 65
+	var include := CheckBox.new()
+	include.text = "Include recent sanitised diagnostics"
+	include.button_pressed = true
+	var count := OptionButton.new()
+	for value in [10, 25, 50, 100]:
+		count.add_item("%d recent exchanges" % value, value)
+	count.select(1)
+	for control in [kind, subject, description, expected, actual, steps, include, count]:
+		form_column.add_child(control)
+	_feedback_fields = {"kind": kind, "subject": subject, "description": description, "expected": expected, "actual": actual, "steps": steps, "include": include, "count": count}
+	_feedback_form.add_child(form_column)
+	add_child(_feedback_form)
+	_feedback_form.confirmed.connect(_on_feedback_form_confirmed)
+	_feedback_preview = ConfirmationDialog.new()
+	_feedback_preview.title = "Public issue preview · confirm to submit"
+	_feedback_preview.ok_button_text = "Submit report"
+	_feedback_preview.size = Vector2i(760, 620)
+	_feedback_preview_text = TextEdit.new()
+	_feedback_preview_text.editable = false
+	_feedback_preview_text.custom_minimum_size = Vector2(700, 470)
+	_feedback_preview.add_child(_feedback_preview_text)
+	add_child(_feedback_preview)
+	_feedback_preview.confirmed.connect(_submit_feedback_preview)
+	_feedback_status_form = ConfirmationDialog.new()
+	_feedback_status_form.title = "Check feedback report status"
+	_feedback_status_input = LineEdit.new()
+	_feedback_status_input.placeholder_text = "Report UUID"
+	_feedback_status_form.add_child(_feedback_status_input)
+	add_child(_feedback_status_form)
+	_feedback_status_form.confirmed.connect(_request_feedback_status)
+	_feedback_result = AcceptDialog.new()
+	_feedback_result.title = "Feedback report"
+	add_child(_feedback_result)
+
+func _on_feedback_form_confirmed() -> void:
+	var kind: OptionButton = _feedback_fields["kind"]
+	var subject: LineEdit = _feedback_fields["subject"]
+	var description: TextEdit = _feedback_fields["description"]
+	var expected: TextEdit = _feedback_fields["expected"]
+	var actual: TextEdit = _feedback_fields["actual"]
+	var steps: TextEdit = _feedback_fields["steps"]
+	if subject.text.strip_edges().is_empty() or description.text.strip_edges().is_empty():
+		gameplay_view.show_notification("A feedback subject and description are required.")
+		return
+	var report_type := "bug" if kind.selected == 0 else "suggestion"
+	if report_type == "bug" and (expected.text.strip_edges().is_empty() or actual.text.strip_edges().is_empty()):
+		gameplay_view.show_notification("Bug reports require expected and actual behaviour.")
+		return
+	var count: OptionButton = _feedback_fields["count"]
+	var diagnostics: Array = transport.diagnostic_snapshot(count.get_item_id(count.selected)) if bool((_feedback_fields["include"] as CheckBox).button_pressed) else []
+	var hud: Dictionary = gameplay_view._snapshot.get("hud", {})
+	var player: Dictionary = gameplay_view._snapshot.get("player", {})
+	var ship: Dictionary = gameplay_view._snapshot.get("ship", {})
+	var context := {"client": "godot", "client_version": "4.5.2", "build_id": "", "protocol_version": "v3", "sector_id": hud.get("sector_id"), "player_id": player.get("player_id"), "ship_id": ship.get("ship_id"), "planet_id": ship.get("onplanet"), "last_failed_command": _last_failed_command.get("command", "")}
+	var bytes := Crypto.new().generate_random_bytes(16)
+	bytes[6] = (bytes[6] & 0x0f) | 0x40
+	bytes[8] = (bytes[8] & 0x3f) | 0x80
+	var hex := bytes.hex_encode()
+	var idem := "%s-%s-%s-%s-%s" % [hex.substr(0, 8), hex.substr(8, 4), hex.substr(12, 4), hex.substr(16, 4), hex.substr(20, 12)]
+	_feedback_payload = {"report_type": report_type, "subject": subject.text.strip_edges(), "description": description.text.strip_edges(), "expected_behavior": expected.text.strip_edges(), "actual_behavior": actual.text.strip_edges(), "reproduction_steps": steps.text.strip_edges(), "diagnostics": {"exchanges": diagnostics, "context": context}, "client_name": "godot", "client_version": "4.5.2", "build_id": "", "protocol_version": "v3", "idempotency_key": idem}
+	var request_id: String = transport.request("feedback.preview", _feedback_payload, auth_session.session_token)
+	if not request_id.is_empty():
+		_feedback_requests[request_id] = "preview"
+	else:
+		gameplay_view.show_notification("Feedback preview could not be sent.")
+
+func _submit_feedback_preview() -> void:
+	if str(_feedback_payload.get("report_id", "")) != str(_feedback_payload.get("idempotency_key", "")):
+		gameplay_view.show_notification("Preview identity was not confirmed by the server; report not submitted.")
+		return
+	var request_id: String = transport.request("feedback.submit", _feedback_payload, auth_session.session_token)
+	if not request_id.is_empty():
+		_feedback_requests[request_id] = "submit"
+	else:
+		gameplay_view.show_notification("Feedback submission could not be sent.")
+
+func _request_feedback_status() -> void:
+	var report_id := _feedback_status_input.text.strip_edges()
+	if report_id.is_empty():
+		gameplay_view.show_notification("Enter the report UUID shown when it was submitted.")
+		return
+	var request_id: String = transport.request("feedback.status", {"report_id": report_id}, auth_session.session_token)
+	if not request_id.is_empty():
+		_feedback_requests[request_id] = "status"
+	else:
+		gameplay_view.show_notification("Feedback status could not be requested.")
 
 func _finish_command_reply(response: Dictionary, operation: Dictionary) -> void:
 	var result: Dictionary = Protocol.result_from_response(response)
@@ -984,6 +1337,15 @@ func _finish_command_reply(response: Dictionary, operation: Dictionary) -> void:
 		if command_name == "player.computer.recommend_routes":
 			gameplay_view.set_command_busy(false)
 			gameplay_view.show_trade_routes(data)
+			return
+		if command_name == "combat.fire_photon":
+			var target_ship_id := int(data.get("target_ship_id", 0))
+			var expiry := int(data.get("expires_at", 0))
+			if data.get("direct_impact_applied", false) == true:
+				gameplay_view.show_notification("Photon disabled combat systems on ship %d until %d. Sector suppression expires at %d." % [target_ship_id, int(data.get("target_disabled_until", expiry)), expiry])
+			else:
+				gameplay_view.show_notification("Photon fired. Ship %d shields blocked direct impact; sector suppression expires at %d." % [target_ship_id, expiry])
+			gameplay_view.set_command_busy(false)
 			return
 		if command_name == "auth.logout":
 			_finish_logout()
@@ -1099,7 +1461,7 @@ func _finish_command_reply(response: Dictionary, operation: Dictionary) -> void:
 				# Reconcile only the authoritative current-sector domain; the server
 				# remains the source of truth for any permitted scan result.
 				gameplay_view.set_command_busy(false)
-				var scan_reason := "omitted a valid sector ID" if reported_sector_id <= 0 else "returned sector %d, but the confirmed location is sector %d" % [reported_sector_id, confirmed_sector_id]
+				var scan_reason := "omitted a valid sector ID" if reported_sector_id <= 0 else ("has no valid confirmed sector ID" if confirmed_sector_id <= 0 else "returned sector %d, but the confirmed location is sector %d" % [reported_sector_id, confirmed_sector_id])
 				gameplay_view.show_notification("%s %s; refreshing current-sector state." % [label, scan_reason])
 				_refresh_after_command(["sector"])
 				return
@@ -1143,6 +1505,14 @@ func _finish_command_reply(response: Dictionary, operation: Dictionary) -> void:
 			if not _ship_inspect_response_type_matches(response):
 				gameplay_view.set_command_busy(false)
 				gameplay_view.show_notification("%s was not displayed because the server returned an unexpected response type; refreshing confirmed sector state." % label)
+				_refresh_after_command(["sector"])
+				return
+			var reported_ship_id := _response_ship_id(data)
+			var requested_ship_id := _authoritative_positive_id(operation.get("data", {}).get("ship_id", 0))
+			if requested_ship_id <= 0 or reported_ship_id <= 0 or reported_ship_id != requested_ship_id:
+				gameplay_view.set_command_busy(false)
+				var ship_reason := "request omitted a valid ship ID" if requested_ship_id <= 0 else ("response omitted a valid ship ID" if reported_ship_id <= 0 else "returned ship %d instead of selected ship %d" % [reported_ship_id, requested_ship_id])
+				gameplay_view.show_notification("%s was not displayed because the response %s; refreshing confirmed sector state." % [label, ship_reason])
 				_refresh_after_command(["sector"])
 				return
 		if command_name == "ship.transfer":
@@ -1227,14 +1597,6 @@ func _finish_command_reply(response: Dictionary, operation: Dictionary) -> void:
 			gameplay_view.show_notification("Ship hull exchange confirmed · refreshing credits, ship and sector.")
 			_refresh_after_command(["player", "ship", "sector"])
 			return
-			var reported_ship_id := _response_ship_id(data)
-			var requested_ship_id := _authoritative_positive_id(operation.get("data", {}).get("ship_id", 0))
-			if requested_ship_id <= 0 or reported_ship_id <= 0 or reported_ship_id != requested_ship_id:
-				gameplay_view.set_command_busy(false)
-				var ship_reason := "omitted a valid ship ID" if reported_ship_id <= 0 else "returned ship %d instead of selected ship %d" % [reported_ship_id, requested_ship_id]
-				gameplay_view.show_notification("%s was not displayed because the response %s; refreshing confirmed sector state." % [label, ship_reason])
-				_refresh_after_command(["sector"])
-				return
 		if command_name == "combat.attack_planet":
 			var requested_planet_id := _authoritative_positive_id(operation.get("data", {}).get("planet_id", 0))
 			var attack_response_type: Variant = response.get("type", null)
@@ -1244,6 +1606,7 @@ func _finish_command_reply(response: Dictionary, operation: Dictionary) -> void:
 				and str(attack_response_type) == "combat.attack_planet"
 			var reported_planet_id := _authoritative_positive_id(data.get("planet_id", 0))
 			var attack_result_valid := data.get("captured", null) is bool \
+				and data.get("enslaved_colonists", null) is bool \
 				and data.get("attacker_remaining_fighters", null) is int \
 				and int(data.get("attacker_remaining_fighters", -1)) >= 0 \
 				and data.get("defender_remaining_fighters", null) is int \
@@ -1340,8 +1703,69 @@ func _finish_command_reply(response: Dictionary, operation: Dictionary) -> void:
 			gameplay_view.set_command_busy(false)
 			gameplay_view.show_notification("Saved autopilot route stopped · no movement was made by this command.")
 			return
+		if command_name == "dock.status":
+			var confirmed_sector_id := _authoritative_positive_id(gameplay_view._snapshot.get("hud", {}).get("sector_id", 0))
+			if response.get("type", null) != "dock.status_v1" or not _valid_dock_status(data, confirmed_sector_id):
+				gameplay_view.set_command_busy(false)
+				gameplay_view.show_notification("Docking state was not confirmed by the canonical server response; refreshing player, ship and sector state.")
+				_refresh_after_command(["player", "ship", "sector"])
+				return
+			if bool(data["docked"]):
+				gameplay_view.show_notification("Docking confirmed at port %d." % int(data["port_id"]))
+			else:
+				gameplay_view.show_notification("Undocking confirmed by the server.")
+			_refresh_after_command(["player", "ship", "sector"])
+			return
 		if command_name == "planet.colonists.set":
 			gameplay_view.show_notification("Colonist transfer confirmed.%s" % (" · " + summary if not summary.is_empty() else ""))
+			_request_planet_surface_records()
+			_refresh_after_command(["player", "ship"])
+			return
+		if command_name == "planet.harvest":
+			var request_data: Variant = operation.get("data", {})
+			if not _valid_planet_harvest_receipt(data, response, request_data):
+				gameplay_view.set_command_busy(false)
+				gameplay_view.show_notification("Harvest was not confirmed by a matching planet.harvest_v1 receipt; refreshing the landed planet and ship.")
+				_reconcile_planet_surface_mutation()
+				return
+			gameplay_view.show_notification("Planet harvest confirmed · ORE %d · ORG %d · EQU %d · %d holds remain." % [int(data["ore_harvested"]), int(data["organics_harvested"]), int(data["equipment_harvested"]), int(data["holds_remaining"])])
+			_request_planet_surface_records()
+			_refresh_after_command(["player", "ship"])
+			return
+		if command_name == "planet.market.sell":
+			var sale_request: Variant = operation.get("data", {})
+			var sale_planet_id := _authoritative_positive_id(sale_request.get("planet_id", 0)) if sale_request is Dictionary else 0
+			var sale_quantity: Variant = sale_request.get("quantity", null) if sale_request is Dictionary else null
+			var sale_commodity := str(sale_request.get("commodity", "")) if sale_request is Dictionary else ""
+			var sale_receipt_valid: bool = response.get("type", null) == "planet.market.sell" and data is Dictionary \
+				and sale_planet_id != 0 and data.get("planet_id", null) == sale_planet_id \
+				and data.get("commodity", null) == sale_commodity \
+				and typeof(sale_quantity) == TYPE_INT and data.get("quantity_sold", null) == sale_quantity \
+				and typeof(data.get("total_credits_received", null)) == TYPE_INT and int(data.get("total_credits_received", -1)) >= 0
+			if not sale_receipt_valid:
+				gameplay_view.set_command_busy(false)
+				gameplay_view.show_notification("Planetary Exchange sale was not confirmed by a matching receipt; refreshing planet and player state.")
+				_reconcile_planet_surface_mutation()
+				return
+			gameplay_view.show_notification("Planetary Exchange sale confirmed · %d %s · %d credits received." % [sale_quantity, sale_commodity, int(data["total_credits_received"])])
+			_request_planet_surface_records()
+			_refresh_after_command(["player"])
+			return
+		if command_name == "planet.port.construct":
+			var construction_request: Variant = operation.get("data", {})
+			var requested_planet_id := _authoritative_positive_id(construction_request.get("planet_id", 0)) if construction_request is Dictionary else 0
+			var requested_class: Variant = construction_request.get("port_class", null) if construction_request is Dictionary else null
+			var construction_receipt_valid: bool = response.get("type", null) == "planet.port_construction_v1" and data is Dictionary \
+				and requested_planet_id > 0 and data.get("planet_id", null) == requested_planet_id \
+				and typeof(requested_class) == TYPE_INT and data.get("port_class", null) == requested_class \
+				and _authoritative_positive_id(data.get("construction_id", 0)) > 0 \
+				and str(data.get("status", "")) in ["building", "completed"]
+			if not construction_receipt_valid:
+				gameplay_view.set_command_busy(false)
+				gameplay_view.show_notification("StarPort construction was not confirmed by a matching receipt; refreshing planet and player state.")
+				_reconcile_planet_surface_mutation()
+				return
+			gameplay_view.show_notification("StarPort class %d construction confirmed · %s." % [requested_class, str(data["status"])])
 			_request_planet_surface_records()
 			_refresh_after_command(["player", "ship"])
 			return
@@ -1389,10 +1813,23 @@ func _finish_command_reply(response: Dictionary, operation: Dictionary) -> void:
 			await gameplay_view.play_warp_transition()
 			_pending_launch_departure = true
 			_planet_pending_count = 0
+			_landed_planet_id = 0
+			_landing_surface_ready = false
+			gameplay_view.leave_planet_workflow()
 			gameplay_view.show_notification("Launch confirmed · refreshing player, ship and sector state before leaving the surface.")
-			_refresh_after_command()
+			_refresh_after_command(["player", "ship", "sector"])
 			return
 		if command_name == "move.transwarp":
+			if str(response.get("status", "")) == "ok" and str(response.get("type", "")) == "move.toll_offer_v1":
+				var transwarp_data_for_offer: Variant = operation.get("data", {})
+				var transwarp_offer_target := _authoritative_positive_id(
+					transwarp_data_for_offer.get("to_sector_id", 0)
+				) if transwarp_data_for_offer is Dictionary else 0
+				if transwarp_offer_target <= 0 or not _show_toll_offer(response, transwarp_offer_target, "move.transwarp"):
+					gameplay_view.set_command_busy(false)
+					gameplay_view.show_notification("Transwarp toll offer did not match the requested sector · refreshing confirmed state.")
+					_refresh_after_command(["player", "ship", "sector"])
+				return
 			if not _movement_response_type_matches(response, "move.transwarp"):
 				gameplay_view.set_command_busy(false)
 				gameplay_view.show_notification("Transwarp response was not recognized · refreshing confirmed player, ship and sector state.")
@@ -1473,7 +1910,13 @@ func _finish_command_reply(response: Dictionary, operation: Dictionary) -> void:
 				_pending_trade["refresh_port_after"] = true
 			if _landed_planet_id > 0:
 				_request_planet_surface_records()
-			_refresh_after_command()
+			if str(operation.get("command", "")) == "hardware.buy":
+				# Equipment settlement changes both the player's credits and the
+				# active ship's installed hardware. A generic refresh omitted these
+				# domains, leaving the HUD stale until the next unrelated action.
+				_refresh_after_command(["player", "ship"])
+			else:
+				_refresh_after_command()
 		else:
 			gameplay_view.set_command_busy(false)
 	else:
@@ -1561,7 +2004,7 @@ func _finish_command_reply(response: Dictionary, operation: Dictionary) -> void:
 			# but its diagnostic payload is not authoritative sector state. Reconcile
 			# only the confirmed sector domain before allowing another scan; never
 			# merge or render the refused payload as a successful disclosure.
-			gameplay_view.show_notification("%s refused · refreshing confirmed sector state." % label)
+			gameplay_view.show_notification("%s refused · %s · refreshing confirmed sector state." % [label, str(result.get("message", "the server did not return scan data"))])
 			_refresh_after_command(["sector"])
 			return
 		if str(operation.get("command", "")) == "ship.list":
@@ -1579,6 +2022,7 @@ func _finish_command_reply(response: Dictionary, operation: Dictionary) -> void:
 			# transfer before offering another lifecycle action.
 			gameplay_view.show_notification("%s refused · %s · refreshing authoritative ownership state." % [label, str(result.get("message", "The server did not accept the ship transfer."))])
 			_ship_roster_refresh_after_command = true
+			_pending_ship_transfer_refusal = str(result.get("message", "Ship transfer was refused."))
 			_refresh_after_command(["player", "ship", "sector"])
 			return
 		if str(operation.get("command", "")) in ["ship.repair", "shipyard.upgrade", "hardware.buy"]:
@@ -1619,6 +2063,10 @@ func _finish_command_reply(response: Dictionary, operation: Dictionary) -> void:
 			else:
 				gameplay_view.show_notification("Password change refused · no change was confirmed.")
 			return
+		if str(operation.get("command", "")) == "dock.status":
+			gameplay_view.show_notification("Docking action refused · %s · refreshing confirmed ship and sector state." % str(result.get("message", "The server did not accept the action.")))
+			_refresh_after_command(["player", "ship", "sector"])
+			return
 		if str(operation.get("command", "")) in ["trade.buy", "trade.sell"]:
 			_pending_trade.clear()
 			_pending_trade["refresh_port_after"] = true
@@ -1630,7 +2078,7 @@ func _finish_command_reply(response: Dictionary, operation: Dictionary) -> void:
 func _is_planet_surface_mutation(command: String) -> bool:
 	return command in [
 		"planet.deposit", "planet.withdraw", "planet.harvest", "planet.fighters.transfer",
-		"planet.colonists.allocate", "planet.colonists.set",
+		"planet.colonists.allocate", "planet.colonists.set", "planet.market.sell", "planet.port.construct",
 		"citadel.build", "citadel.upgrade", "planet.rename"
 	]
 
@@ -1680,6 +2128,12 @@ func _refresh_after_command(domains: Array = []) -> void:
 	_command_refresh_pending = true
 	if not refresh_coordinator.refresh(true, domains):
 		_command_refresh_pending = false
+		if _pending_launch_departure:
+			_pending_launch_departure = false
+			_landed_planet_id = 0
+			_landing_surface_ready = false
+			gameplay_view.leave_planet_workflow()
+			gameplay_view.show_notification("Launch was confirmed, but state refresh could not start; planet actions remain closed until reconnect.")
 		if _pending_landing_surface_id > 0:
 			# A confirmed landing is not actionable until its player/ship refresh
 			# completes.  If refresh cannot even start, do not leave a pending
@@ -1696,7 +2150,9 @@ func _refresh_after_command(domains: Array = []) -> void:
 		if _ship_roster_refresh_after_command:
 			_ship_roster_refresh_after_command = false
 			gameplay_view.command_menu.set_owned_ship_roster({})
-			_request_ship_roster_refresh()
+			var transfer_refusal := _pending_ship_transfer_refusal
+			_pending_ship_transfer_refusal = ""
+			gameplay_view.show_notification("%s%sOwnership refresh could not start; the stale ship roster was cleared." % [transfer_refusal, " · " if not transfer_refusal.is_empty() else ""])
 
 func _request_ship_roster_refresh() -> void:
 	var request_id: String = transport.request("ship.list", {}, auth_session.session_token)
@@ -1824,6 +2280,36 @@ func _response_sector_id(data: Dictionary) -> int:
 			# and fractional values without falling through to an alias.
 			return _authoritative_positive_id(value)
 	return 0
+
+func _valid_dock_status(data: Variant, expected_sector_id: int) -> bool:
+	if not data is Dictionary or expected_sector_id <= 0:
+		return false
+	var port_id: Variant = data.get("port_id", null)
+	var sector_id: Variant = data.get("sector_id", null)
+	var docked: Variant = data.get("docked", null)
+	return typeof(port_id) == TYPE_INT and int(port_id) >= 0 \
+		and typeof(sector_id) == TYPE_INT and int(sector_id) == expected_sector_id \
+		and typeof(docked) == TYPE_BOOL and bool(docked) == (int(port_id) > 0)
+
+func _valid_planet_harvest_receipt(data: Variant, response: Dictionary, request_data: Variant) -> bool:
+	if not data is Dictionary or not request_data is Dictionary:
+		return false
+	if response.get("type", null) != "planet.harvest_v1":
+		return false
+	var requested_planet_id := _authoritative_positive_id(request_data.get("planet_id", null))
+	var landed_planet_id := _authoritative_positive_id(_landed_planet_id)
+	var active_ship_id := _authoritative_positive_id(gameplay_view._snapshot.get("hud", {}).get("ship_id", null))
+	if requested_planet_id <= 0 or requested_planet_id != landed_planet_id or active_ship_id <= 0:
+		return false
+	if _authoritative_positive_id(data.get("planet_id", null)) != requested_planet_id:
+		return false
+	if _authoritative_positive_id(data.get("ship_id", null)) != active_ship_id:
+		return false
+	for field in ["ore_harvested", "organics_harvested", "equipment_harvested", "holds_remaining", "turns_charged"]:
+		var value: Variant = data.get(field, null)
+		if typeof(value) != TYPE_INT or int(value) < 0:
+			return false
+	return int(data["turns_charged"]) == 0
 
 func _density_has_authoritative_ids(payload: Dictionary) -> bool:
 	var rows: Variant = payload.get("sectors", payload.get("data", payload))
@@ -2032,13 +2518,15 @@ func _accept_authoritative_port(data: Dictionary, label: String, expected_port_i
 	return true
 
 func _authoritative_positive_id(value: Variant) -> int:
-	# Godot may decode a JSON integer as an integral float. Preserve the
-	# authoritative numeric identity while rejecting strings, booleans and
-	# fractional values.
-	var valid: bool = (typeof(value) == TYPE_INT and int(value) > 0) or (typeof(value) == TYPE_FLOAT and is_finite(value) and value > 0.0 and value == floor(value))
+	# Protocol identity fields must remain JSON integer values.
+	var valid: bool = typeof(value) == TYPE_INT and int(value) > 0
 	if not valid:
 		return 0
 	return int(value)
+
+func _new_port_attack_idempotency_key() -> String:
+	var crypto := Crypto.new()
+	return "godot-" + crypto.generate_random_bytes(16).hex_encode()
 
 func _sector_snapshot_is_fresh() -> bool:
 	# Treat malformed refresh metadata exactly like an unknown/stale snapshot.
@@ -2061,7 +2549,9 @@ func _sector_snapshot_is_fresh() -> bool:
 func _planet_landing_terminal(value: Variant) -> bool:
 	if not value is Dictionary:
 		return false
-	if value.get("ship_destroyed", false) == true or value.get("ship_remains_in_sector", true) == false:
+	var destroyed: Variant = value.get("ship_destroyed", false)
+	var remains: Variant = value.get("ship_remains_in_sector", true)
+	if (typeof(destroyed) == TYPE_BOOL and destroyed) or (typeof(remains) == TYPE_BOOL and not remains):
 		return true
 	# Planetary defense reports may carry the authoritative terminal flag on
 	# the individual combat row.  Inspect only documented boolean fields; do
@@ -2073,7 +2563,10 @@ func _planet_landing_terminal(value: Variant) -> bool:
 		for row in rows:
 			if not row is Dictionary:
 				continue
-			if row.get("destroyed", false) == true or row.get("ship_remains_in_sector", true) == false:
+			var row_destroyed: Variant = row.get("destroyed", false)
+			var row_remains: Variant = row.get("ship_remains_in_sector", true)
+			if ((typeof(row_destroyed) == TYPE_BOOL and row_destroyed)
+					or (typeof(row_remains) == TYPE_BOOL and not row_remains)):
 				return true
 	return false
 
@@ -2272,11 +2765,10 @@ func _finish_route_warp(response: Dictionary, operation: Dictionary) -> void:
 		_route_running = false
 		_route_stop_requested = false
 		_route_stop_after_next = false
-		_planned_route.push_front(int(operation.get("destination", 0)))
-		_route_destination = int(_planned_route.back()) if not _planned_route.is_empty() else 0
-		if not _planned_route.is_empty():
-			gameplay_view.show_restored_autopilot_route(_planned_route, _route_destination, "paused", _autopilot_mode)
-		gameplay_view.show_notification("Autonav paused · warp response was not recognized. Remaining route preserved while location is refreshed.")
+		_planned_route.clear()
+		_route_destination = 0
+		gameplay_view.clear_planned_route()
+		gameplay_view.show_notification("Autonav stopped · warp response was not recognized. The route was cleared while location is refreshed.")
 		_refresh_after_command(["player", "ship", "sector"])
 		return
 	var hazards := Protocol.move_hazard_report(response)

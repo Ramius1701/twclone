@@ -12,6 +12,7 @@ class PlanetaryServerContractTests(unittest.TestCase):
         cls.planets = (ROOT / "src/server_planets.c").read_text(encoding="utf-8")
         cls.citadel = (ROOT / "src/server_citadel.c").read_text(encoding="utf-8")
         cls.combat = (ROOT / "src/server_combat.c").read_text(encoding="utf-8")
+        cls.schemas = (ROOT / "src/schemas.c").read_text(encoding="utf-8")
         cls.loop = (ROOT / "src/server_loop.c").read_text(encoding="utf-8")
         cls.universe = (ROOT / "src/server_universe.c").read_text(encoding="utf-8")
         cls.universe_repo = (ROOT / "src/db/repo/repo_universe.c").read_text(
@@ -117,13 +118,17 @@ class PlanetaryServerContractTests(unittest.TestCase):
                       (ROOT / "sql/pg/171_v3_planet_population_state.sql").read_text())
         self.assertIn("daily@04:15Z",
                       (ROOT / "sql/pg/176_slave_unrest_daily_scheduler.sql").read_text())
-        self.assertIn("interval_days == 0 || stoppage_cycles == 0 || population_loss == 0",
+        # The approved daily rule uses a percentage parameter. Keep the
+        # unset/disabled sentinel checks tied to the authoritative names.
+        self.assertIn("interval_days == 0 || stoppage_cycles == 0",
                       self.cron_repo)
+        self.assertIn("|| population_loss_percent == 0", self.cron_repo)
 
     def test_used_shipyard_inventory_preserves_and_sells_existing_hulls(self):
         listing = self.stardock.split("cmd_shipyard_list", 1)[1].split(
             "cmd_shipyard_upgrade", 1
         )[0]
+        self.assertIn('"type_id", json_integer (ship_type_id)', listing)
         self.assertIn("shipyard_used_inventory", listing)
         self.assertIn("used_available", listing)
         self.assertIn("shipyard_used_resale_factor_bp", listing)
@@ -140,6 +145,23 @@ class PlanetaryServerContractTests(unittest.TestCase):
         self.assertIn("ship_ownership(ship_id,player_id,role_id,is_primary)", repo)
         self.assertIn("DELETE FROM shipyard_used_inventory", repo)
         self.assertIn("UPDATE ships SET sector_id", repo)
+
+    def test_shipyard_upgrade_restores_replacement_hull_starting_holds(self):
+        upgrade = self.stardock_repo.split("repo_stardock_upgrade_ship", 1)[1].split(
+            "repo_stardock_purchase_used_ship", 1
+        )[0]
+        self.assertIn("initialholds", upgrade)
+        self.assertIn("GREATEST(COALESCE(holds, 0)", upgrade)
+        self.assertIn("holds = GREATEST", upgrade)
+
+    def test_fast_scan_summary_includes_existing_ship_and_planet_row_counts(self):
+        counts = self.universe.split("attach_sector_asset_counts (db_t *db, int sid, json_t *out)", 1)[1].split(
+            "cmd_move_scan", 1
+        )[0]
+        self.assertIn('"ships_present"', counts)
+        self.assertIn('"celestial_objects"', counts)
+        self.assertIn('"ships"', counts)
+        self.assertIn('"planets"', counts)
 
     def test_ship_sale_last_hull_count_includes_non_primary_owned_ships(self):
         sale = self.stardock_repo.split("repo_stardock_sell_ship", 1)[1].split(
@@ -213,8 +235,12 @@ class PlanetaryServerContractTests(unittest.TestCase):
 
     def test_orion_blockader_holds_home_and_uses_existing_defence_systems(self):
         blockader = self.universe.split(
-            "if (personality == SHIP_PERSONALITY_BLOCKADER)", 1
-        )[1].split("if (personality == SHIP_PERSONALITY_OFFENSIVE", 1)[0]
+            "if (personality == SHIP_PERSONALITY_BLOCKADER && current_sector > 10)", 1
+        )[1].split(
+            "if ((personality == SHIP_PERSONALITY_OFFENSIVE", 1
+        )[0]
+        self.assertIn("personality == SHIP_PERSONALITY_BLOCKADER && current_sector > 10",
+                      self.universe)
         self.assertIn("new_target = (ori_home_sector_id > 0)", blockader)
         self.assertIn("current_sector == ori_home_sector_id", blockader)
         self.assertIn("npc_deploy_defensive_fighter", blockader)
@@ -242,6 +268,53 @@ class PlanetaryServerContractTests(unittest.TestCase):
         self.assertIn("def.hull <= 0 && def.player_id > 0 && !defender_is_npc", attack)
         self.assertIn("handle_ship_destruction (db, &kill_ctx)", attack)
         self.assertIn("KILL_CAUSE_COMBAT", attack)
+
+    def test_pvp_attack_delivers_canonical_hit_to_defender_after_settlement(self):
+        attack = self.combat.split("int\nhandle_ship_attack (", 1)[1].split(
+            "\nint\ncmd_combat_attack", 1
+        )[0]
+        committed = attack.index("if (!db_tx_commit")
+        event = attack.index('server_deliver_to_player (def.player_id, "combat.hit"')
+        self.assertLess(committed, event)
+        for field in (
+            '"attacker_id"', '"defender_id"', '"weapon"', '"damage"',
+            '"defender_hp_after"', '"sector_id"',
+        ):
+            self.assertIn(field, attack[event - 700:event + 500])
+
+    def test_hardware_catalog_lists_capacity_limited_deployment_assets(self):
+        state_query = self.stardock_repo.split(
+            "repo_stardock_get_ship_state", 1
+        )[1].split("repo_stardock_get_hardware_items", 1)[0]
+        self.assertIn("s.mines", state_query)
+        self.assertIn("st.maxmines", state_query)
+        listing = self.stardock.split(
+            "cmd_hardware_list", 1
+        )[1].split("cmd_hardware_buy", 1)[0]
+        for code, current, capacity in (
+            ("MINES", "current_mines", "max_mines"),
+            ("LIMPETS", "current_limpets", "max_limpets"),
+            ("PHOTONS", "current_photons", "max_photons"),
+            ("BEACONS", "current_beacons", "max_beacons"),
+        ):
+            self.assertIn(f'"{code}"', listing)
+            self.assertIn(current, listing)
+            self.assertIn(capacity, listing)
+
+    def test_mine_deployment_schema_accepts_selected_asset_type(self):
+        schema = self.schemas.split("schema_combat_deploy_mines (void)")[-1].split(
+            "schema_mines_recall", 1
+        )[0]
+        self.assertIn('json_array_append_new (required, json_string ("amount"))', schema)
+        self.assertNotIn('json_array_append_new (required, json_string ("offense"))', schema)
+        self.assertIn('json_object_set_new (props, "mine_type", mine_type_prop)', schema)
+        self.assertIn('json_string ("armid")', schema)
+        self.assertIn('json_string ("limpet")', schema)
+        self.assertIn('json_object_set_new (props, "offense", offense_prop)', schema)
+        fighters = self.schemas.split("schema_combat_deploy_fighters (void)")[-1].split(
+            "schema_combat_deploy_mines", 1
+        )[0]
+        self.assertIn('json_array_append_new (required, json_string ("offense"))', fighters)
 
     def test_treasury_is_not_authorized_by_landing_alone(self):
         info = self.planets.split("cmd_planet_info", 1)[1].split(
@@ -477,8 +550,9 @@ class PlanetaryServerContractTests(unittest.TestCase):
             "db_cron_planet_get_production_overview_json", 1
         )[1]
         self.assertIn("db_cron_planet_get_production_overview_json", view)
-        self.assertIn("WHEN 'ORG' THEN COALESCE(p.colonists_org,0)*COALESCE(pt.organicsProduction,0)", production)
-        self.assertIn("WHEN 'EQU' THEN COALESCE(p.colonists_eq,0)*COALESCE(pt.equipmentProduction,0)", production)
+        self.assertIn("pp.workers_per_unit>0", production)
+        self.assertIn("ELSE COALESCE(p.colonists_org,0)*COALESCE(pt.organicsProduction,0)", production)
+        self.assertIn("ELSE COALESCE(p.colonists_eq,0)*COALESCE(pt.equipmentProduction,0)", production)
         self.assertIn("slave_population_effective_output", production)
         policy = (ROOT / "src/slave_population.h").read_text(encoding="utf-8")
         self.assertIn('strcmp (commodity_code, "ORE") == 0', policy)

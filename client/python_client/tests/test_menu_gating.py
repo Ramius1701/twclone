@@ -23,9 +23,6 @@ KNOWN_ABSENT_COMMANDS = {
 # Registered RPC names whose current server handlers explicitly return
 # ERR_NOT_IMPLEMENTED. Keep them out of ordinary player-facing menu paths.
 KNOWN_SERVER_STUBS = {
-    "insurance.policies.list",
-    "insurance.policies.buy",
-    "insurance.claim.file",
     "ship.sell",
     "ship.transfer",
     "ship.transfer_cargo",
@@ -99,6 +96,46 @@ def test_normal_mode_excludes_debug_only_menu_entries(ctx_factory, menus):
     assert "equity.portfolio.list" in exchange_commands
 
 
+def test_online_player_directory_is_reachable_in_normal_play(ctx_factory, menus):
+    ctx = ctx_factory(debug=False)
+    commands = _collect_rpc_commands(menus, "MAIN", ctx)
+    assert "player.list_online" in commands
+
+
+def test_landed_surface_exposes_public_and_detailed_planet_reads(ctx_factory, menus):
+    ctx = ctx_factory(debug=False)
+    ctx.state.update(on_planet=True, current_planet_id=77)
+    visible = _visible_options(menus["SURFACE"], ctx)
+    workflows = {option.get("action", {}).get("pycall") for option in visible}
+    assert "planet_view_flow" in workflows
+    assert "planet_overview_flow" in workflows
+
+
+def test_shipyard_menu_exposes_used_hull_purchase(ctx_factory, menus):
+    ctx = ctx_factory(debug=False)
+    workflows = {option.get("action", {}).get("pycall")
+                 for option in _visible_options(menus["SHIPYARD_MAIN"], ctx)}
+    assert "shipyard_used_purchase_flow" in workflows
+
+
+def test_bank_menu_exposes_standing_order_creation(ctx_factory, menus):
+    ctx = ctx_factory(debug=False)
+    workflows = {option.get("action", {}).get("pycall")
+                 for option in _visible_options(menus["BANK"], ctx)}
+    assert "bank_order_create_flow" in workflows
+
+
+def test_corporation_member_can_reach_leave_workflow(ctx_factory, menus):
+    ctx = ctx_factory()
+    ctx.state["in_corporation"] = True
+    ctx.state["is_ceo"] = False
+
+    corporation_keys = {
+        o["key"] for o in _visible_options(menus["CORPORATION_MAIN"], ctx)
+    }
+
+    assert "e" in corporation_keys
+
 def test_transwarp_requires_authoritative_current_sector(ctx_factory, menus):
     """NAV-02: do not expose a movement mutation without a server-owned ID."""
     stale_ctx = ctx_factory(debug=False)
@@ -169,16 +206,16 @@ def test_rankings_uses_authoritative_server_endpoint(
 ):
     ctx = ctx_factory()
     ctx.push("COMPUTER")
-    fake_conn.queue("player.rankings", {"status": "ok", "type": "player.rankings.response", "data": {"rankings": [
+    fake_conn.queue("player.rankings", {"status": "ok", "data": {"rankings": [
         {"player_id": 7, "name": "Nova", "experience": 42, "alignment": 10},
     ]}})
 
     client.handle_choice(ctx, "k")
 
     assert "Nova" in capsys.readouterr().out
-    assert [call for call in fake_conn.calls if call["command"] == "player.rankings"] == [
-        {"command": "player.rankings", "data": {"by": "net_worth", "limit": 10}},
-    ]
+    assert {"command": "player.rankings", "data": {"by": "net_worth", "limit": 10}} in fake_conn.calls
+    assert all(call["command"] in {"player.my_info", "corp.status", "player.rankings"}
+               for call in fake_conn.calls)
 
 
 def test_rankings_refusal_is_displayed_without_assuming_response_shape(
@@ -277,7 +314,7 @@ def test_enter_ship_uses_selected_ship_inspection_contract(
     ctx_factory, fake_conn, monkeypatch, capsys
 ):
     target = {
-        "id": 99,
+        "ship_id": 99,
         "name": "Derelict",
         "ship_type": "Scout",
         "owner": "derelict",
@@ -299,17 +336,11 @@ def test_enter_ship_uses_selected_ship_inspection_contract(
     assert fake_conn.calls == [{"command": "ship.inspect", "data": {"ship_id": 99}}]
 
 
-def test_insurance_placeholder_actions_are_explicit_and_never_claim_success(
-    ctx_factory, fake_conn, capsys
-):
-    ctx = ctx_factory()
-    ctx.push("INSURANCE_MAIN")
-
-    for choice in ("l", "b", "c"):
-        client.handle_choice(ctx, choice)
-
-    output = capsys.readouterr().out
-    assert output.count("Insurance is unavailable") == 3
-    assert "do not persist policies or claims" in output
-    assert "No request was sent" in output
-    assert all(call["command"] == "player.my_info" for call in fake_conn.calls)
+def test_insurance_menu_exposes_persistent_policy_and_claim_workflows(ctx_factory, menus):
+    ctx = ctx_factory(debug=False)
+    workflows = {option.get("action", {}).get("pycall")
+                 for option in _visible_options(menus["INSURANCE_MAIN"], ctx)
+                 if option.get("action", {}).get("pycall")}
+    assert workflows == {
+        "insurance_list_flow", "insurance_buy_flow", "insurance_claim_flow"
+    }

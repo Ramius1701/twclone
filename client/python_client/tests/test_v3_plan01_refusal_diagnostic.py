@@ -16,7 +16,7 @@ def test_landing_refusal_diagnostic_cannot_open_reported_planet_surface(
         "planet.land",
         {
             "status": "refused",
-            "type": "error",
+            "type": "planet.land.success",
             "error": {
                 "message": "Planetary defenses refused landing.",
                 "data": {"planet_id": 77, "landing_allowed": True},
@@ -25,15 +25,15 @@ def test_landing_refusal_diagnostic_cannot_open_reported_planet_surface(
     )
     fake_conn.queue(
         "player.my_info",
-        {"status": "ok", "type": "player.info", "data": {"player": {"id": 3, "turns": 40}}},
+        {"status": "ok", "data": {"player": {"id": 3, "turns": 40}}},
     )
     fake_conn.queue(
         "ship.status",
-        {"status": "ok", "type": "ship.status", "data": {"ship": {"ship_id": 9, "onplanet": 12}}},
+        {"status": "ok", "data": {"ship": {"ship_id": 9, "onplanet": 12}}},
     )
     fake_conn.queue(
         "move.describe_sector",
-        {"status": "ok", "type": "sector.info", "data": {"id": 17, "planets": [{"id": 77}]}},
+        {"status": "ok", "type": "sector.info", "data": {"sector_id": 17, "planets": [{"planet_id": 77}]}},
     )
 
     client.land_flow(ctx)
@@ -44,10 +44,9 @@ def test_landing_refusal_diagnostic_cannot_open_reported_planet_surface(
         "ship.status",
         "move.describe_sector",
     ]
-    assert ctx.state["current_planet_id"] == 12
+    assert "current_planet_id" not in ctx.state
     assert ctx.state["on_planet"] is False
     assert ctx.menu_stack == ["MAIN"]
     output = capsys.readouterr().out
-    assert "Landing failed: Planetary defenses refused landing." in output
+    assert "Landing response had unexpected type planet.land.success" in output
     assert "Landed on planet 77." not in output
-

@@ -7,9 +7,9 @@ class FakeTransport extends RefCounted:
 	var next_id := 1
 
 	func request(command: String, data: Dictionary, session_token: String = "") -> String:
-		calls.append({"command": command, "data": data, "session_token": session_token})
 		var request_id := "test-%d" % next_id
 		next_id += 1
+		calls.append({"command": command, "data": data, "session_token": session_token, "request_id": request_id})
 		return request_id
 
 	func poll(_delta: float = 0.0) -> void:
@@ -45,6 +45,9 @@ func _run() -> void:
 		"status": "ok", "type": "auth.session",
 		"data": {"session": "test-session", "player_id": 3},
 	})
+	# Planet reads are accepted only when the response also agrees with the
+	# player's freshly confirmed current sector.
+	app.client_state.sector = {"id": 20}
 	var fake_transport := FakeTransport.new()
 	app.transport = fake_transport
 	app.refresh_coordinator = FakeRefresh.new()
@@ -146,7 +149,7 @@ func _run() -> void:
 	await app._finish_command_reply(
 		{"status": "ok", "type": "combat.attack_planet", "data": {
 			"planet_id": 88, "attacker_remaining_fighters": 12,
-			"defender_remaining_fighters": 0, "captured": true,
+			"defender_remaining_fighters": 0, "captured": true, "enslaved_colonists": false,
 		}},
 		{"label": "Attack planet", "command": "combat.attack_planet", "mutating": true, "data": {"planet_id": 77}},
 	)
@@ -159,7 +162,7 @@ func _run() -> void:
 	await app._finish_command_reply(
 		{"status": "ok", "type": "planet.info", "data": {
 			"planet_id": 77, "attacker_remaining_fighters": 12,
-			"defender_remaining_fighters": 0, "captured": true,
+			"defender_remaining_fighters": 0, "captured": true, "enslaved_colonists": false,
 		}},
 		{"label": "Attack planet", "command": "combat.attack_planet", "mutating": true, "data": {"planet_id": 77}},
 	)
@@ -172,7 +175,7 @@ func _run() -> void:
 	await app._finish_command_reply(
 		{"status": "ok", "data": {
 			"planet_id": 77, "attacker_remaining_fighters": 12,
-			"defender_remaining_fighters": 0, "captured": true,
+			"defender_remaining_fighters": 0, "captured": true, "enslaved_colonists": false,
 		}},
 		{"label": "Attack planet", "command": "combat.attack_planet", "mutating": true, "data": {"planet_id": 77}},
 	)
@@ -183,7 +186,7 @@ func _run() -> void:
 	await app._finish_command_reply(
 		{"status": "ok", "type": "combat.attack_planet", "data": {
 			"planet_id": 77, "attacker_remaining_fighters": 12,
-			"defender_remaining_fighters": 0, "captured": true,
+			"defender_remaining_fighters": 0, "captured": true, "enslaved_colonists": false,
 		}},
 		{"label": "Attack planet", "command": "combat.attack_planet", "mutating": true, "data": {"planet_id": 77}},
 	)
@@ -196,7 +199,7 @@ func _run() -> void:
 	await app._finish_command_reply(
 		{"status": "ok", "type": "combat.attack_planet", "data": {
 			"planet_id": 77, "attacker_remaining_fighters": 0,
-			"defender_remaining_fighters": 4, "captured": false,
+			"defender_remaining_fighters": 4, "captured": false, "enslaved_colonists": false,
 		}},
 		{"label": "Attack planet", "command": "combat.attack_planet", "mutating": true, "data": {"planet_id": 77}},
 	)
@@ -207,7 +210,7 @@ func _run() -> void:
 	await app._finish_command_reply(
 		{"status": "ok", "type": "combat.attack_planet", "data": {
 			"planet_id": 77, "attacker_remaining_fighters": "0",
-			"defender_remaining_fighters": 4, "captured": false,
+			"defender_remaining_fighters": 4, "captured": false, "enslaved_colonists": false,
 		}},
 		{"label": "Attack planet", "command": "combat.attack_planet", "mutating": true, "data": {"planet_id": 77}},
 	)
@@ -238,9 +241,21 @@ func _run() -> void:
 	)
 	_check(app.gameplay_view.information_text.text.contains("minefield"), "successful launch hazard details were not presented from the server response")
 	_check(app._landed_planet_id == 0, "successful launch retained the landed-planet context")
+	_check(not app.gameplay_view.planet_workflow.visible, "successful launch left planet actions visible during refresh")
 	_check(app.refresh_coordinator.calls.size() == 1, "successful launch did not refresh authoritative state")
 	if app.refresh_coordinator.calls.size() == 1:
 		_check(app.refresh_coordinator.calls[0]["domains"] == ["player", "ship", "sector"], "successful launch refreshed the wrong state domains")
+	await app._on_refresh_finished({"freshness": {"player": "fresh", "ship": "fresh", "sector": "fresh"}, "player": {"id": 3, "ship_id": 9, "last_planet_id": 0}, "ship": {"id": 9, "onplanet": 0}, "sector": {"id": 20}})
+	_check(not app._pending_launch_departure, "confirmed launch remained pending after a complete authoritative refresh")
+	_check(app._landed_planet_id == 0 and not app.gameplay_view.planet_workflow.visible, "confirmed launch restored stale planet actions")
+
+	# Subsequent planet cases model a newly confirmed landed surface. Complete
+	# each read pair so no later operation is issued while a prior refresh remains
+	# pending.
+	app._landed_planet_id = 77
+	app._landing_surface_ready = true
+	app.gameplay_view.enter_planet_workflow(77)
+	await _settle_fake_planet_reads(app, fake_transport)
 
 	await app._finish_command_reply(
 		{"status": "refused", "error": {"message": "Insufficient equipment."}},
@@ -248,7 +263,7 @@ func _run() -> void:
 	)
 	_check(app.gameplay_view.notification_label.text.contains("Insufficient equipment"), "citadel resource refusal was not shown")
 	_check(fake_transport.calls.size() == 2, "refused construction did not refresh the confirmed planet records")
-	fake_transport.calls.clear()
+	await _settle_fake_planet_reads(app, fake_transport)
 
 	await app._finish_command_reply(
 		{"status": "refused", "error": {"message": "You do not control this planet."}},
@@ -256,7 +271,7 @@ func _run() -> void:
 	)
 	_check(app.gameplay_view.notification_label.text.contains("You do not control this planet"), "invalid-ownership refusal was not shown")
 	_check(fake_transport.calls.size() == 2, "refused workforce allocation did not refresh the confirmed planet records")
-	fake_transport.calls.clear()
+	await _settle_fake_planet_reads(app, fake_transport)
 
 	await app._finish_command_reply(
 		{"status": "error", "error": {"message": "Database temporarily unavailable."}},
@@ -264,15 +279,31 @@ func _run() -> void:
 	)
 	_check(app.gameplay_view.notification_label.text.contains("Database temporarily unavailable"), "server error was not shown with its reason")
 	_check(fake_transport.calls.size() == 2, "failed stock transfer did not refresh the confirmed planet records")
-	fake_transport.calls.clear()
+	await _settle_fake_planet_reads(app, fake_transport)
 
+	app.gameplay_view._snapshot["hud"] = {"ship_id": 9}
+	var harvest_receipt := {
+		"planet_id": 77, "ship_id": 9, "ore_harvested": 12,
+		"organics_harvested": 3, "equipment_harvested": 1,
+		"holds_remaining": 4, "turns_charged": 0,
+	}
 	await app._finish_command_reply(
-		{"status": "refused", "error": {"message": "Planet harvest is unavailable."}},
-		{"label": "Harvest planet production", "command": "planet.harvest", "mutating": true},
+		{"status": "ok", "type": "planet.harvest_v1", "data": harvest_receipt},
+		{"label": "Harvest planet production", "command": "planet.harvest", "data": {"planet_id": 77}, "mutating": true},
 	)
-	_check(app.gameplay_view.notification_label.text.contains("Planet harvest is unavailable"), "harvest refusal was not shown")
-	_check(fake_transport.calls.size() == 2, "harvest refusal did not refresh the confirmed planet records")
-	fake_transport.calls.clear()
+	_check(app.gameplay_view.notification_label.text.contains("Planet harvest confirmed") and app.gameplay_view.notification_label.text.contains("ORE 12"), "valid harvest receipt was not presented from authoritative result values")
+	_check(fake_transport.calls.size() == 2, "confirmed harvest did not refresh the landed planet records")
+	await _settle_fake_planet_reads(app, fake_transport)
+	app.refresh_coordinator.calls.clear()
+	var mismatched_harvest_receipt := harvest_receipt.duplicate(true)
+	mismatched_harvest_receipt["planet_id"] = 78
+	await app._finish_command_reply(
+		{"status": "ok", "type": "planet.harvest_v1", "data": mismatched_harvest_receipt},
+		{"label": "Harvest planet production", "command": "planet.harvest", "data": {"planet_id": 77}, "mutating": true},
+	)
+	_check(app.gameplay_view.notification_label.text.contains("not confirmed by a matching"), "mismatched planet harvest identity was presented as success")
+	_check(app.refresh_coordinator.calls.size() == 1 and app.refresh_coordinator.calls[0]["domains"] == ["player", "ship"], "invalid harvest receipt did not reconcile authoritative player and ship state")
+	await _settle_fake_planet_reads(app, fake_transport)
 
 	await app._finish_command_reply(
 		{"status": "refused", "error": {"message": "Insufficient ship fighter capacity."}},
@@ -280,7 +311,7 @@ func _run() -> void:
 	)
 	_check(app.gameplay_view.notification_label.text.contains("Insufficient ship fighter capacity"), "fighter transfer capacity refusal was not shown")
 	_check(fake_transport.calls.size() == 2, "rejected fighter transfer did not refresh the confirmed planet records")
-	fake_transport.calls.clear()
+	await _settle_fake_planet_reads(app, fake_transport)
 
 	await app._finish_command_reply(
 		{"status": "ok", "type": "citadel.upgrade_started", "data": {"target_level": 2, "days_to_complete": 4}},
@@ -293,6 +324,7 @@ func _run() -> void:
 		_check(fake_transport.calls[0]["command"] == "planet.info", "success refresh did not request authoritative planet information")
 		_check(fake_transport.calls[1]["command"] == "planet.colonists.get", "success refresh did not request colonist/cargo information")
 		_check(fake_transport.calls.all(func(call: Dictionary) -> bool: return not str(call["command"]).begins_with("citadel.")), "success refresh repeated the citadel mutation")
+	await _settle_fake_planet_reads(app, fake_transport)
 
 	app._landed_planet_id = 0
 	fake_transport.calls.clear()
@@ -303,15 +335,10 @@ func _run() -> void:
 	)
 	_check(app._landed_planet_id == 77, "successful landing did not retain the authoritative planet ID")
 	_check(not app.gameplay_view.planet_workflow.visible, "successful landing opened the surface before refresh")
-
-	_check(fake_transport.calls.size() == 2, "successful landing did not request both authoritative planet records")
-	if fake_transport.calls.size() == 2:
-		_check(fake_transport.calls[0]["command"] == "planet.info", "successful landing did not request planet information")
-		_check(fake_transport.calls[1]["command"] == "planet.colonists.get", "successful landing did not request colonist/cargo information")
 	_check(app.refresh_coordinator.calls.size() == 1, "successful landing did not refresh player, ship, and sector state")
 	if app.refresh_coordinator.calls.size() == 1:
 		_check(app.refresh_coordinator.calls[0]["domains"] == ["player", "ship", "sector"], "successful landing refreshed the wrong state domains")
-	await app._on_refresh_finished({"freshness": {"player": "fresh", "ship": "fresh", "sector": "fresh"}, "player": {"id": 3}, "ship": {"id": 9, "onplanet": 0}, "sector": {"id": 20}})
+	await app._on_refresh_finished({"freshness": {"player": "fresh", "ship": "fresh", "sector": "fresh"}, "player": {"id": 3, "ship_id": 9, "last_planet_id": 0}, "ship": {"id": 9, "onplanet": 0}, "sector": {"id": 20}})
 	_check(not app.gameplay_view.planet_workflow.visible, "landing opened the surface while authoritative ship state remained off-planet")
 	_check(app.gameplay_view.notification_label.text.contains("refresh was incomplete"), "off-planet refresh did not keep the surface unavailable")
 
@@ -326,17 +353,24 @@ func _run() -> void:
 		"freshness": {"player": "fresh", "ship": "fresh", "sector": "fresh"},
 		"ship": {"id": 9},
 	})
-	_check(app._landed_planet_id == 77, "launch refresh without onplanet incorrectly cleared the confirmed planet")
-	_check(app.gameplay_view.planet_workflow.visible, "launch refresh without onplanet closed the surface")
+	_check(app._landed_planet_id == 77, "incomplete launch refresh discarded the last confirmed planet identity")
+	_check(app.gameplay_view.planet_workflow.visible, "incomplete launch refresh hid the last confirmed planet surface")
+	_check(not app._landing_surface_ready, "incomplete launch refresh left planet actions enabled")
 	_check(app.gameplay_view.notification_label.text.contains("Launch state was incomplete"), "missing onplanet was not surfaced as incomplete launch state")
 	app._pending_landing_surface_id = 77
 	app._command_refresh_pending = true
-	await app._on_refresh_finished({"freshness": {"player": "fresh", "ship": "fresh", "sector": "fresh"}, "player": {"id": 3}, "ship": {"id": 9, "onplanet": 1}, "sector": {"id": 20}})
+	app._landed_planet_id = 77
+	await app._on_refresh_finished({"freshness": {"player": "fresh", "ship": "fresh", "sector": "fresh"}, "player": {"id": 3, "ship_id": 9, "last_planet_id": 77}, "ship": {"id": 9, "onplanet": 1}, "sector": {"id": 20}})
 	_check(app.gameplay_view.planet_workflow.visible, "successful landing did not open the surface after authoritative on-planet refresh")
+	_check(fake_transport.calls.size() == 2, "successful landing did not request both authoritative planet records: %s" % str(fake_transport.calls.map(func(call: Dictionary) -> String: return str(call.get("command", "")))))
+	if fake_transport.calls.size() == 2:
+		_check(fake_transport.calls[0]["command"] == "planet.info", "successful landing did not request planet information")
+		_check(fake_transport.calls[1]["command"] == "planet.colonists.get", "successful landing did not request colonist/cargo information")
+	await _settle_fake_planet_reads(app, fake_transport)
+	await _settle_fake_planet_reads(app, fake_transport)
 
-	# A JSON-null response type is equivalent to an omitted optional type. The
-	# Python client already accepts this legacy-compatible envelope; Godot must
-	# not stringify null into a type mismatch.
+	# The current V3 server publishes a typed landing receipt. A missing/null type
+	# is not an alternate success schema and must not authorize a planet surface.
 	app._landed_planet_id = 0
 	fake_transport.calls.clear()
 	app.refresh_coordinator.calls.clear()
@@ -344,16 +378,19 @@ func _run() -> void:
 		{"status": "ok", "type": null, "data": {"planet_id": 77}},
 		{"label": "Land on planet", "command": "planet.land", "mutating": true, "data": {"planet_id": 77}},
 	)
-	_check(app._landed_planet_id == 77, "JSON-null landing response type was treated as a mismatch")
+	_check(app._landed_planet_id == 0, "JSON-null landing response type authorized a planet surface")
+	_check(app.gameplay_view.notification_label.text.contains("unexpected response type"), "JSON-null landing type mismatch was not explained")
 	_check(app.refresh_coordinator.calls.size() == 1, "JSON-null landing response did not refresh authoritative state")
 	if app.refresh_coordinator.calls.size() == 1:
 		_check(app.refresh_coordinator.calls[0]["domains"] == ["player", "ship", "sector"], "JSON-null landing response refreshed the wrong state domains")
+	app.refresh_coordinator.calls.clear()
+	app._command_refresh_pending = false
 
 	app._landed_planet_id = 0
 	fake_transport.calls.clear()
 	app.refresh_coordinator.calls.clear()
 	await app._finish_command_reply(
-		{"status": "ok", "data": {"planet_id": 88}},
+		{"status": "ok", "type": "planet.land.success", "data": {"planet_id": 88}},
 		{"label": "Land on planet", "command": "planet.land", "mutating": true, "data": {"planet_id": 77}},
 	)
 	_check(app._landed_planet_id == 0, "landing opened a surface for a mismatched authoritative planet ID")
@@ -361,16 +398,20 @@ func _run() -> void:
 	_check(app.refresh_coordinator.calls.size() == 1, "mismatched landing ID did not refresh authoritative state")
 	if app.refresh_coordinator.calls.size() == 1:
 		_check(app.refresh_coordinator.calls[0]["domains"] == ["player", "ship", "sector"], "mismatched landing refreshed the wrong state domains")
+	app.refresh_coordinator.calls.clear()
+	app._command_refresh_pending = false
 
 	fake_transport.calls.clear()
 	app.refresh_coordinator.calls.clear()
 	await app._finish_command_reply(
-		{"status": "ok", "data": {"message": "Landed"}},
+		{"status": "ok", "type": "planet.land.success", "data": {"message": "Landed"}},
 		{"label": "Land on planet", "command": "planet.land", "mutating": true, "data": {"planet_id": 77}},
 	)
 	_check(app._landed_planet_id == 0, "landing opened a surface when the authoritative planet ID was missing")
 	_check(app.gameplay_view.notification_label.text.contains("omitted the planet ID"), "missing landing ID was not explained")
 	_check(app.refresh_coordinator.calls.size() == 1, "missing landing ID did not refresh authoritative state")
+	app.refresh_coordinator.calls.clear()
+	app._command_refresh_pending = false
 
 	# An ambiguous success must also close a previously confirmed surface. The
 	# follow-up refresh may show that the server consumed the turn or moved the
@@ -393,28 +434,50 @@ func _run() -> void:
 	app._landed_planet_id = 77
 	app._landing_surface_ready = true
 	app.gameplay_view.enter_planet_workflow(77)
+	await _settle_fake_planet_reads(app, fake_transport)
 	app.refresh_coordinator.calls.clear()
 	app._pending_game_commands["planet-info-malformed-id"] = {
 		"kind": "planet_info", "command": "planet.info", "label": "Planet information",
 	}
 	app._on_transport_reply("planet-info-malformed-id", {
-		"status": "ok", "data": {"planet_id": true, "planet": {"planet_id": 77}},
+		"status": "ok", "type": "planet.info", "data": {"planet_id": true, "planet": {"planet_id": 77}},
 	}, "planet.info")
 	_check(app._landed_planet_id == 0, "malformed explicit planet ID fell through to a nested alias")
 	_check(not app._landing_surface_ready and not app.gameplay_view.planet_workflow.visible, "malformed explicit planet ID left stale surface actions visible")
 	_check(app.refresh_coordinator.calls.size() == 1, "malformed explicit planet ID did not refresh authoritative state")
+	app.refresh_coordinator.calls.clear()
+	app._command_refresh_pending = false
+
+	app._landed_planet_id = 77
+	app._landing_surface_ready = true
+	app.gameplay_view.enter_planet_workflow(77)
+	await _settle_fake_planet_reads(app, fake_transport)
+	app.refresh_coordinator.calls.clear()
+	app._pending_game_commands["planet-info-sector-mismatch"] = {
+		"kind": "planet_info", "command": "planet.info", "label": "Planet information",
+	}
+	app._on_transport_reply("planet-info-sector-mismatch", {
+		"status": "ok", "type": "planet.info", "data": {"planet_id": 77, "sector_id": 21},
+	}, "planet.info")
+	_check(app._landed_planet_id == 0 and not app.gameplay_view.planet_workflow.visible,
+		"planet.info from a different sector exposed surface actions")
+	_check(app.refresh_coordinator.calls.size() == 1,
+		"planet.info sector mismatch did not reconcile authoritative location")
+	app.refresh_coordinator.calls.clear()
+	app._command_refresh_pending = false
 
 	# Colony records are also location-sensitive. A successful response for a
 	# different planet must not populate the confirmed surface workflow.
 	app._landed_planet_id = 77
 	app._landing_surface_ready = true
 	app.gameplay_view.enter_planet_workflow(77)
+	await _settle_fake_planet_reads(app, fake_transport)
 	app.refresh_coordinator.calls.clear()
 	app._pending_game_commands["planet-colonists-mismatch"] = {
 		"kind": "planet_colonists", "command": "planet.colonists.get", "label": "Colony and cargo information",
 	}
 	app._on_transport_reply("planet-colonists-mismatch", {
-		"status": "ok", "data": {"planet_id": 88, "planet_colonists": 4, "ship_colonists": 2},
+		"status": "ok", "type": "planet.colonists.get", "data": {"planet_id": 88, "planet_colonists": 4, "ship_colonists": 2},
 	}, "planet.colonists.get")
 	_check(app._landed_planet_id == 0, "mismatched colony response retained stale landed-planet context")
 	_check(not app._landing_surface_ready and not app.gameplay_view.planet_workflow.visible, "mismatched colony response left stale surface actions visible")
@@ -461,3 +524,24 @@ func _check(condition: bool, message: String) -> void:
 	checks += 1
 	if not condition:
 		failures.append(message)
+
+func _settle_fake_planet_reads(app, fake_transport: FakeTransport) -> void:
+	var calls: Array = fake_transport.calls.duplicate(true)
+	fake_transport.calls.clear()
+	for call in calls:
+		var command := str(call.get("command", ""))
+		if command not in ["planet.info", "planet.colonists.get"]:
+			continue
+		var response_data: Dictionary
+		if command == "planet.info":
+			response_data = {"planet_id": 77, "sector_id": 20, "citadel_level": 1, "name": "Fixture Planet", "goods": []}
+		else:
+			response_data = {"planet_id": 77, "planet_colonists": 40, "ship_colonists": 0, "ship_holds_available": 100}
+		await app._on_transport_reply(str(call.get("request_id", "")), {
+			"status": "ok", "type": command, "data": response_data,
+		}, command)
+	app._planet_pending_count = 0
+	if app._command_refresh_pending:
+		await app._on_refresh_finished({})
+	else:
+		app.gameplay_view.set_command_busy(false)

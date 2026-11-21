@@ -197,6 +197,50 @@ int db_combat_lock_sector(db_t *db, int sector_id) {
     return (found && err.code == 0) ? 0 : -1;
 }
 
+int
+db_combat_lock_sector_for_entry (db_t *db, int sector_id)
+{
+  if (!db || sector_id <= 0)
+    return -1;
+  if (db_backend (db) == DB_BACKEND_POSTGRES)
+    {
+      /* Movement has already written rows with sector foreign keys by the
+       * time entry hazards run. Those writes hold KEY SHARE locks on the
+       * sectors row, so upgrading two concurrent transactions to FOR UPDATE
+       * can deadlock. A transaction-scoped advisory lock serializes the same
+       * destination without conflicting with those foreign-key locks.
+       */
+      db_res_t *lock_res = NULL;
+      db_error_t lock_err = {0};
+      char lock_sql[256];
+      int64_t lock_key = ((int64_t) 0x5457434c << 32)
+                         | (uint32_t) sector_id;
+      if (sql_build (db,
+                     "SELECT pg_advisory_xact_lock({1});",
+                     lock_sql, sizeof (lock_sql)) != 0
+          || !db_query (db, lock_sql,
+                        (db_bind_t[]){ db_bind_i64 (lock_key) },
+                        1, &lock_res, &lock_err))
+        return -1;
+      int locked = db_res_step (lock_res, &lock_err) ? 1 : 0;
+      db_res_finalize (lock_res);
+      return locked && lock_err.code == 0 ? 0 : -1;
+    }
+  db_res_t *res = NULL;
+  db_error_t err = {0};
+  char sql_tmpl[256], sql[256];
+  snprintf (sql_tmpl, sizeof (sql_tmpl),
+            "SELECT sector_id FROM sectors WHERE sector_id = {1}%s;",
+            sql_for_update (db));
+  if (sql_build (db, sql_tmpl, sql, sizeof (sql)) != 0
+      || !db_query (db, sql, (db_bind_t[]){ db_bind_i64 (sector_id) }, 1,
+                    &res, &err))
+    return -1;
+  int found = db_res_step (res, &err) ? 1 : 0;
+  db_res_finalize (res);
+  return found && err.code == 0 ? 0 : -1;
+}
+
 int db_combat_sum_sector_fighters(db_t *db, int sector_id, int *total) {
     if (!db || !total) return -1;
     db_res_t *res = NULL;
@@ -290,7 +334,12 @@ int db_combat_load_ship_full_locked(db_t *db, int ship_id, repo_combat_ship_full
     db_error_t err = {0};
     char lock_clause[128] = { 0 };
     char sql_tmpl[1024];
-    if (sql_for_update_of (db, "s, st, op", lock_clause,
+    /* Shiptype combat attributes are catalogue data and never mutate as part
+     * of combat. Locking the shared shiptypes row for every ship of a class
+     * creates cross-ship lock cycles with sector-entry serialization. Lock
+     * only the mutable ship state and its primary ownership row.
+     */
+    if (sql_for_update_of (db, "s, op", lock_clause,
 			   sizeof (lock_clause)) != 0)
       return -1;
     if (skip_locked)
@@ -304,9 +353,9 @@ int db_combat_load_ship_full_locked(db_t *db, int ship_id, repo_combat_ship_full
 	  return -1;
       }
 
-    snprintf (sql_tmpl, sizeof (sql_tmpl),
-	      "SELECT s.ship_id, s.hull, s.shields, s.fighters, s.sector_id, s.name, st.offense, st.defense, st.maxattack, op.player_id, cm.corporation_id FROM ships s JOIN shiptypes st ON s.type_id = st.shiptypes_id JOIN ship_ownership op ON op.ship_id = s.ship_id AND op.is_primary = TRUE LEFT JOIN corp_members cm ON cm.player_id = op.player_id WHERE s.ship_id = {1}%s",
-	      lock_clause);
+	      snprintf (sql_tmpl, sizeof (sql_tmpl),
+		"SELECT s.ship_id, s.hull, s.shields, s.fighters, s.sector_id, s.name, st.offense, st.defense, st.maxattack, op.player_id, cm.corporation_id, COALESCE(s.combat_disabled_until,0) FROM ships s JOIN shiptypes st ON s.type_id = st.shiptypes_id JOIN ship_ownership op ON op.ship_id = s.ship_id AND op.is_primary = TRUE LEFT JOIN corp_members cm ON cm.player_id = op.player_id WHERE s.ship_id = {1} AND COALESCE(s.destroyed,FALSE)=FALSE%s",
+		lock_clause);
     char sql[1024];
     if (sql_build (db, sql_tmpl, sql, sizeof (sql)) != 0)
       return -1;
@@ -322,6 +371,7 @@ int db_combat_load_ship_full_locked(db_t *db, int ship_id, repo_combat_ship_full
     out->attack_power = (int)db_res_col_i32(res, 6, &err); out->defense_power = (int)db_res_col_i32(res, 7, &err);
     out->max_attack = (int)db_res_col_i32(res, 8, &err); out->player_id = (int)db_res_col_i32(res, 9, &err);
     out->corp_id = (int)db_res_col_i32(res, 10, &err);
+    out->combat_disabled_until = db_res_col_i64(res, 11, &err);
     db_res_finalize(res);
     return (err.code == 0) ? 0 : -1;
 }
@@ -331,7 +381,7 @@ int db_combat_load_ship_full_unlocked(db_t *db, int ship_id, repo_combat_ship_fu
     db_res_t *res = NULL;
     db_error_t err = {0};
     char sql[1024];
-    sql_build(db, "SELECT s.ship_id, s.hull, s.shields, s.fighters, s.sector_id, s.name, st.offense, st.defense, st.maxattack, op.player_id, cm.corporation_id FROM ships s JOIN shiptypes st ON s.type_id = st.shiptypes_id JOIN ship_ownership op ON op.ship_id = s.ship_id AND op.is_primary = TRUE LEFT JOIN corp_members cm ON cm.player_id = op.player_id WHERE s.ship_id = {1}", sql, sizeof(sql));
+    sql_build(db, "SELECT s.ship_id, s.hull, s.shields, s.fighters, s.sector_id, s.name, st.offense, st.defense, st.maxattack, op.player_id, cm.corporation_id, COALESCE(s.combat_disabled_until,0) FROM ships s JOIN shiptypes st ON s.type_id = st.shiptypes_id JOIN ship_ownership op ON op.ship_id = s.ship_id AND op.is_primary = TRUE LEFT JOIN corp_members cm ON cm.player_id = op.player_id WHERE s.ship_id = {1} AND COALESCE(s.destroyed,FALSE)=FALSE", sql, sizeof(sql));
     if (!db_query(db, sql, (db_bind_t[]){ db_bind_i64(ship_id) }, 1, &res, &err)) return -1;
     if (!db_res_step(res, &err)) { db_res_finalize(res); return -1; }
     out->id = (int)db_res_col_i32(res, 0, &err); out->hull = (int)db_res_col_i32(res, 1, &err);
@@ -341,6 +391,7 @@ int db_combat_load_ship_full_unlocked(db_t *db, int ship_id, repo_combat_ship_fu
     out->attack_power = (int)db_res_col_i32(res, 6, &err); out->defense_power = (int)db_res_col_i32(res, 7, &err);
     out->max_attack = (int)db_res_col_i32(res, 8, &err); out->player_id = (int)db_res_col_i32(res, 9, &err);
     out->corp_id = (int)db_res_col_i32(res, 10, &err);
+    out->combat_disabled_until = db_res_col_i64(res, 11, &err);
     db_res_finalize(res);
     return (err.code == 0) ? 0 : -1;
 }

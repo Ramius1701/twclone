@@ -11,7 +11,7 @@ def test_landing_success_does_not_authorize_untyped_player_refresh(
         "status": "ok", "type": "planet.land.success",
         "data": {"planet_id": 77},
     })
-    fake_conn.queue("player.my_info", {
+    fake_conn.queue_untyped("player.my_info", {
         "status": "ok", "data": {"player": {"id": 3, "turns": 39}},
     })
     fake_conn.queue("ship.status", {
@@ -45,9 +45,9 @@ def test_landing_success_does_not_authorize_untyped_ship_refresh(
         "status": "ok", "type": "player.info",
         "data": {"player": {"id": 3, "ship_id": 9, "turns": 39}},
     })
-    fake_conn.queue("ship.status", {
+    fake_conn.queue_untyped("ship.status", {
         "status": "ok",
-        "data": {"ship": {"id": 9, "onplanet": 77}},
+        "data": {"ship": {"id": 9, "onplanet": 1}},
     })
     fake_conn.queue("move.describe_sector", {
         "status": "ok", "type": "sector.info",

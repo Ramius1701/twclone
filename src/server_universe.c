@@ -12,6 +12,7 @@
 #include <string.h>
 #include <strings.h>
 #include <inttypes.h>
+#include <limits.h>
 
 /* local includes */
 #include "server_universe.h"
@@ -33,6 +34,7 @@
 #include "errors.h"
 #include "globals.h"
 #include "server_players.h"
+#include "server_config.h"
 #include "server_log.h"
 #include "server_combat.h"
 #include "db/repo/repo_combat.h"
@@ -72,6 +74,7 @@ static int64_t g_iss_last_patrol_s = 0;
 static db_t *ori_db = NULL;
 static bool ori_initialized = false;
 static int ori_owner_id = -1;
+static int ori_corporation_id = -1;
 static int ori_home_sector_id = -1;
 
 /* ============ ISS Helper Function Forward Declarations ============ */
@@ -364,7 +367,7 @@ ori_move_all_ships (int64_t now_s)
                                   ship_id, port_id, current_sector,
                                   (int) (now_s / 900));
 
-      if (personality == SHIP_PERSONALITY_BLOCKADER)
+      if (personality == SHIP_PERSONALITY_BLOCKADER && current_sector > 10)
         {
           /* Blockaders hold their assigned home sector.  Their persistent
            * assets and attacks are independently claimed so a duplicated
@@ -444,15 +447,15 @@ ori_move_all_ships (int64_t now_s)
                             (ori_db, attack_key,
                              attack_rc == 0 ? "completed" : "failed", "{}");
                         }
-                      break;
                     }
                   db_res_finalize (targets);
                 }
             }
         }
 
-      if (personality == SHIP_PERSONALITY_OFFENSIVE
-          || personality == SHIP_PERSONALITY_LOOTER)
+      if (current_sector > 10
+          && (personality == SHIP_PERSONALITY_OFFENSIVE
+              || personality == SHIP_PERSONALITY_LOOTER))
         {
           db_error_t target_err;
           db_error_clear (&target_err);
@@ -464,7 +467,12 @@ ori_move_all_ships (int64_t now_s)
                 {
                   int target_player = db_res_col_i32 (targets, 0, &target_err);
                   int target_ship = h_get_active_ship_id (ori_db, target_player);
-                  if (target_ship <= 0 || target_ship == ship_id) continue;
+                  int target_is_orion = 0;
+                  if (target_ship <= 0 || target_ship == ship_id
+                      || repo_universe_ship_is_orion_owned
+                           (ori_db, target_ship, &target_is_orion) < 0
+                      || target_is_orion)
+                    continue;
                   char attack_key[128];
                   snprintf (attack_key, sizeof attack_key,
                             "orion:attack:%d:%d:%" PRId64, ship_id,
@@ -483,7 +491,6 @@ ori_move_all_ships (int64_t now_s)
                         (ori_db, ship_id, target_player, current_sector,
                          "same_sector_observation", now_s + 1800);
                     }
-                  break;
                 }
               db_res_finalize (targets);
             }
@@ -547,7 +554,7 @@ ori_init_once (db_t *db)
 {
   if (ori_initialized)
     {
-      return (ori_owner_id != -1);
+      return (ori_owner_id != -1 && ori_corporation_id != -1);
     }
   if (!db)
     {
@@ -563,10 +570,13 @@ ori_init_once (db_t *db)
 
   /* Step 1: Find the Orion Syndicate owner ID from corporation tag */
   if (repo_universe_get_corp_owner_by_tag (db, "ORION", &ori_owner_id) !=
-      0)
+      0 || repo_universe_get_corp_id_by_tag (db, "ORION",
+                                              &ori_corporation_id) != 0)
     {
       LOGW ("[ori] Failed to find Orion Syndicate owner. Skipping.");
-      ori_initialized = true;
+      /* BigBang or a disposable/test world may add faction records after the
+       * server begins ticking. Keep initialization retryable so a missing
+       * startup record does not permanently disable Orion for this process. */
       return 0;
     }
 
@@ -582,7 +592,7 @@ ori_init_once (db_t *db)
   LOGI ("[ori]: Orion Syndicate owner ID is %d, Home Sector is %d",
 	ori_owner_id, ori_home_sector_id);
   if (repo_universe_ensure_orion_population
-      (db, ori_owner_id, ori_home_sector_id) != 0)
+      (db, ori_corporation_id, ori_home_sector_id) != 0)
     LOGW ("[ori]: Could not reconcile configured Orion population");
   ori_initialized = true;
   return 1;
@@ -592,7 +602,6 @@ ori_init_once (db_t *db)
 void
 ori_tick (db_t *db, int64_t now_ms)
 {
-  (void) now_ms;
   if (!ori_initialized)
     {
       if (!ori_init_once (db))
@@ -606,7 +615,9 @@ ori_tick (db_t *db, int64_t now_ms)
       if (!db)
 	return;
     }
-  ori_move_all_ships ((int64_t) time (NULL));
+  int64_t now_s = now_ms >= INT64_C(1000000000000)
+    ? now_ms / 1000 : (int64_t) time (NULL);
+  ori_move_all_ships (now_s);
 }
 
 
@@ -1207,6 +1218,13 @@ h_check_interdiction (db_t *db, int sector_id, int player_id, int corp_id)
       return 0;
     }
 
+  int photon_active = server_combat_sector_photon_active
+    (db, sector_id, (int64_t) time (NULL));
+  if (photon_active < 0)
+    return 1; /* Fail closed if temporary suppression state cannot be read. */
+  if (photon_active)
+    return 0;
+
   db_error_t err;
   db_res_t *res = repo_universe_get_interdictors (db, sector_id, &err);
   if (!res)
@@ -1363,6 +1381,303 @@ validate_warp_rule (int from_sector, int to_sector)
   return 0;
 }
 
+/* Toll fighters require a player decision before sector entry. The first
+ * movement request creates a short-lived quote and returns without charging
+ * a turn. The same move command resumes with the quote identifier and a
+ * boolean decision, keeping payment and passage inside the movement tx. */
+static int
+move_warp_toll_offer (client_ctx_t *ctx, json_t *root, db_t *db, int to,
+                      bool transwarp)
+{
+  if (!ctx || !root || !db || g_cfg.toll_fighter_rate <= 0)
+    return 0;
+  json_t *data = json_object_get (root, "data");
+  json_t *offer_value = json_object_get (data, "toll_offer_id");
+  if (json_is_string (offer_value))
+    return 0;
+  json_t *id_value = json_object_get (root, "id");
+  const char *request_id = json_is_string (id_value)
+    ? json_string_value (id_value) : NULL;
+  if (!request_id || !*request_id || strlen (request_id) > 128)
+    return -1;
+
+  db_error_t err = {0};
+  db_res_t *res = NULL;
+  if (!db_tx_begin (db, DB_TX_IMMEDIATE, &err))
+    return -1;
+  if (!db_query (db,
+       "SELECT player_id FROM players WHERE player_id={1} FOR UPDATE",
+       (db_bind_t[]){db_bind_i32 (ctx->player_id)}, 1, &res, &err)
+      || !db_res_step (res, &err))
+    goto toll_offer_failed;
+  db_res_finalize (res); res = NULL;
+  if (!db_query (db,
+       "SELECT offer_id,fighter_count,unit_rate,amount,state,expires_at,from_sector_id FROM toll_passage_offers "
+       "WHERE player_id={1} AND request_id={2} AND to_sector_id={3}",
+       (db_bind_t[]){db_bind_i32 (ctx->player_id), db_bind_text (request_id),
+                     db_bind_i32 (to)}, 3, &res, &err))
+    goto toll_offer_failed;
+  if (db_res_step (res, &err))
+    {
+      char offer_id[160] = {0};
+      const char *value = db_res_col_text (res, 0, &err);
+      if (value) snprintf (offer_id, sizeof offer_id, "%s", value);
+      int fighters = db_res_col_i32 (res, 1, &err);
+      int rate = db_res_col_i32 (res, 2, &err);
+      int64_t amount = db_res_col_i64 (res, 3, &err);
+      const char *state_value = db_res_col_text (res, 4, &err);
+      char state[16] = {0};
+      if (state_value) snprintf (state, sizeof state, "%s", state_value);
+      int64_t expires_at = db_res_col_i64 (res, 5, &err);
+      int from_sector = db_res_col_i32 (res, 6, &err);
+      db_res_finalize (res); res = NULL;
+      if (err.code || !db_tx_commit (db, &err)) goto toll_offer_failed;
+      if (strcmp (state, "pending") != 0)
+        {
+          json_t *repeat = NULL;
+          if (transwarp)
+            {
+              int distance = 0;
+              if (repo_universe_get_transwarp_distance (db, from_sector, to,
+                                                        &distance) != 0)
+                {
+                  send_response_error (ctx, root, ERR_DB,
+                                       "Could not reconcile transwarp toll retry");
+                  return 1;
+                }
+              repeat = json_pack ("{s:i,s:s,s:i,s:I,s:b}", "sector_id", to,
+                  "status", "transwarp_complete", "distance_sectors", distance,
+                  "fuel_ore_consumed", (json_int_t) distance * 3,
+                  "idempotent_retry", 1);
+              send_response_ok_take (ctx, root, "move.transwarp", &repeat);
+            }
+          else
+            {
+              repeat = json_pack ("{s:i,s:i,s:b}", "sector_id", to,
+                                  "to_sector_id", to, "idempotent_retry", 1);
+              send_response_ok_take (ctx, root, "move.result", &repeat);
+            }
+          return 1;
+        }
+      if (expires_at <= (int64_t) time (NULL))
+        {
+          send_response_error (ctx, root, ERR_PERMISSION_DENIED,
+                               "Toll offer has expired; request a new passage");
+          return 1;
+        }
+      json_t *out = json_pack ("{s:s,s:i,s:i,s:I}", "offer_id", offer_id,
+                               "sector_id", to, "fighter_count", fighters,
+                               "amount", (json_int_t) amount);
+      if (out) json_object_set_new (out, "credits_per_fighter", json_integer (rate));
+      send_response_ok_take (ctx, root, "move.toll_offer_v1", &out);
+      return 1;
+    }
+  db_res_finalize (res); res = NULL;
+  if (err.code) goto toll_offer_failed;
+
+  if (!db_query (db,
+       "SELECT owner_id,COALESCE(SUM(quantity),0) FROM sector_assets "
+       "WHERE sector_id={1} AND asset_type=2 AND offensive_setting={4} AND quantity>0 "
+       "AND owner_id<>{2} AND (COALESCE(corporation_id,0)=0 OR corporation_id<>{3}) "
+       "GROUP BY owner_id ORDER BY owner_id",
+       (db_bind_t[]){db_bind_i32 (to), db_bind_i32 (ctx->player_id),
+                     db_bind_i32 (ctx->corp_id), db_bind_i32 (OFFENSE_TOLL)},
+       4, &res, &err))
+    goto toll_offer_failed;
+  int payee_count = 0, payee_capacity = 4, fighters = 0;
+  int *payee_ids = malloc ((size_t) payee_capacity * sizeof (int));
+  int *payee_fighters = malloc ((size_t) payee_capacity * sizeof (int));
+  if (!payee_ids || !payee_fighters)
+    {
+      free (payee_ids); free (payee_fighters);
+      db_res_finalize (res); res = NULL;
+      goto toll_offer_failed;
+    }
+  while (db_res_step (res, &err))
+    {
+      int owner = db_res_col_i32 (res, 0, &err);
+      int quantity = db_res_col_i32 (res, 1, &err);
+      if (err.code || owner <= 0 || quantity <= 0 || fighters > INT_MAX - quantity)
+        { err.code = err.code ? err.code : 1; break; }
+      if (payee_count == payee_capacity)
+        {
+          payee_capacity *= 2;
+          int *new_ids = realloc (payee_ids, (size_t) payee_capacity * sizeof (int));
+          int *new_fighters = realloc (payee_fighters,
+                                      (size_t) payee_capacity * sizeof (int));
+          if (!new_ids || !new_fighters)
+            {
+              free (new_ids ? new_ids : payee_ids);
+              free (new_fighters ? new_fighters : payee_fighters);
+              payee_ids = payee_fighters = NULL;
+              err.code = 1;
+              break;
+            }
+          payee_ids = new_ids; payee_fighters = new_fighters;
+        }
+      payee_ids[payee_count] = owner;
+      payee_fighters[payee_count++] = quantity;
+      fighters += quantity;
+    }
+  db_res_finalize (res); res = NULL;
+  if (err.code || payee_count == 0)
+    {
+      free (payee_ids); free (payee_fighters);
+      if (err.code) goto toll_offer_failed;
+      if (!db_tx_commit (db, &err)) goto toll_offer_failed;
+      return 0;
+    }
+  if (fighters <= 0
+      || (int64_t) fighters > INT64_MAX / g_cfg.toll_fighter_rate)
+    { free (payee_ids); free (payee_fighters); goto toll_offer_failed; }
+  int64_t amount = (int64_t) fighters * g_cfg.toll_fighter_rate;
+  char offer_id[160];
+  snprintf (offer_id, sizeof offer_id, "toll-%d-%s", ctx->player_id, request_id);
+  if (!db_exec (db,
+       "INSERT INTO toll_passage_offers(offer_id,request_id,player_id,ship_id,from_sector_id,to_sector_id,owner_player_id,fighter_count,unit_rate,amount,state,expires_at) "
+       "VALUES({1},{2},{3},{4},{5},{6},{7},{8},{9},{10},'pending',extract(epoch from now())::bigint+300)",
+       (db_bind_t[]){db_bind_text (offer_id), db_bind_text (request_id),
+                     db_bind_i32 (ctx->player_id), db_bind_i32 (h_get_active_ship_id (db, ctx->player_id)),
+                     db_bind_i32 (ctx->sector_id), db_bind_i32 (to), db_bind_i32 (payee_ids[0]),
+                     db_bind_i32 (fighters), db_bind_i32 (g_cfg.toll_fighter_rate),
+                     db_bind_i64 (amount)}, 10, &err)
+      )
+    { free (payee_ids); free (payee_fighters); goto toll_offer_failed; }
+  for (int i = 0; i < payee_count; i++)
+    {
+      int64_t payee_amount = (int64_t) payee_fighters[i] * g_cfg.toll_fighter_rate;
+      if (!db_exec (db,
+           "INSERT INTO toll_passage_payees(offer_id,owner_player_id,fighter_count,amount) VALUES({1},{2},{3},{4})",
+           (db_bind_t[]){db_bind_text (offer_id), db_bind_i32 (payee_ids[i]),
+                         db_bind_i32 (payee_fighters[i]), db_bind_i64 (payee_amount)},
+           4, &err))
+        { free (payee_ids); free (payee_fighters); goto toll_offer_failed; }
+    }
+  free (payee_ids); free (payee_fighters);
+  if (!db_tx_commit (db, &err)) goto toll_offer_failed;
+  json_t *out = json_pack ("{s:s,s:i,s:i,s:I,s:i}", "offer_id", offer_id,
+      "sector_id", to, "fighter_count", fighters, "amount", (json_int_t) amount,
+      "credits_per_fighter", g_cfg.toll_fighter_rate);
+  send_response_ok_take (ctx, root, "move.toll_offer_v1", &out);
+  return 1;
+
+toll_offer_failed:
+  if (res) db_res_finalize (res);
+  db_tx_rollback (db, &err);
+  return -1;
+}
+
+/* Settle the same durable toll quote used by ordinary warp, inside the
+ * transwarp mutation transaction. Return 0 to continue movement, 1 when a
+ * refusal/error/retry response was already sent, and -1 for a DB failure. */
+static int
+move_transwarp_toll_settle (client_ctx_t *ctx, json_t *root, db_t *db,
+                            int destination, db_res_t **res,
+                            db_error_t *txerr)
+{
+  json_t *data = json_object_get (root, "data");
+  json_t *offer_value = json_object_get (data, "toll_offer_id");
+  if (!json_is_string (offer_value)) return 0;
+  const char *offer_id = json_string_value (offer_value);
+  json_t *accept_value = json_object_get (data, "toll_accept");
+  if (!json_is_boolean (accept_value))
+    {
+      db_tx_rollback (db, NULL);
+      send_response_error (ctx, root, ERR_INVALID_ARG,
+                           "Toll offer decision must be accept or refuse");
+      return 1;
+    }
+  if (!db_query (db,
+       "SELECT player_id,ship_id,from_sector_id,to_sector_id,amount,state,expires_at FROM toll_passage_offers WHERE offer_id={1} FOR UPDATE",
+       (db_bind_t[]){db_bind_text (offer_id)}, 1, res, txerr))
+    return -1;
+  if (!db_res_step (*res, txerr))
+    {
+      db_res_finalize (*res); *res = NULL;
+      if (txerr->code) return -1;
+      db_tx_rollback (db, NULL);
+      send_response_error (ctx, root, ERR_NOT_FOUND,
+                           "Toll offer was not found or has expired");
+      return 1;
+    }
+  int offer_player = db_res_col_i32 (*res, 0, txerr);
+  int offer_ship = db_res_col_i32 (*res, 1, txerr);
+  int offer_from = db_res_col_i32 (*res, 2, txerr);
+  int offer_to = db_res_col_i32 (*res, 3, txerr);
+  int64_t amount = db_res_col_i64 (*res, 4, txerr);
+  const char *state_value = db_res_col_text (*res, 5, txerr);
+  char state[16] = {0};
+  if (state_value) snprintf (state, sizeof state, "%s", state_value);
+  int64_t expires_at = db_res_col_i64 (*res, 6, txerr);
+  db_res_finalize (*res); *res = NULL;
+  if (txerr->code) return -1;
+  if (offer_player != ctx->player_id || offer_to != destination)
+    {
+      db_tx_rollback (db, NULL);
+      send_response_error (ctx, root, ERR_PERMISSION_DENIED,
+                           "Toll offer does not match this transwarp");
+      return 1;
+    }
+  if (strcmp (state, "pending") != 0)
+    {
+      int distance = 0;
+      if (repo_universe_get_transwarp_distance (db, offer_from, offer_to,
+                                                &distance) != 0)
+        return -1;
+      db_tx_rollback (db, NULL);
+      json_t *repeat = json_pack ("{s:i,s:s,s:i,s:I,s:b}",
+          "sector_id", offer_to, "status", "transwarp_complete",
+          "distance_sectors", distance, "fuel_ore_consumed",
+          (json_int_t) distance * 3, "idempotent_retry", 1);
+      send_response_ok_take (ctx, root, "move.transwarp", &repeat);
+      return 1;
+    }
+  if (offer_ship != h_get_active_ship_id (db, ctx->player_id)
+      || offer_from != ctx->sector_id || expires_at <= (int64_t) time (NULL))
+    {
+      db_tx_rollback (db, NULL);
+      send_response_error (ctx, root, ERR_PERMISSION_DENIED,
+                           "Toll offer no longer matches the active transwarp");
+      return 1;
+    }
+  bool accept = json_is_true (accept_value);
+  if (accept && h_deduct_player_petty_cash_unlocked
+      (db, ctx->player_id, amount, NULL) != 0)
+    {
+      db_tx_rollback (db, NULL);
+      send_response_refused_steal (ctx, root, ERR_INSUFFICIENT_FUNDS,
+                                   "Not enough credits to pay this toll", NULL);
+      return 1;
+    }
+  if (accept)
+    {
+      if (!db_query (db,
+           "SELECT owner_player_id,amount FROM toll_passage_payees WHERE offer_id={1} ORDER BY owner_player_id",
+           (db_bind_t[]){db_bind_text (offer_id)}, 1, res, txerr))
+        return -1;
+      int payees = 0;
+      while (db_res_step (*res, txerr))
+        {
+          int payee = db_res_col_i32 (*res, 0, txerr);
+          int64_t payee_amount = db_res_col_i64 (*res, 1, txerr);
+          if (txerr->code || h_add_player_petty_cash_unlocked
+              (db, payee, payee_amount, NULL) != 0)
+            { txerr->code = txerr->code ? txerr->code : 1; break; }
+          payees++;
+        }
+      db_res_finalize (*res); *res = NULL;
+      if (txerr->code || payees == 0) return -1;
+    }
+  if (!db_exec (db,
+       "UPDATE toll_passage_offers SET state={1},resolved_at=CURRENT_TIMESTAMP WHERE offer_id={2} AND state='pending'",
+       (db_bind_t[]){db_bind_text (accept ? "accepted" : "refused"),
+                     db_bind_text (offer_id)}, 2, txerr))
+    return -1;
+  ctx->toll_refused_sector_id = accept ? 0 : destination;
+  ctx->toll_paid_sector_id = accept ? destination : 0;
+  return 0;
+}
+
 int
 cmd_move_warp (client_ctx_t *ctx, json_t *root)
 {
@@ -1371,11 +1686,88 @@ cmd_move_warp (client_ctx_t *ctx, json_t *root)
     {
       return -1;
     }
+  db_res_t *res = NULL;
+  db_error_t err = {0};
   json_t *data = json_object_get (root, "data");
   int to = 0;
   if (!json_get_int_flexible (data, "to_sector_id", &to))
     {
       json_get_int_flexible (data, "sector_id", &to);
+    }
+
+  /* A completed toll movement may be retried after the player's location has
+   * already changed, so resolve its receipt before checking adjacency. */
+  json_t *toll_offer_value = json_object_get (data, "toll_offer_id");
+  json_t *request_id_value = json_object_get (root, "id");
+  const char *movement_request_id = json_is_string (request_id_value)
+    ? json_string_value (request_id_value) : NULL;
+  if (json_is_string (toll_offer_value) || movement_request_id)
+    {
+      const char *lookup = json_is_string (toll_offer_value)
+        ? "SELECT player_id,to_sector_id,state,expires_at FROM toll_passage_offers WHERE offer_id={1}"
+        : "SELECT player_id,to_sector_id,state,expires_at FROM toll_passage_offers WHERE player_id={1} AND request_id={2} AND to_sector_id={3}";
+      db_bind_t binds[3]; size_t bind_count = 1;
+      if (json_is_string (toll_offer_value))
+        binds[0] = db_bind_text (json_string_value (toll_offer_value));
+      else
+        {
+          binds[0] = db_bind_i32 (ctx->player_id);
+          binds[1] = db_bind_text (movement_request_id);
+          binds[2] = db_bind_i32 (to);
+          bind_count = 3;
+        }
+      if (!db_query (db, lookup, binds, bind_count, &res, &err))
+        {
+          send_response_error (ctx, root, ERR_DB,
+                               "Could not reconcile toll movement request");
+          return 0;
+        }
+      if (db_res_step (res, &err))
+        {
+          int offer_player = db_res_col_i32 (res, 0, &err);
+          int offer_to = db_res_col_i32 (res, 1, &err);
+          const char *state_value = db_res_col_text (res, 2, &err);
+          char state[16] = {0};
+          if (state_value) snprintf (state, sizeof state, "%s", state_value);
+          int64_t expires_at = db_res_col_i64 (res, 3, &err);
+          db_res_finalize (res); res = NULL;
+          if (err.code)
+            {
+              send_response_error (ctx, root, ERR_DB,
+                                   "Could not read toll movement receipt");
+              return 0;
+            }
+          if (offer_player != ctx->player_id || offer_to != to)
+            {
+              send_response_error (ctx, root, ERR_PERMISSION_DENIED,
+                                   "Toll receipt does not match this movement");
+              return 0;
+            }
+          if (strcmp (state, "pending") != 0)
+            {
+              json_t *repeat = json_pack ("{s:i,s:i,s:b}", "sector_id", to,
+                                          "to_sector_id", to,
+                                          "idempotent_retry", 1);
+              send_response_ok_take (ctx, root, "move.result", &repeat);
+              return 0;
+            }
+          if (expires_at <= (int64_t) time (NULL))
+            {
+              send_response_error (ctx, root, ERR_PERMISSION_DENIED,
+                                   "Toll offer has expired; request a new passage");
+              return 0;
+            }
+        }
+      else
+        {
+          db_res_finalize (res); res = NULL;
+          if (err.code)
+            {
+              send_response_error (ctx, root, ERR_DB,
+                                   "Could not read toll movement receipt");
+              return 0;
+            }
+        }
     }
 
   /* Check warp link exists */
@@ -1409,6 +1801,16 @@ cmd_move_warp (client_ctx_t *ctx, json_t *root)
       }
   }
 
+  int toll_offer_rc = move_warp_toll_offer (ctx, root, db, to, false);
+  if (toll_offer_rc > 0)
+    return 0;
+  if (toll_offer_rc < 0)
+    {
+      send_response_error (ctx, root, ERR_DB_TX,
+                           "Could not prepare toll fighter passage");
+      return 0;
+    }
+
   /* Movement and entry hazards are one gameplay mutation.  Keep the outer
    * transaction open so a failed hazard lookup/application cannot leave the
    * player moved (or charged) without its entry outcome. */
@@ -1420,6 +1822,117 @@ cmd_move_warp (client_ctx_t *ctx, json_t *root)
                            "Could not begin warp transaction");
       return 0;
     }
+  if (db_combat_lock_sector_for_entry (db, to) != 0)
+    {
+      db_tx_rollback (db, NULL);
+      send_response_error (ctx, root, ERR_DB_TX,
+                           "Could not serialize destination entry defenses");
+      return 0;
+    }
+
+  json_t *toll_accept_value = json_object_get (data, "toll_accept");
+  if (json_is_string (toll_offer_value))
+    {
+      const char *offer_id = json_string_value (toll_offer_value);
+      if (!json_is_boolean (toll_accept_value))
+        {
+          db_tx_rollback (db, NULL);
+          send_response_error (ctx, root, ERR_INVALID_ARG,
+                               "Toll offer decision must be accept or refuse");
+          return 0;
+        }
+      if (!db_query (db,
+           "SELECT player_id,ship_id,from_sector_id,to_sector_id,owner_player_id,amount,state,expires_at FROM toll_passage_offers WHERE offer_id={1} FOR UPDATE",
+           (db_bind_t[]){db_bind_text (offer_id)}, 1, &res, &txerr))
+        goto toll_movement_failed;
+      if (!db_res_step (res, &txerr))
+        {
+          db_res_finalize (res); res = NULL;
+          db_tx_rollback (db, NULL);
+          send_response_error (ctx, root, ERR_NOT_FOUND,
+                               "Toll offer was not found or has expired");
+          return 0;
+        }
+      int offer_player = db_res_col_i32 (res, 0, &txerr);
+      int offer_ship = db_res_col_i32 (res, 1, &txerr);
+      int offer_from = db_res_col_i32 (res, 2, &txerr);
+      int offer_to = db_res_col_i32 (res, 3, &txerr);
+      (void) db_res_col_i32 (res, 4, &txerr);
+      int64_t amount = db_res_col_i64 (res, 5, &txerr);
+      const char *state_text = db_res_col_text (res, 6, &txerr);
+      char state[16] = {0};
+      if (state_text) snprintf (state, sizeof state, "%s", state_text);
+      int64_t expires_at = db_res_col_i64 (res, 7, &txerr);
+      db_res_finalize (res); res = NULL;
+      if (txerr.code) goto toll_movement_failed;
+      if (offer_player != ctx->player_id)
+        {
+          db_tx_rollback (db, NULL);
+          send_response_error (ctx, root, ERR_PERMISSION_DENIED,
+                               "Toll offer does not match this passage");
+          return 0;
+        }
+      if (strcmp (state, "pending") != 0)
+        {
+          db_tx_rollback (db, NULL);
+          json_t *repeat = json_pack ("{s:i,s:i,s:b}", "sector_id", offer_to,
+                                      "to_sector_id", offer_to,
+                                      "idempotent_retry", 1);
+          send_response_ok_take (ctx, root, "move.result", &repeat);
+          return 0;
+        }
+      if (offer_ship != h_get_active_ship_id (db, ctx->player_id)
+          || offer_from != ctx->sector_id || offer_to != to)
+        {
+          db_tx_rollback (db, NULL);
+          send_response_error (ctx, root, ERR_PERMISSION_DENIED,
+                               "Toll offer does not match this passage");
+          return 0;
+        }
+      if (expires_at <= (int64_t) time (NULL))
+        {
+          db_tx_rollback (db, NULL);
+          send_response_error (ctx, root, ERR_PERMISSION_DENIED,
+                               "Toll offer has expired");
+          return 0;
+        }
+      bool accept_toll = json_is_true (toll_accept_value);
+      if (accept_toll
+          && (h_deduct_player_petty_cash_unlocked (db, ctx->player_id,
+                                                    amount, NULL) != 0))
+        {
+          db_tx_rollback (db, NULL);
+          send_response_refused_steal (ctx, root, ERR_INSUFFICIENT_FUNDS,
+                                       "Not enough credits to pay this toll", NULL);
+          return 0;
+        }
+      if (accept_toll)
+        {
+          if (!db_query (db,
+               "SELECT owner_player_id,amount FROM toll_passage_payees WHERE offer_id={1} ORDER BY owner_player_id",
+               (db_bind_t[]){db_bind_text (offer_id)}, 1, &res, &txerr))
+            goto toll_movement_failed;
+          int payees = 0;
+          while (db_res_step (res, &txerr))
+            {
+              int payee = db_res_col_i32 (res, 0, &txerr);
+              int64_t payee_amount = db_res_col_i64 (res, 1, &txerr);
+              if (txerr.code || h_add_player_petty_cash_unlocked
+                  (db, payee, payee_amount, NULL) != 0)
+                { txerr.code = txerr.code ? txerr.code : 1; break; }
+              payees++;
+            }
+          db_res_finalize (res); res = NULL;
+          if (txerr.code || payees == 0) goto toll_movement_failed;
+        }
+      if (!db_exec (db,
+           "UPDATE toll_passage_offers SET state={1},resolved_at=CURRENT_TIMESTAMP WHERE offer_id={2} AND state='pending'",
+           (db_bind_t[]){db_bind_text (accept_toll ? "accepted" : "refused"),
+                         db_bind_text (offer_id)}, 2, &txerr))
+        goto toll_movement_failed;
+      ctx->toll_refused_sector_id = accept_toll ? 0 : to;
+      ctx->toll_paid_sector_id = accept_toll ? to : 0;
+    }
 
   int previous_sector = ctx->sector_id;
 
@@ -1428,6 +1941,8 @@ cmd_move_warp (client_ctx_t *ctx, json_t *root)
   if (tc != TURN_CONSUME_SUCCESS)
     {
       db_tx_rollback (db, NULL);
+      ctx->toll_refused_sector_id = 0;
+      ctx->toll_paid_sector_id = 0;
       return handle_turn_consumption_error (ctx, tc, "move.warp", root, NULL);
     }
 
@@ -1458,6 +1973,8 @@ cmd_move_warp (client_ctx_t *ctx, json_t *root)
       json_t *hazard_report = NULL;
       int hazard_rc = server_combat_apply_entry_hazards_report
         (db, ctx, to, &hazard_report);
+      ctx->toll_refused_sector_id = 0;
+      ctx->toll_paid_sector_id = 0;
       if (hazard_rc < 0)
         {
           if (hazard_report)
@@ -1519,9 +2036,20 @@ cmd_move_warp (client_ctx_t *ctx, json_t *root)
       db_tx_rollback (db, NULL);
       send_response_error (ctx, root, ERR_DB, "Failed");
       ctx->sector_id = previous_sector;
+      ctx->toll_refused_sector_id = 0;
+      ctx->toll_paid_sector_id = 0;
       return 0;
     }
 
+  return 0;
+
+toll_movement_failed:
+  if (res) db_res_finalize (res);
+  ctx->toll_refused_sector_id = 0;
+  ctx->toll_paid_sector_id = 0;
+  db_tx_rollback (db, &txerr);
+  send_response_error (ctx, root, ERR_DB_TX,
+                       "Toll passage could not be committed");
   return 0;
 }
 
@@ -1621,6 +2149,29 @@ cmd_move_pathfind (client_ctx_t *ctx, json_t *root)
       prev[i] = -1;
     }
 
+  /* Persisted player avoids apply to ordinary route finding as well as the
+   * autopilot planner. A failed read must not silently route through an
+   * avoided sector. */
+  db_res_t *avoid_res = repo_players_get_avoids (db, ctx->player_id, &err);
+  if (!avoid_res)
+    {
+      free (avoid);
+      free (seen);
+      free (known);
+      free (prev);
+      free (queue);
+      send_response_error (ctx, root, ERR_DB,
+                           "Failed to load avoided sectors");
+      return 0;
+    }
+  while (db_res_step (avoid_res, &err))
+    {
+      int avoided_sector = db_res_col_i32 (avoid_res, 0, &err);
+      if (avoided_sector > 0 && avoided_sector <= max_id)
+        avoid[avoided_sector] = 1;
+    }
+  db_res_finalize (avoid_res);
+
   /* Pathfinding must not disclose routes through sectors the player has not
    * discovered. The live sector is known even if an older account lacks a
    * visit row. */
@@ -1647,7 +2198,31 @@ cmd_move_pathfind (client_ctx_t *ctx, json_t *root)
   if (ctx->sector_id > 0 && ctx->sector_id <= max_id)
     known[ctx->sector_id] = 1;
 
-  if (!known[from] || !known[to])
+  /* Direct exits are already visible in sector.info. Treat them as known
+   * endpoints so plotting a route to an adjacent sector works before the
+   * player has physically visited it. */
+  db_res_t *adjacent_res = repo_universe_get_adjacent_sectors
+    (db, ctx->sector_id, &err);
+  if (!adjacent_res)
+    {
+      free (avoid);
+      free (seen);
+      free (known);
+      free (prev);
+      free (queue);
+      send_response_error (ctx, root, ERR_DB,
+                           "Failed to load adjacent sectors");
+      return 0;
+    }
+  while (db_res_step (adjacent_res, &err))
+    {
+      int adjacent_sector = db_res_col_i32 (adjacent_res, 0, &err);
+      if (adjacent_sector > 0 && adjacent_sector <= max_id)
+        known[adjacent_sector] = 1;
+    }
+  db_res_finalize (adjacent_res);
+
+  if (!known[from])
     {
       free (avoid);
       free (seen);
@@ -1752,8 +2327,12 @@ cmd_move_pathfind (client_ctx_t *ctx, json_t *root)
 	  int v = (int) db_res_col_i64 (res, 1, &err);
 
 
-	  if (u > 0 && u <= max_id && v > 0 && v <= max_id)
+      if (u > 0 && u <= max_id && v > 0 && v <= max_id)
 	    {
+              /* Exits from a visited/current sector are already visible to
+               * this player and therefore valid route endpoints. */
+              known[u] = 1;
+              known[v] = 1;
 	      to_v[e] = v;
 	      next[e] = head[u];
 	      head[u] = e++;
@@ -1802,6 +2381,17 @@ cmd_move_pathfind (client_ctx_t *ctx, json_t *root)
   free (to_v);
   free (next);
   free (head);
+
+  if (!known[to])
+    {
+      free (avoid);
+      free (seen);
+      free (known);
+      free (prev);
+      free (queue);
+      send_response_error (ctx, root, ERR_NOT_FOUND, "Path not found");
+      return 0;
+    }
 
   if (!found)
     {
@@ -1872,6 +2462,8 @@ static void
 attach_sector_asset_counts (db_t *db, int sid, json_t *out)
 {
   int ftrs = 0, armid = 0, limpet = 0;
+  json_t *ships_present = json_object_get (out, "ships_present");
+  json_t *celestial_objects = json_object_get (out, "celestial_objects");
   db_res_t *res = NULL;
   db_error_t err;
 
@@ -1901,6 +2493,16 @@ attach_sector_asset_counts (db_t *db, int sid, json_t *out)
       db_res_finalize (res);
     }
   json_t *c = json_object ();
+
+  /* The summary scan already fetched these current-sector rows. Include their
+   * cardinalities in the summary instead of forcing clients to infer missing
+   * counts or issue a second visibility request. */
+  json_object_set_new (c, "ships",
+                       json_integer (json_is_array (ships_present)
+                                     ? json_array_size (ships_present) : 0));
+  json_object_set_new (c, "planets",
+                       json_integer (json_is_array (celestial_objects)
+                                     ? json_array_size (celestial_objects) : 0));
 
 
   json_object_set_new (c, "fighters", json_integer (ftrs));
@@ -2200,6 +2802,7 @@ int
 cmd_move_transwarp (client_ctx_t *ctx, json_t *root)
 {
   db_t *db = game_db_get_handle ();
+  db_res_t *res = NULL;
   if (!db)
     {
       send_response_error (ctx, root, ERR_DB_CLOSED, "No database handle");
@@ -2273,6 +2876,18 @@ cmd_move_transwarp (client_ctx_t *ctx, json_t *root)
       return 0;
     }
 
+  /* Transwarp arrival uses the same durable toll quote as normal warp. The
+   * quote is created before the movement transaction and charges nothing;
+   * fuel, turns, payment/refusal and entry combat settle together below. */
+  int toll_offer_rc = move_warp_toll_offer (ctx, root, db, to_sector_id, true);
+  if (toll_offer_rc > 0) return 0;
+  if (toll_offer_rc < 0)
+    {
+      send_response_error (ctx, root, ERR_DB_TX,
+                           "Could not prepare toll fighter passage");
+      return 0;
+    }
+
   /* Keep turn consumption, relocation and entry hazards in one authoritative
    * transaction. A failed hazard resolution must not strand a moved ship or
    * consume the turn. */
@@ -2282,6 +2897,13 @@ cmd_move_transwarp (client_ctx_t *ctx, json_t *root)
     {
       send_response_error (ctx, root, ERR_DB_TX,
                            "Could not begin transwarp transaction");
+      return 0;
+    }
+  if (db_combat_lock_sector_for_entry (db, to_sector_id) != 0)
+    {
+      db_tx_rollback (db, NULL);
+      send_response_error (ctx, root, ERR_DB_TX,
+                           "Could not serialize destination entry defenses");
       return 0;
     }
   int previous_sector = ctx->sector_id;
@@ -2369,10 +2991,28 @@ cmd_move_transwarp (client_ctx_t *ctx, json_t *root)
       return 0;
     }
 
+  int toll_settle_rc = move_transwarp_toll_settle
+    (ctx, root, db, to_sector_id, &res, &txerr);
+  if (toll_settle_rc != 0)
+    {
+      ctx->toll_refused_sector_id = 0;
+      ctx->toll_paid_sector_id = 0;
+      if (toll_settle_rc < 0)
+        {
+          if (res) db_res_finalize (res);
+          db_tx_rollback (db, &txerr);
+          send_response_error (ctx, root, ERR_DB_TX,
+                               "Toll transwarp could not be committed");
+        }
+      return 0;
+    }
+
   cargo_rc = repo_cargo_consume_locked (db, ship_id, "ORE", fuel_required);
   if (cargo_rc != 0)
     {
       db_tx_rollback (db, NULL);
+      ctx->toll_refused_sector_id = 0;
+      ctx->toll_paid_sector_id = 0;
       send_response_error (ctx, root, ERR_DB,
                            "Could not debit transwarp Fuel Ore.");
       return 0;
@@ -2383,6 +3023,8 @@ cmd_move_transwarp (client_ctx_t *ctx, json_t *root)
   if (tc != TURN_CONSUME_SUCCESS)
     {
       db_tx_rollback (db, NULL);
+      ctx->toll_refused_sector_id = 0;
+      ctx->toll_paid_sector_id = 0;
       return handle_turn_consumption_error (ctx, tc, "move.transwarp", root,
 					    NULL);
     }
@@ -2394,6 +3036,8 @@ cmd_move_transwarp (client_ctx_t *ctx, json_t *root)
                                           to_sector_id) != 0)
     {
       db_tx_rollback (db, NULL);
+      ctx->toll_refused_sector_id = 0;
+      ctx->toll_paid_sector_id = 0;
       send_response_error (ctx, root, ERR_DB,
 			   "Database error during transwarp");
       return 0;
@@ -2405,6 +3049,8 @@ cmd_move_transwarp (client_ctx_t *ctx, json_t *root)
   json_t *hazard_report = NULL;
   int hazard_rc = server_combat_apply_entry_hazards_report
     (db, ctx, to_sector_id, &hazard_report);
+  ctx->toll_refused_sector_id = 0;
+  ctx->toll_paid_sector_id = 0;
   if (hazard_rc < 0)
     {
       if (hazard_report)
@@ -2750,7 +3396,25 @@ fer_init_once (db_t *db)
 {
   if (g_fer_inited)
     {
-      return 1;
+      if (!db)
+	db = g_fer_db;
+      int32_t current_corp_id = 0;
+      int32_t current_player_id = 0;
+      if (db && repo_universe_get_ferengi_corp_info
+	  (db, &current_corp_id, &current_player_id) == 0)
+	{
+	  /* The durable universe may have been restored or re-rigged while this
+	   * process remained alive.  Refresh cached identity from PostgreSQL so a
+	   * stale in-memory initialized flag cannot suppress NPC recovery. */
+	  g_fer_db = db;
+	  g_fer_corp_id = current_corp_id;
+	  g_fer_player_id = current_player_id;
+	  return 1;
+	}
+
+      g_fer_inited = 0;
+      g_fer_corp_id = 0;
+      g_fer_player_id = 0;
     }
   if (!db)
     {
@@ -3120,10 +3784,11 @@ int cmd_ferengi_deal_reject (client_ctx_t *ctx, json_t *root)
 void
 fer_tick (db_t *db, int64_t now_ms)
 {
-  if (!g_fer_inited && !fer_init_once (db)) return;
+  if (!fer_init_once (db)) return;
   if (!db) db = g_fer_db;
   if (!db) return;
-  int64_t now_s = (int64_t) time (NULL);
+  int64_t now_s = now_ms >= INT64_C(1000000000000)
+    ? now_ms / 1000 : (int64_t) time (NULL);
   if (now_ms != 0 && g_fer_last_tick_s && now_s - g_fer_last_tick_s < 900) return;
   g_fer_last_tick_s = now_s;
   if (repo_universe_ensure_ferengi_traders (db, g_fer_corp_id,
@@ -3389,8 +4054,8 @@ iss_init (db_t *db)
 void
 iss_tick (db_t *db, int64_t now_ms)
 {
-  (void) now_ms;
-  int64_t now_s = (int64_t) time (NULL);
+  int64_t now_s = now_ms >= INT64_C(1000000000000)
+    ? now_ms / 1000 : (int64_t) time (NULL);
   if (g_iss_last_patrol_s != 0 && now_s - g_iss_last_patrol_s < 30)
     return;
   if (!g_iss_inited)

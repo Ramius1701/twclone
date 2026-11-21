@@ -15,9 +15,13 @@ RUN autoreconf -fi \
 
 FROM debian:bookworm-slim AS runtime
 ENV DEBIAN_FRONTEND=noninteractive
+# The runtime image is intentionally non-root and /app is read-only. Keep the
+# default server log in a writable, ephemeral location unless deployment config
+# explicitly selects a persistent log path.
+ENV TWCLONE_LOG_PATH=/tmp/twclone.log
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libjansson4 libpq5 libssl3 libreadline8 libargon2-1 libbsd0 \
-    postgresql-client \
+    postgresql-client python3 python3-psycopg python3-jwt python3-cryptography \
  && rm -rf /var/lib/apt/lists/* \
  && groupadd --system --gid 10001 twclone \
  && useradd --system --uid 10001 --gid 10001 --home-dir /nonexistent \
@@ -26,6 +30,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app/bin
 COPY --from=build /src/bin/server /app/bin/server
 COPY --from=build /src/bin/bigbang /app/bin/bigbang
+COPY tools/feedback_github_publisher.py /app/bin/feedback_github_publisher.py
 COPY --from=build /src/sql/pg /app/sql/pg
 COPY docker/bigbang.beta.json /app/bin/bigbang.json
 COPY docker/entrypoint-server.sh /app/entrypoint-server.sh

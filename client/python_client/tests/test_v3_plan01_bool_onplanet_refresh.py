@@ -22,6 +22,7 @@ def test_landing_does_not_open_surface_for_boolean_onplanet_refresh(
         "type": "ship.status",
         "data": {"ship": {"ship_id": 9, "onplanet": True, "hull": 100}},
     })
+    fake_conn.queue("move.describe_sector", {"status": "ok", "type": "sector.info", "data": {"sector_id": 17, "planets": [{"planet_id": 77}]}})
 
     client.land_flow(ctx)
 

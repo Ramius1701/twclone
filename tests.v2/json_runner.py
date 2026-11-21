@@ -6,18 +6,26 @@ import time
 import sys
 import uuid
 import argparse
+import threading
+from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
 
 # Import TWClient - assuming it's available in the same directory or PYTHONPATH
 from twclient import TWClient
 
+_MISSING = object()
+
 class JsonSuiteRunner:
     def __init__(self, host: str, port: int, timeout: int = 25, macros_path: str = "tests.v2/macros.json",
                  use_tls: bool = False, tls_skip_verify: bool = False,
-                 capture_responses: Optional[str] = None):
+                 capture_responses: Optional[str] = None,
+                 client_idle_timeout_ms: int = 8000,
+                 second_server_port: Optional[int] = None):
         self.host = host
         self.port = port
+        self.second_server_port = second_server_port
         self.timeout = timeout
+        self.client_idle_timeout_seconds = max(0.025, client_idle_timeout_ms / 1000.0)
         self.default_use_tls = use_tls
         self.default_tls_skip_verify = tls_skip_verify
         self.use_tls = use_tls
@@ -75,7 +83,7 @@ class JsonSuiteRunner:
         for test in tests:
             if "setup" in test:
                 macro_name = test["setup"]
-                if macro_name in self.macros:
+                if isinstance(macro_name, str) and macro_name in self.macros:
                     context = test.copy()
                     del context["setup"]
                     
@@ -99,6 +107,16 @@ class JsonSuiteRunner:
                             last_step["save"].update(test["save"])
                     
                     expanded_tests.extend(expanded_macro_steps)
+                elif macro_name == []:
+                    # Some historical transport suites used an empty setup
+                    # array to mean "no setup". Do not use that list as a
+                    # dictionary key (and do not silently treat its request
+                    # DSL as a passing command; run_suite validates that next).
+                    normalized = dict(test)
+                    normalized.pop("setup", None)
+                    expanded_tests.append(normalized)
+                else:
+                    expanded_tests.append(test)
             else:
                 expanded_tests.append(test)
         return expanded_tests
@@ -199,16 +217,24 @@ class JsonSuiteRunner:
             f"UPDATE players SET {match.group('set').strip()} WHERE {predicate};"
         )
 
-    def _get_user_client(self, username: str) -> TWClient:
+    def _get_user_client(self, username: str, reauthenticate: bool = True) -> TWClient:
         client = self.user_clients.get(username)
-        if client is None or client.sock is None:
+        if client is None or not client.is_connected(self.client_idle_timeout_seconds):
+            previous_token = client.session_token if client is not None else None
+            if client is not None:
+                client.close()
             client = TWClient(self.host, self.port, timeout=self.timeout,
                             use_tls=self.use_tls, tls_skip_verify=self.tls_skip_verify)
             client.connect()
             credentials = self.user_credentials.get(username)
-            if credentials and not client.login(*credentials):
+            if reauthenticate and credentials and not client.login(*credentials):
                 client.close()
                 raise ConnectionError(f"could not re-authenticate JSON test user {username}")
+            if not reauthenticate and previous_token:
+                # Some acceptance cases must prove that a revoked token fails
+                # on a fresh transport. Preserve that token without silently
+                # converting the check into a successful credential login.
+                client.session_token = previous_token
             self.user_clients[username] = client
         return self.user_clients[username]
 
@@ -236,6 +262,10 @@ class JsonSuiteRunner:
                 pass
 
     def _get_admin_client(self) -> TWClient:
+        if (self._admin_client is not None
+                and not self._admin_client.is_connected(self.client_idle_timeout_seconds)):
+            self._admin_client.close()
+            self._admin_client = None
         if not self._admin_client:
             self._admin_client = TWClient(self.host, self.port, timeout=self.timeout,
                                         use_tls=self.use_tls, tls_skip_verify=self.tls_skip_verify)
@@ -266,6 +296,23 @@ class JsonSuiteRunner:
             return False
         with open(suite_path, "r") as f:
             data = json.load(f)
+
+        legacy_request_tests = [
+            test for test in data.get("tests", [])
+            if isinstance(test, dict)
+            and ("request" in test or "requests" in test)
+            and "command" not in test
+        ]
+        if legacy_request_tests:
+            self.last_suite_report = {
+                "suite": suite_path,
+                "status": "blocked",
+                "reason": "legacy request/sequence test DSL is not normalized to JSON-RPC cases",
+                "cases": [],
+                "total_cases": len(legacy_request_tests),
+            }
+            print("Suite requires legacy request DSL normalization")
+            return False
         
         # Transport configuration is scoped to this suite.  A TLS suite must
         # never leave subsequent plaintext suites using TLS (or vice versa).
@@ -391,8 +438,125 @@ class JsonSuiteRunner:
                     self._current_failure_reason = f"database fixture statement rejected: {response}"
                     return False
             print("PASS (database fixture)")
+            # A fixture is setup for this case, not the case itself.  Continue
+            # so the command, response assertions and save mappings on the
+            # same test object are executed as authored.
+
+        # Run independent requests from separate TCP connections at the same
+        # barrier.  This is used for server/database concurrency acceptance;
+        # normal JSON cases remain sequential and retain their existing shape.
+        parallel_requests = test.get("parallel_requests")
+        if parallel_requests is not None:
+            if not isinstance(parallel_requests, list) or len(parallel_requests) < 2:
+                print("FAIL (parallel_requests must contain at least two requests)")
+                self._current_failure_reason = "parallel_requests must contain at least two requests"
+                return False
+            clients = []
+            for request in parallel_requests:
+                if not isinstance(request, dict) or not isinstance(request.get("command"), str):
+                    print("FAIL (each parallel request requires a command)")
+                    self._current_failure_reason = "invalid parallel request"
+                    return False
+                user = request.get("user")
+                if user == "admin":
+                    session = self._get_admin_client().session_token
+                elif user:
+                    session = self._get_user_client(user).session_token
+                else:
+                    session = None
+                client = TWClient(
+                    request.get("host", self.host),
+                    int(request.get(
+                        "port",
+                        self.second_server_port
+                        if request.get("server") == "second" and self.second_server_port
+                        else self.port,
+                    )),
+                    timeout=int(request.get("timeout", self.timeout)),
+                    use_tls=self.use_tls, tls_skip_verify=self.tls_skip_verify,
+                )
+                client.session_token = session
+                clients.append((client, request))
+
+            barrier = threading.Barrier(len(clients))
+            responses = [None] * len(clients)
+            errors = [None] * len(clients)
+
+            def execute_parallel(index, client, request):
+                try:
+                    client.connect()
+                    request_timeout = int(request.get("timeout", self.timeout))
+                    barrier.wait(timeout=request_timeout)
+                    delay_ms = int(request.get("delay_before_send_ms", 0))
+                    if delay_ms > 0:
+                        client.close()
+                        time.sleep(delay_ms / 1000.0)
+                        client.connect()
+                    command = {"command": request["command"]}
+                    if isinstance(request.get("request_id"), str):
+                        command["id"] = request["request_id"]
+                    if "data" in request:
+                        command["data"] = request["data"]
+                    client.send_json(command)
+                    responses[index] = client.recv_next_non_notice()
+                except Exception as error:
+                    errors[index] = f"{type(error).__name__}: {error}"
+                finally:
+                    client.close()
+
+            threads = [
+                threading.Thread(target=execute_parallel,
+                                 args=(index, client, request), daemon=True)
+                for index, (client, request) in enumerate(clients)
+            ]
+            for thread in threads:
+                thread.start()
+            join_timeout = max(
+                int(request.get("timeout", self.timeout))
+                for _, request in clients
+            ) + 2
+            for thread in threads:
+                thread.join(join_timeout)
+            if any(thread.is_alive() for thread in threads):
+                errors = [error or "concurrent request thread did not finish"
+                          for error in errors]
+            expected_each = test.get("expect_each", {"status": "ok"})
+            statuses_ok = all(
+                isinstance(response, dict)
+                and response.get("status") == expected_each.get("status", "ok")
+                and ("error_code" not in expected_each
+                     or (response.get("error") or {}).get("code")
+                     == expected_each["error_code"])
+                for response in responses
+            )
+            for response in responses:
+                for assertion in expected_each.get("asserts", []):
+                    actual, found = self._resolve_assertion_path(
+                        response, assertion["path"]
+                    )
+                    expected = self._expand_vars(assertion.get("value"))
+                    passed, detail = self._evaluate_assertion(
+                        assertion["op"], actual, expected, found
+                    )
+                    if not passed:
+                        statuses_ok = False
+                        errors.append(
+                            f"assertion failed at {assertion['path']}: {detail}"
+                        )
+            self._current_response = {
+                "id": "test-concurrent",
+                "status": "ok" if statuses_ok and not any(errors) else "error",
+                "type": "test.concurrent_requests",
+                "data": {"responses": responses, "errors": errors},
+            }
+            self._capture_response(name, "parallel_requests", self._current_response)
+            if not statuses_ok or any(errors):
+                print("FAIL (one or more concurrent requests failed)")
+                self._current_failure_reason = str(errors)
+                return False
+            print(f"PASS ({len(responses)} concurrent requests)")
             return True
-        
+
         if "command" not in test:
             if "comment" in test:
                 pass # Just a documentation step
@@ -408,13 +572,17 @@ class JsonSuiteRunner:
         if user == "admin":
             client = self._get_admin_client()
         elif user:
-            client = self._get_user_client(user)
+            client = self._get_user_client(
+                user, reauthenticate=not test.get("reuse_session_token", False)
+            )
         else:
             client = TWClient(self.host, self.port, timeout=self.timeout,
                             use_tls=self.use_tls, tls_skip_verify=self.tls_skip_verify)
             client.connect()
 
         cmd_json = {}
+        if isinstance(test.get("request_id"), str):
+            cmd_json["id"] = test["request_id"]
         if "command" in test:
             cmd_json["command"] = test["command"]
             if "data" in test:
@@ -529,8 +697,9 @@ class JsonSuiteRunner:
         # Custom assertions
         if "asserts" in test:
             for assertion in test["asserts"]:
-                actual = self._get_path(resp, assertion["path"])
-                expected = assertion.get("value")
+                path = assertion["path"]
+                actual, found = self._resolve_assertion_path(resp, path)
+                expected = self._expand_vars(assertion.get("value"))
                 if isinstance(expected, dict) and "sql_int" in expected:
                     sql = self._expand_vars(expected["sql_int"])
                     admin = self._get_admin_client()
@@ -538,50 +707,17 @@ class JsonSuiteRunner:
                     sql_resp = admin.recv_next_non_notice()
                     if sql_resp.get("status") == "ok" and sql_resp["data"]["rows"]:
                         expected = sql_resp["data"]["rows"][0][0]
-                
+
                 op = assertion["op"]
-                if op == "==":
-                    if actual != expected:
-                        print(f"FAIL (Assert: {actual} != {expected})")
-                        self._current_failure_reason = (
-                            f"assertion failed at {assertion['path']}: expected {expected!r}, got {actual!r}"
-                        )
-                        return False
-                elif op == "is_string_array":
-                    if not isinstance(actual, list) or any(
-                            not isinstance(item, str) for item in actual):
-                        print(f"FAIL (Assert: {actual} is not an array of strings)")
-                        self._current_failure_reason = (
-                            f"assertion failed at {assertion['path']}: expected an array of strings, got {actual!r}"
-                        )
-                        return False
-                elif op == "keys_eq":
-                    if not isinstance(actual, dict) or set(actual) != set(expected):
-                        print(f"FAIL (Assert: {actual} keys do not equal {expected})")
-                        self._current_failure_reason = (
-                            f"assertion failed at {assertion['path']}: expected keys {expected!r}, got {actual!r}"
-                        )
-                        return False
-                elif op == "contains":
-                    if isinstance(actual, list):
-                        found = False
-                        for item in actual:
-                            if expected == item or str(expected) in str(item):
-                                found = True
-                                break
-                        if not found:
-                            print(f"FAIL (Assert: {actual} does not contain {expected})")
-                            self._current_failure_reason = (
-                                f"assertion failed at {assertion['path']}: {actual!r} does not contain {expected!r}"
-                            )
-                            return False
-                    else:
-                        if str(expected) not in str(actual):
-                            print(f"FAIL (Assert: {actual} does not contain {expected})")
-                            self._current_failure_reason = (
-                                f"assertion failed at {assertion['path']}: {actual!r} does not contain {expected!r}"
-                            )
-                            return False
+                passed, detail = self._evaluate_assertion(op, actual, expected, found)
+                if not passed:
+                    msg = assertion.get("msg") or detail
+                    print(f"FAIL (Assert {op} at {path}: {msg})")
+                    self._current_failure_reason = f"assertion failed at {path}: {detail}"
+                    if xfail:
+                        print("XFAIL")
+                        return True
+                    return False
 
         if xfail:
             print("XPASS (unexpected pass)")
@@ -591,34 +727,151 @@ class JsonSuiteRunner:
         if user is None: client.close()
         return True
 
+    def _resolve_assertion_path(self, response: Any, path: str):
+        """Resolve a response or saved-variable path, preserving absent/null."""
+        if path in self.vars:
+            return self.vars[path], True
+        for name in sorted(self.vars, key=len, reverse=True):
+            if path.startswith(name + "."):
+                return self._get_path_raw(self.vars[name], path[len(name) + 1:])
+        return self._get_path_raw(response, path)
+
     def _get_path(self, obj: Any, path: str) -> Any:
-        if not path: return obj
+        value, found = self._get_path_raw(obj, path)
+        return value if found else None
+
+    @staticmethod
+    def _get_path_raw(obj: Any, path: str):
+        if not path:
+            return obj, True
         parts = re.split(r'\.(?![^\[]*\])', path)
         curr = obj
-        for p in parts:
-            if isinstance(curr, dict):
-                curr = curr.get(p)
-            elif isinstance(curr, list):
-                if p.isdigit():
-                    idx = int(p)
-                    curr = curr[idx] if idx < len(curr) else None
-                elif p.startswith("*[") and p.endswith("]"):
-                    inner = p[2:-1]
-                    if "=" in inner:
-                        fk, fv = inner.split("=", 1)
-                        found = None
-                        for item in curr:
-                            if isinstance(item, dict) and str(item.get(fk)) == fv:
-                                found = item
-                                break
-                        curr = found
-                    else:
-                        return None
+        for part in parts:
+            if part.startswith("*[") and part.endswith("]"):
+                if not isinstance(curr, list) or "=" not in part[2:-1]:
+                    return None, False
+                key, expected = part[2:-1].split("=", 1)
+                curr = next((item for item in curr
+                             if isinstance(item, dict) and str(item.get(key)) == expected),
+                            _MISSING)
+                if curr is _MISSING:
+                    return None, False
+                continue
+            base, bracket, suffix = part.partition("[")
+            if base:
+                if isinstance(curr, dict) and base in curr:
+                    curr = curr[base]
+                elif isinstance(curr, list) and base.isdigit() and int(base) < len(curr):
+                    curr = curr[int(base)]
                 else:
-                    return None
-            else:
+                    return None, False
+            rest = ("[" + suffix) if bracket else ""
+            while rest:
+                match = re.match(r"^\[([^\]]+)\](.*)$", rest)
+                if not match:
+                    return None, False
+                token, rest = match.groups()
+                if not isinstance(curr, list):
+                    return None, False
+                if token.isdigit():
+                    index = int(token)
+                    if index >= len(curr):
+                        return None, False
+                    curr = curr[index]
+                elif token.startswith("?(") and token.endswith(")"):
+                    condition = re.fullmatch(
+                        r"\?\(@\.([A-Za-z0-9_]+)\s*==\s*'([^']*)'\)", token
+                    )
+                    if not condition:
+                        return None, False
+                    key, expected = condition.groups()
+                    curr = [item for item in curr
+                            if isinstance(item, dict) and str(item.get(key)) == expected]
+                elif token.startswith("*") and "=" in token:
+                    key, expected = token[1:].split("=", 1)
+                    curr = next((item for item in curr
+                                 if isinstance(item, dict) and str(item.get(key)) == expected),
+                                _MISSING)
+                    if curr is _MISSING:
+                        return None, False
+                else:
+                    return None, False
+        return curr, True
+
+    @staticmethod
+    def _numeric(value):
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float, Decimal)):
+            return Decimal(str(value))
+        if isinstance(value, str):
+            try:
+                return Decimal(value)
+            except InvalidOperation:
                 return None
-        return curr
+        return None
+
+    @classmethod
+    def _evaluate_assertion(cls, op, actual, expected, found):
+        if op == "exists":
+            passed = found
+        elif op == "not_exists":
+            passed = not found
+        elif not found:
+            return False, "path is missing from the response and saved variables"
+        elif op in ("==", "equals"):
+            left, right = cls._numeric(actual), cls._numeric(expected)
+            passed = left == right if left is not None and right is not None else actual == expected
+        elif op in (">", ">=", "<", "<=", "greater_than"):
+            left, right = cls._numeric(actual), cls._numeric(expected)
+            if left is None or right is None:
+                passed = False
+            else:
+                operator = ">" if op == "greater_than" else op
+                passed = {">": left > right, ">=": left >= right,
+                          "<": left < right, "<=": left <= right}[operator]
+        elif op == "contains":
+            if isinstance(actual, list):
+                passed = any(expected == item or str(expected) in str(item) for item in actual)
+            elif isinstance(actual, (tuple, dict, str)):
+                passed = expected in actual
+            else:
+                passed = False
+        elif op == "not_contains":
+            if isinstance(actual, list):
+                passed = not any(expected == item or str(expected) in str(item) for item in actual)
+            elif isinstance(actual, (tuple, dict, str)):
+                passed = expected not in actual
+            else:
+                passed = False
+        elif op == "keys_eq":
+            passed = isinstance(actual, dict) and set(actual) == set(expected)
+        elif op == "is_string_array":
+            passed = isinstance(actual, list) and all(isinstance(item, str) for item in actual)
+        elif op == "is_array":
+            passed = isinstance(actual, list)
+        elif op == "is_empty":
+            passed = isinstance(actual, (list, dict, str)) and len(actual) == 0
+        elif op == "unique_by":
+            passed = (isinstance(actual, list) and isinstance(expected, str)
+                      and all(isinstance(item, dict) and expected in item
+                              for item in actual)
+                      and len({item[expected] for item in actual}) == len(actual))
+        elif op == "sorted_by":
+            values = ([item.get(expected) for item in actual]
+                      if isinstance(actual, list) and isinstance(expected, str)
+                      and all(isinstance(item, dict) for item in actual) else None)
+            passed = values is not None and all(
+                left <= right for left, right in zip(values, values[1:])
+            )
+        elif op == "len_gt":
+            count = cls._numeric(len(actual)) if isinstance(actual, (list, dict, str)) else None
+            right = cls._numeric(expected)
+            passed = count is not None and right is not None and count > right
+        else:
+            return False, f"unsupported assertion operator {op!r}"
+        return passed, ("passed" if passed else
+                        f"actual value {actual!r} did not satisfy {op} {expected!r}")
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Run one JSON RPC integration suite")
@@ -635,11 +888,18 @@ def main(argv=None):
         help="Game server port (default: TWCLONE_TEST_PORT or 1234)",
     )
     parser.add_argument("--timeout", type=int, default=25)
+    parser.add_argument("--second-server-port", type=int,
+                        help="Optional second loopback game-server port for concurrent acceptance")
     parser.add_argument("--capture-responses", help="Append redacted RPC responses as JSONL")
     args = parser.parse_args(argv)
 
-    runner = JsonSuiteRunner(args.host, args.port, timeout=args.timeout,
-                             capture_responses=args.capture_responses)
+    runner_options = {
+        "timeout": args.timeout,
+        "capture_responses": args.capture_responses,
+    }
+    if args.second_server_port is not None:
+        runner_options["second_server_port"] = args.second_server_port
+    runner = JsonSuiteRunner(args.host, args.port, **runner_options)
     return 0 if runner.run_suite(args.suite) else 1
 
 

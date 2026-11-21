@@ -26,6 +26,7 @@
 #include "server_log.h"		// Explicitly include server_log.h
 #include "sysop_interaction.h"	// Explicitly include sysop_interaction.h
 #include "server_cron.h"
+#include "server_stardock.h"
 #include "globals.h"
 #include "repo_cmd.h"
 #include "db/repo/repo_engine.h"
@@ -382,6 +383,15 @@ main (void)
       return EXIT_FAILURE;
     }
 
+  /* Tavern handlers run in this process. Load their DB-backed limits here;
+     loading them only in the scheduler child leaves every live command with
+     zero-initialized limits and disabled services. */
+  if (tavern_settings_load () != 0)
+    {
+      LOGE ("Failed to load tavern settings for player command handling.");
+      return EXIT_FAILURE;
+    }
+
 
   if (needs_bigbang ())
     {
@@ -546,12 +556,17 @@ main (void)
      - request engine shutdown & reap
    */
   g_s2s_run = 0;
+  /* The control thread borrows g_s2s_conn until it exits.  Closing and
+   * freeing it here races its next s2s_recv_env() (especially when the
+   * public listener failed to bind and server_loop returned immediately).
+   * Shutdown the socket to unblock recv, join the borrower, then free it. */
+  s2s_shutdown (g_s2s_conn);
+  pthread_join (g_s2s_thr, NULL);
   if (g_s2s_conn)
     {
       s2s_close (g_s2s_conn);
       g_s2s_conn = NULL;
-    }				// unblocks thread
-  pthread_join (g_s2s_thr, NULL);
+    }
   if (s2s_listen_fd >= 0)
     {
       close (s2s_listen_fd);

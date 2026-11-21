@@ -87,6 +87,13 @@ def main():
     if args.reset:
         print("Resetting test data...")
         execute_sql("ALTER TABLE corp_members DISABLE TRIGGER corp_one_leader_guard;", **db_config)
+        # Test rigs reuse fixed ship IDs. Clear their destruction idempotency
+        # ledger so a reset can replay ship-loss scenarios deterministically.
+        execute_sql("DELETE FROM engine_events WHERE idem_key LIKE 'ship-destruction-%';", **db_config)
+        # Planet IDs are deliberately reused by isolated gameplay suites. The
+        # Exchange transaction ledger has no planet FK so historical rows from
+        # an earlier disposable rig would be counted as duplicate sales.
+        execute_sql("DELETE FROM galactic_exchange_transactions;", **db_config)
         execute_sql("TRUNCATE sessions, corp_members, citadels, planets, ships, ship_ownership, bank_accounts, turns, players, corporations, sector_assets, entity_stock CASCADE;", **db_config)
         # The world (and its ports) survives this player-fixture reset. Rebuild
         # the port settlement accounts that BigBang created before the reset;
@@ -114,6 +121,10 @@ def main():
     # 3. Ports
     if "ports" in rig and not args.skip_ports:
         print("Rigging Ports...")
+        # The fixture moves fixed port IDs between sectors. Temporarily
+        # deactivate ports already occupying fixture sectors so the active
+        # port-per-sector constraint is satisfied during each upsert.
+        execute_sql("UPDATE ports SET is_active = FALSE WHERE port_id IN (1, 2, 9) OR sector_id IN (1, 2, 3);", **db_config)
         for p in rig["ports"]:
             sql = f"""
             INSERT INTO ports (port_id, sector_id, type, name) 
@@ -121,7 +132,8 @@ def main():
             ON CONFLICT (port_id) DO UPDATE SET 
                 sector_id = {p['sector_id']}, 
                 type = {p['type']}, 
-                name = '{p['name']}';
+                name = '{p['name']}',
+                is_active = TRUE;
             """
             execute_sql(sql, **db_config)
 
@@ -131,8 +143,31 @@ def main():
                 # omit the column so this fixture follows the schema default
                 # rather than forcing a boolean literal into a legacy numeric
                 # enabled column when running against an existing QA schema.
-                sql = f"INSERT INTO taverns (sector_id, name_id) VALUES ({p['sector_id']}, 3) ON CONFLICT (sector_id) DO NOTHING;"
+                tavern_sector = p.get("tavern_sector_id", p["sector_id"])
+                sql = f"INSERT INTO taverns (sector_id, name_id) VALUES ({tavern_sector}, 3) ON CONFLICT (sector_id) DO NOTHING;"
                 execute_sql(sql, **db_config)
+
+    if args.reset:
+        # Player resets truncate entity_stock even though the generated world
+        # and its port_commodity_state rows survive. Reconcile the commodity
+        # inventory from that authoritative market snapshot so port.info and
+        # trading use the same stock the market system tracks. Only restore
+        # commodities enabled for the port (or illegal goods at a black market).
+        execute_sql("""
+            INSERT INTO entity_stock (entity_type, entity_id, commodity_code, quantity, price)
+            SELECT 'port', p.port_id, c.code,
+                   GREATEST(0, COALESCE(pcs.stock_level, 0)), c.base_price
+              FROM ports p
+              JOIN commodities c ON TRUE
+              LEFT JOIN port_commodity_state pcs
+                ON pcs.port_id = p.port_id AND pcs.commodity_code = c.code
+             WHERE EXISTS (
+                       SELECT 1 FROM port_trade pt
+                        WHERE pt.port_id = p.port_id AND pt.commodity = c.code
+                   )
+                OR (p.type = 10 AND c.illegal = TRUE)
+            ON CONFLICT (entity_type, entity_id, commodity_code) DO NOTHING;
+        """, **db_config)
 
     # 4. Users
     if "users" in rig:
@@ -252,6 +287,14 @@ def main():
                     """
                     execute_sql(sql, **db_config)
 
+                    for cargo in s.get("cargo", []):
+                        commodity_code = cargo["commodity_code"].replace("'", "''")
+                        quantity = max(0, int(cargo["quantity"]))
+                        execute_sql(
+                            f"INSERT INTO ship_cargo (ship_id, commodity_code, quantity) VALUES ({s['ship_id']}, '{commodity_code}', {quantity}) ON CONFLICT (ship_id, commodity_code) DO UPDATE SET quantity = EXCLUDED.quantity;",
+                            **db_config,
+                        )
+
                     # The V3 active-owner invariant requires the ownership row
                     # to exist before players.ship_id is changed.  Keeping
                     # these as two statements preserves the fixture's existing
@@ -266,9 +309,10 @@ def main():
         for p in rig["planets"]:
             owner_id = get_player_id(p["owner_username"], **db_config)
             if owner_id:
+                planet_type_id = f"(SELECT planettypes_id FROM planettypes WHERE code = '{p['class']}')"
                 sql = f"""
-                INSERT INTO planets (planet_id, num, sector_id, name, owner_id, owner_type, class, created_by)
-                VALUES ({p['planet_id']}, {p['num']}, {p['sector_id']}, '{p['name']}', {owner_id}, 'player', '{p['class']}', {owner_id})
+                INSERT INTO planets (planet_id, num, sector_id, name, owner_id, owner_type, class, type, created_by)
+                VALUES ({p['planet_id']}, {p['num']}, {p['sector_id']}, '{p['name']}', {owner_id}, 'player', '{p['class']}', {planet_type_id}, {owner_id})
                 ON CONFLICT (planet_id) DO UPDATE SET
                     num = EXCLUDED.num,
                     sector_id = EXCLUDED.sector_id,
@@ -276,10 +320,38 @@ def main():
                     owner_id = EXCLUDED.owner_id,
                     owner_type = EXCLUDED.owner_type,
                     class = EXCLUDED.class,
+                    type = EXCLUDED.type,
                     created_by = EXCLUDED.created_by;
                 """
                 execute_sql(sql, **db_config)
                 print(f"DEBUG: Planet {p['planet_id']} inserted/updated successfully.")
+
+                goods = p.get("goods", {})
+                if goods:
+                    # Explicit stocked fixture planets may predate the
+                    # planet_goods rows installed by migration 108. Recreate
+                    # their caps from the canonical planet type so the
+                    # production/harvest repository can address its stock.
+                    execute_sql(f"""
+                        INSERT INTO planet_goods (planet_id, commodity, quantity, max_capacity, production_rate)
+                        SELECT pl.planet_id, caps.commodity, 0, caps.max_capacity, 0
+                          FROM planets pl
+                          JOIN planettypes pt ON pt.planettypes_id = pl.type
+                          CROSS JOIN LATERAL (VALUES
+                            ('ORE', pt.maxore), ('ORG', pt.maxorganics), ('EQU', pt.maxequipment)
+                          ) AS caps(commodity, max_capacity)
+                         WHERE pl.planet_id = {p['planet_id']}
+                        ON CONFLICT (planet_id, commodity) DO UPDATE
+                           SET max_capacity = EXCLUDED.max_capacity;
+                    """, **db_config)
+
+                for commodity_code, quantity in goods.items():
+                    safe_code = str(commodity_code).replace("'", "''")
+                    safe_quantity = max(0, int(quantity))
+                    execute_sql(
+                        f"INSERT INTO entity_stock (entity_type, entity_id, commodity_code, quantity, price) VALUES ('planet', {p['planet_id']}, '{safe_code}', {safe_quantity}, 0) ON CONFLICT (entity_type, entity_id, commodity_code) DO UPDATE SET quantity = EXCLUDED.quantity;",
+                        **db_config,
+                    )
                 
                 if "citadel" in p:
                     c = p["citadel"]
@@ -318,6 +390,43 @@ def main():
             if owner_id:
                 sql = f"INSERT INTO player_prefs (player_prefs_id, key, type, value) VALUES ({owner_id}, '{p['key']}', '{p['type']}', '{p['value']}') ON CONFLICT (player_prefs_id, key) DO UPDATE SET value = '{p['value']}';"
                 execute_sql(sql, **db_config)
+
+    # Fixtures deliberately use stable explicit IDs for reproducible ship
+    # references. PostgreSQL sequences do not advance for those inserts, so
+    # reconcile every owned sequence before ordinary auth.register requests.
+    execute_sql("""
+    DO $$
+    DECLARE
+      r RECORD;
+      seq_name TEXT;
+      max_value BIGINT;
+      has_rows BOOLEAN;
+    BEGIN
+      FOR r IN
+        SELECT table_ns.nspname AS table_schema,
+               table_rel.relname AS table_name,
+               attr.attname AS column_name
+          FROM pg_class AS seq_rel
+          JOIN pg_depend AS dep ON dep.objid = seq_rel.oid
+          JOIN pg_class AS table_rel ON table_rel.oid = dep.refobjid
+          JOIN pg_namespace AS table_ns ON table_ns.oid = table_rel.relnamespace
+          JOIN pg_attribute AS attr ON attr.attrelid = table_rel.oid
+                                   AND attr.attnum = dep.refobjsubid
+         WHERE seq_rel.relkind = 'S'
+           AND dep.deptype IN ('a', 'i')
+           AND table_ns.nspname = current_schema()
+      LOOP
+        seq_name := pg_get_serial_sequence(
+          format('%I.%I', r.table_schema, r.table_name), r.column_name);
+        EXECUTE format('SELECT max(%I), count(*) > 0 FROM %I.%I',
+                       r.column_name, r.table_schema, r.table_name)
+          INTO max_value, has_rows;
+        IF seq_name IS NOT NULL THEN
+          PERFORM setval(seq_name::regclass, COALESCE(max_value, 1), has_rows);
+        END IF;
+      END LOOP;
+    END $$;
+    """, **db_config)
 
     print("Rigging Complete.")
     execute_sql("ALTER TABLE corp_members ENABLE TRIGGER corp_one_leader_guard;", **db_config)

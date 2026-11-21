@@ -92,7 +92,6 @@ var _note_input: LineEdit
 var _note_status: Label
 var _note_content: VBoxContainer
 var _note_toggle: Button
-var primary_tabs: TabBar
 var workspace_buttons: Array[Button] = []
 var workspace_status: Label
 var _holographic_scan_buttons: Array[Button] = []
@@ -106,7 +105,12 @@ func _ready() -> void:
 	_render_snapshot(_snapshot)
 	resized.connect(_on_gameplay_resized)
 	_update_responsive_layout()
-	call_deferred("_move_port_workflow_to_window_overlay")
+
+func _exit_tree() -> void:
+	# In a standalone GameplayView test the trade surface is attached to the
+	# Window root as a sibling; release it when the view goes away.
+	if is_instance_valid(port_workflow) and port_workflow.get_parent() != self:
+		port_workflow.queue_free()
 
 func _on_gameplay_resized() -> void:
 	print("[PORT_UI] gameplay_resized size=%s workflow=%s" % [str(size), str(port_workflow) if is_instance_valid(port_workflow) else "invalid"])
@@ -114,24 +118,23 @@ func _on_gameplay_resized() -> void:
 		port_workflow._ui_trace("gameplay_resized gameplay_size=%s workflow_size=%s workflow_parent=%s" % [str(size), str(port_workflow.size), str(port_workflow.get_parent())])
 	_update_responsive_layout()
 
-func _move_port_workflow_to_window_overlay() -> void:
-	if not is_instance_valid(port_workflow):
-		return
-	var window_root := get_parent()
-	if window_root == null or port_workflow.get_parent() == window_root:
-		return
-	remove_child(port_workflow)
-	window_root.add_child(port_workflow)
-	port_workflow.z_index = 1000
-	port_workflow.move_to_front()
-
 func set_snapshot(snapshot: Dictionary) -> void:
 	var previous_sector = _snapshot.get("hud", {}).get("sector_id", null)
 	var next_sector = snapshot.get("hud", {}).get("sector_id", null)
 	if port_workflow != null and port_workflow.visible and previous_sector != null and next_sector != null and int(previous_sector) != int(next_sector):
 		port_workflow.close_for_location_change()
 		command_menu.set_tavern_access(false)
+	if command_menu != null and previous_sector != null and next_sector != null and int(previous_sector) != int(next_sector):
+		command_menu.clear_confirmed_port_context()
+	if command_menu != null and int(snapshot.get("ship", {}).get("ported", 0)) <= 0:
+		command_menu.clear_confirmed_port_context()
 	_snapshot = snapshot.duplicate(true)
+	# The port workflow stays open while a trade command refreshes the player's
+	# ship. Keep its cargo/credit view aligned with the newest authoritative
+	# snapshot so a buy can enable a subsequent sale without closing the panel.
+	if is_instance_valid(port_workflow) and port_workflow.visible:
+		port_workflow.set_player_hold(_snapshot.get("ship", {}),
+			_snapshot.get("hud", {}).get("credits", null))
 	_render_snapshot(_snapshot)
 	_sync_holographic_scan_controls()
 
@@ -347,21 +350,8 @@ func _build() -> void:
 	_apply_button_style(help_button, false)
 	top_row.add_child(help_button)
 
-	primary_tabs = TabBar.new()
-	primary_tabs.custom_minimum_size.y = 42
-	primary_tabs.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	for workspace in WORKSPACES:
-		primary_tabs.add_tab(workspace.capitalize())
-	primary_tabs.tab_changed.connect(_on_workspace_tab_changed)
-	primary_tabs.current_tab = 0
-	primary_tabs.add_theme_font_size_override("font_size", 14)
-	primary_tabs.add_theme_color_override("font_selected_color", Color(0.92, 1.0, 0.98))
-	primary_tabs.add_theme_color_override("font_unselected_color", Color(0.64, 0.76, 0.79))
-	# Keep the native tab state for keyboard/state compatibility. Godot's
-	# dynamically-created TabBar can lose its label rendering when adjacent
-	# panels are hidden, so the visible presentation uses ordinary accessible
-	# buttons bound to the same workspace state.
-	primary_tabs.visible = false
+	# Visible accessible buttons are the single source for workspace selection.
+	# A hidden native TabBar added no UI and leaked theme-created labels at exit.
 	var workspace_row := HBoxContainer.new()
 	workspace_row.custom_minimum_size.y = 42
 	workspace_row.add_theme_constant_override("separation", 4)
@@ -379,6 +369,7 @@ func _build() -> void:
 		workspace_buttons.append(workspace_button)
 	_sync_workspace_buttons()
 	workspace_status = _label("SECTOR WORKSPACE · select an object or scan the current sector", 10, Color(0.48, 0.78, 0.78))
+	workspace_row.add_child(workspace_status)
 	# Context is retained for accessibility/state updates but no longer consumes
 	# a separate row above the flexible viewport.
 	workspace_status.visible = false
@@ -554,9 +545,13 @@ func _build() -> void:
 		command_menu.set_tavern_access(false)
 	)
 	port_workflow.visibility_changed.connect(_on_port_workflow_visibility_changed)
-	# It starts here so its controls receive _ready() normally. It is moved to
-	# the fixed window overlay after GameplayView has finished building.
-	add_child(port_workflow)
+	# Attach the trade surface to the window overlay from the outset. Reparenting
+	# it after _ready() temporarily detaches its controls and popup ownership.
+	var overlay_root := get_parent()
+	if overlay_root != null:
+		overlay_root.add_child.call_deferred(port_workflow)
+	else:
+		add_child(port_workflow)
 	sector_view.set_interaction_enabled(true)
 	planet_workflow = PlanetWorkflowScript.new()
 	planet_workflow.command_requested.connect(func(command: String, data: Dictionary, label: String, mutating: bool) -> void:
@@ -978,7 +973,8 @@ func _render_selection(object: Dictionary) -> void:
 	action_button = null
 	if object.is_empty():
 		var sector: Dictionary = _snapshot.get("sector", {})
-		var sector_id := int(_snapshot.get("hud", {}).get("sector_id", sector.get("sector_id", 0)))
+		var raw_sector_id: Variant = _snapshot.get("hud", {}).get("sector_id", sector.get("sector_id", 0))
+		var sector_id := int(raw_sector_id) if typeof(raw_sector_id) == TYPE_INT else 0
 		var ports: Array = sector.get("ports", []) if sector.get("ports", []) is Array else []
 		var planets: Array = sector.get("planets", []) if sector.get("planets", []) is Array else []
 		var ships: Array = sector.get("ships_present", []) if sector.get("ships_present", []) is Array else []
@@ -1073,6 +1069,7 @@ func _add_object_actions(kind: String, object: Dictionary) -> void:
 			var port_data: Dictionary = object.get("data", {})
 			if _authoritative_object_id(port_data, ["port_id", "id"]) > 0:
 				_add_context_button("DOCK · OPEN PORT", true, _dispatch_context_action.bind({"label": "Dock · open port screen", "command": "port.info", "context_id": "port_id", "fixed": {}} , object))
+				_add_context_button("ATTACK THIS STARPORT", true, _dispatch_context_action.bind({"label": "Attack StarPort", "command": "combat.attack.port", "context_id": "port_id", "mutating": true}, object))
 			else:
 				_add_context_unavailable("DOCK · PORT ID UNAVAILABLE", "The sector response did not include a valid port ID, so the client cannot safely request port.info.")
 		"planet":
@@ -1142,10 +1139,10 @@ func _authoritative_object_id(source: Dictionary, keys: Array) -> int:
 	for key in keys:
 		if not source.has(key):
 			continue
-		# Godot may decode a JSON integer as an integral float. Accept that wire
-		# representation, but never coerce strings, booleans or fractional values.
+		# IDs have to arrive in the normalized integer form; do not coerce
+		# strings, booleans or floats into actionable object identities.
 		var raw: Variant = source[key]
-		var valid: bool = (typeof(raw) == TYPE_INT and int(raw) > 0) or (typeof(raw) == TYPE_FLOAT and is_finite(raw) and raw > 0.0 and raw == floor(raw))
+		var valid: bool = typeof(raw) == TYPE_INT and int(raw) > 0
 		if not valid:
 			# An explicit but malformed identity must not fall through to a
 			# legacy alias that could identify a different object. This includes
@@ -1368,7 +1365,10 @@ func enter_port_workflow(data: Dictionary) -> void:
 		return
 	port_workflow.set_player_hold(_snapshot.get("ship", {}), _snapshot.get("hud", {}).get("credits", null))
 	port_workflow.show_port(data, sector_id)
-	sector_view.set_interaction_enabled(false)
+	if port_workflow.visible:
+		if is_instance_valid(command_menu):
+			command_menu.set_confirmed_port_context(data, sector_id)
+		sector_view.set_interaction_enabled(false)
 
 func _on_port_workflow_visibility_changed() -> void:
 	if is_instance_valid(sector_view) and is_instance_valid(port_workflow):
@@ -1509,7 +1509,7 @@ func _unhandled_key_input(event: InputEvent) -> void:
 	if not (event is InputEventKey) or not event.pressed or event.echo:
 		return
 	if event.alt_pressed and event.keycode >= KEY_1 and event.keycode <= KEY_5:
-		primary_tabs.current_tab = event.keycode - KEY_1
+		_on_workspace_button_pressed(event.keycode - KEY_1)
 		get_viewport().set_input_as_handled()
 		return
 	if command_menu.capture_shortcut(event):
@@ -1573,8 +1573,6 @@ func _unhandled_key_input(event: InputEvent) -> void:
 func _on_workspace_tab_changed(index: int) -> void:
 	if index < 0 or index >= WORKSPACES.size():
 		return
-	if is_instance_valid(primary_tabs) and primary_tabs.current_tab != index:
-		primary_tabs.current_tab = index
 	_active_workspace = WORKSPACES[index]
 	# Computer and Communications open directly into their integrated command
 	# surface. Trading and Navigation use their purpose-built controls and do
@@ -1893,10 +1891,7 @@ func _comm_button(label: String, callback: Callable) -> Button:
 
 
 func _on_workspace_button_pressed(index: int) -> void:
-	if is_instance_valid(primary_tabs):
-		primary_tabs.current_tab = index
-	else:
-		_on_workspace_tab_changed(index)
+	_on_workspace_tab_changed(index)
 
 func _sync_workspace_buttons() -> void:
 	for index in workspace_buttons.size():

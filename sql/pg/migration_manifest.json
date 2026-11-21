@@ -73,7 +73,16 @@
       "171_v3_planet_population_state.sql",
       "172_v3_bank_standing_orders.sql",
       "173_v3_slave_unrest_policy_config.sql"
-      ,"178_ship_sale_equipment_catalogue.sql"
+      ,"178_ship_sale_equipment_catalogue.sql",
+      "182_v3_planet_production_rates.sql",
+      "183_v3_photon_effects.sql",
+      "184_v3_toll_passage.sql",
+      "185_v3_starport_construction.sql",
+      "188_v3_player_feedback_outbox.sql",
+      "190_v3_slave_unrest_production_cycles.sql",
+      "191_ferengi_destruction_rewards.sql",
+      "192_v3_approved_slave_unrest_rules.sql",
+      "193_v3_photon_ship_disablement.sql"
     ],
     "diagnostics": [
       "130_insurance_ledger_invariants.sql",
@@ -734,6 +743,90 @@
     {
       "name": "181_active_starport_sector_uniqueness.sql",
       "subsystem": "ports",
+      "required": true,
+      "v3_only": true,
+      "diagnostic": false
+    },
+    {
+      "name": "182_v3_planet_production_rates.sql",
+      "subsystem": "planets",
+      "required": true,
+      "v3_only": true,
+      "diagnostic": false
+    },
+    {
+      "name": "183_v3_photon_effects.sql",
+      "subsystem": "combat",
+      "required": true,
+      "v3_only": true,
+      "diagnostic": false
+    },
+    {
+      "name": "184_v3_toll_passage.sql",
+      "subsystem": "combat",
+      "required": true,
+      "v3_only": true,
+      "diagnostic": false
+    },
+    {
+      "name": "185_v3_starport_construction.sql",
+      "subsystem": "ports",
+      "required": true,
+      "v3_only": true,
+      "diagnostic": false
+    },
+    {
+      "name": "186_v3_starport_combat.sql",
+      "subsystem": "ports",
+      "required": true,
+      "v3_only": true,
+      "diagnostic": false
+    },
+    {
+      "name": "187_v3_starport_sector_uniqueness.sql",
+      "subsystem": "ports",
+      "required": true,
+      "v3_only": true,
+      "diagnostic": false
+    },
+    {
+      "name": "188_v3_player_feedback_outbox.sql",
+      "subsystem": "player-feedback",
+      "required": true,
+      "v3_only": true,
+      "diagnostic": false
+    },
+    {
+      "name": "189_trade_idempotency_player_scope.sql",
+      "subsystem": "ports",
+      "required": true,
+      "v3_only": false,
+      "diagnostic": false
+    },
+    {
+      "name": "190_v3_slave_unrest_production_cycles.sql",
+      "subsystem": "planets",
+      "required": true,
+      "v3_only": true,
+      "diagnostic": false
+    },
+    {
+      "name": "191_ferengi_destruction_rewards.sql",
+      "subsystem": "combat",
+      "required": true,
+      "v3_only": true,
+      "diagnostic": false
+    },
+    {
+      "name": "192_v3_approved_slave_unrest_rules.sql",
+      "subsystem": "planets",
+      "required": true,
+      "v3_only": true,
+      "diagnostic": false
+    },
+    {
+      "name": "193_v3_photon_ship_disablement.sql",
+      "subsystem": "combat",
       "required": true,
       "v3_only": true,
       "diagnostic": false

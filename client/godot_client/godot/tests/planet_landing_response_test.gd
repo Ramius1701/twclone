@@ -70,6 +70,9 @@ func _run() -> void:
 
 	# Refusal envelopes may contain diagnostic data, but that data cannot grant
 	# landing access or replace the previously confirmed surface context.
+	app._landed_planet_id = 66
+	app._landing_surface_ready = true
+	app.gameplay_view.enter_planet_workflow(66)
 	fake_refresh.calls.clear()
 	await app._finish_command_reply({
 		"status": "refused",
@@ -89,7 +92,7 @@ func _run() -> void:
 
 	fake_refresh.calls.clear()
 	await app._finish_command_reply({
-		"status": "ok", "data": {"planet_id": 88},
+		"status": "ok", "type": "planet.land.success", "data": {"planet_id": 88},
 	}, {
 		"label": "Land on planet", "command": "planet.land",
 		"data": {"planet_id": 77}, "mutating": true,
@@ -102,7 +105,7 @@ func _run() -> void:
 
 	fake_refresh.calls.clear()
 	await app._finish_command_reply({
-		"status": "ok", "data": {"message": "Landed"},
+		"status": "ok", "type": "planet.land.success", "data": {"message": "Landed"},
 	}, {
 		"label": "Land on planet", "command": "planet.land",
 		"data": {"planet_id": 77}, "mutating": true,
@@ -130,7 +133,7 @@ func _run() -> void:
 
 	fake_refresh.calls.clear()
 	await app._finish_command_reply({
-		"status": "ok", "data": {"planet_id": true},
+		"status": "ok", "type": "planet.land.success", "data": {"planet_id": true},
 	}, {
 		"label": "Land on planet", "command": "planet.land",
 		"data": {"planet_id": 1}, "mutating": true,
@@ -143,7 +146,7 @@ func _run() -> void:
 
 	fake_refresh.calls.clear()
 	await app._finish_command_reply({
-		"status": "ok", "data": {"planet_id": 77.0},
+		"status": "ok", "type": "planet.land.success", "data": {"planet_id": 77},
 	}, {
 		"label": "Land on planet", "command": "planet.land",
 		"data": {"planet_id": 77}, "mutating": true,
@@ -151,8 +154,8 @@ func _run() -> void:
 	_check(fake_refresh.calls.size() == 1, "floating-point landing ID did not refresh authoritative state")
 	if fake_refresh.calls.size() == 1:
 		_check(fake_refresh.calls[0] == ["player", "ship", "sector"], "floating-point landing ID refreshed the wrong domains")
-	_check(app._landed_planet_id == 0, "floating-point landing ID was coerced into a real planet ID")
-	_check(app.gameplay_view.notification_label.text.contains("omitted the planet ID"), "floating-point landing ID was not explained")
+	_check(app._landed_planet_id == 77, "integral JSON landing ID was not retained")
+	_check(app._pending_landing_surface_id == 77, "integral JSON landing ID did not await authoritative refresh")
 
 	# A malformed JSON boolean must not be coerced to planet ID 1 by GDScript.
 	fake_refresh.calls.clear()
@@ -167,21 +170,23 @@ func _run() -> void:
 
 	fake_refresh.calls.clear()
 	await app._finish_command_reply({
-		"status": "ok", "data": {"planet_id": 77},
+		"status": "ok", "type": "planet.land.success", "data": {"planet_id": 77},
 	}, {
 		"label": "Land on planet", "command": "planet.land",
 		"data": {"planet_id": 77}, "mutating": true,
 	})
 	_check(fake_refresh.calls.size() == 1, "confirmed landing did not refresh authoritative player and ship state")
 	if fake_refresh.calls.size() == 1:
-		_check(fake_refresh.calls[0] == ["player", "ship"], "confirmed landing refreshed unrelated domains")
+		_check(fake_refresh.calls[0] == ["player", "ship", "sector"], "confirmed landing refreshed unrelated domains")
 	_check(app._landed_planet_id == 77, "confirmed landing did not retain the authoritative planet ID")
 	_check(not app._landing_surface_ready, "landing became surface-ready before the authoritative refresh")
 	_check(not app.gameplay_view.planet_workflow.visible, "planet workflow opened before authoritative refresh completed")
 	_check(app.gameplay_view.notification_label.text.contains("refreshing player and ship"), "confirmed landing refresh state was not presented to the player")
+	app.auth_session.player_id = 42
 	await app._on_refresh_finished({
-		"freshness": {"player": "fresh", "ship": "fresh"},
-		"ship": {"onplanet": 77},
+		"freshness": {"player": "fresh", "ship": "fresh", "sector": "fresh"},
+		"player": {"id": 42, "ship_id": 9, "last_planet_id": 77},
+		"ship": {"id": 9, "onplanet": 1},
 	})
 	_check(app.gameplay_view.planet_workflow.visible, "confirmed landing did not open the planet workflow after refresh")
 	_check(app._landing_surface_ready, "successful landing refresh did not enable surface reads")
@@ -224,7 +229,8 @@ func _run() -> void:
 	fake_refresh.calls.clear()
 	await app._on_refresh_finished({
 		"freshness": {"player": "fresh", "ship": "fresh"},
-		"ship": {"onplanet": 88},
+		"player": {"id": 42, "ship_id": 9, "last_planet_id": 88},
+		"ship": {"id": 9, "onplanet": 1},
 	})
 	_check(not app._landing_surface_ready, "refresh for another planet opened the requested surface")
 	_check(not app.gameplay_view.planet_workflow.visible, "contradictory landed planet ID left surface actions visible")
@@ -307,6 +313,8 @@ func _run() -> void:
 	app._landed_planet_id = 77
 	app._planet_pending_count = 2
 	app._planet_read_refused = false
+	app.refresh_coordinator = fake_refresh
+	app._command_refresh_pending = false
 	fake_refresh.calls.clear()
 	app._pending_game_commands["planet-info-mixed"] = {
 		"kind": "planet_info", "command": "planet.info", "label": "Planet information",
@@ -319,7 +327,7 @@ func _run() -> void:
 		"kind": "planet_colonists", "command": "planet.colonists.get", "label": "Colony information",
 	}
 	await app._on_transport_reply("planet-colonists-mixed", {
-		"status": "ok", "data": {"planet_colonists": 3},
+		"status": "ok", "type": "planet.colonists.get", "data": {"planet_id": 77, "planet_colonists": 3},
 	}, "planet.colonists.get")
 	_check(fake_refresh.calls.size() == 1, "mixed surface read did not reconcile after a companion refusal")
 	if fake_refresh.calls.size() == 1:
@@ -333,12 +341,14 @@ func _run() -> void:
 	app._landing_surface_ready = true
 	app._planet_pending_count = 1
 	app.gameplay_view.enter_planet_workflow(77)
+	app.refresh_coordinator = fake_refresh
+	app._command_refresh_pending = false
 	app._pending_game_commands["planet-info-mismatch"] = {
 		"kind": "planet_info", "command": "planet.info", "label": "Planet information",
 	}
 	fake_refresh.calls.clear()
 	await app._on_transport_reply("planet-info-mismatch", {
-		"status": "ok", "data": {"planet_id": 88, "name": "Untrusted planet"},
+		"status": "ok", "type": "planet.info", "data": {"planet_id": 88, "name": "Untrusted planet"},
 	}, "planet.info")
 	_check(app._landed_planet_id == 0, "mismatched planet.info retained the landed planet identity")
 	_check(not app.gameplay_view.planet_workflow.visible, "mismatched planet.info left stale surface actions visible")

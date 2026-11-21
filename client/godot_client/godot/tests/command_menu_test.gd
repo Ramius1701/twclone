@@ -18,14 +18,37 @@ func _run() -> void:
 	)
 	menu._snapshot = {"authenticated": true, "disconnected": false, "hud": {"sector_id": 17}}
 	menu._selection = {"kind": "port", "name": "Helix Trade Port", "data": {"port_id": 55}}
-	menu._active_category = "COMPUTER"
+	menu._active_category = "NAVIGATION"
 	menu._render_actions()
 	await process_frame
+	var photon_action: Dictionary = {}
+	for candidate in CommandMenu.COMMANDS.get("OPERATIONS", []):
+		if str(candidate.get("command", "")) == "combat.fire_photon":
+			photon_action = candidate
+	_check(photon_action.get("fields", []).size() == 2 and photon_action["fields"][0][0] == "sector_id" and photon_action["fields"][1][0] == "target_ship_id", "photon workflow does not request both adjacent sector and explicit target ship")
 	var communication_mail_action: Dictionary = {}
 	for candidate in CommandMenu.COMMANDS.get("COMMUNICATIONS", []):
 		if str(candidate.get("command", "")) == "mail.inbox":
 			communication_mail_action = candidate
 	_check(communication_mail_action.get("fixed", null) is Dictionary and communication_mail_action["fixed"].is_empty(), "communications mail inbox sent unsupported request fields")
+	var online_players_action: Dictionary = {}
+	for candidate in CommandMenu.COMMANDS.get("COMMUNICATIONS", []):
+		if str(candidate.get("command", "")) == "player.list_online":
+			online_players_action = candidate
+	_check(not online_players_action.is_empty(), "online player directory is absent from the Godot communications menu")
+	menu._active_category = "COMMUNICATIONS"
+	menu._render_actions()
+	await process_frame
+	var online_players_button := _action_button(menu, "Online players")
+	var before_online_players := captured.size()
+	_check(online_players_button != null and not online_players_button.disabled, "online player directory is unavailable in the Godot menu")
+	if online_players_button != null:
+		online_players_button.pressed.emit()
+	_check(captured.size() == before_online_players + 1 and captured.back()["command"] == "player.list_online", "Godot online player menu did not dispatch the canonical command")
+	captured.resize(before_online_players)
+	menu._active_category = "NAVIGATION"
+	menu._render_actions()
+	await process_frame
 	var stale_scan_button := _action_button(menu, "Scan adjacent sectors")
 	_check(stale_scan_button != null and stale_scan_button.disabled and stale_scan_button.tooltip_text.contains("Refresh the current sector"), "scan was enabled without a fresh authoritative sector")
 	var stale_density_button := _action_button(menu, "Sector density scan")
@@ -40,7 +63,7 @@ func _run() -> void:
 	menu._snapshot["freshness"] = {"sector": "fresh"}
 	menu._render_actions()
 	await process_frame
-	menu._active_category = "COMPUTER"
+	menu._active_category = "NAVIGATION"
 	menu._choose_action({"label": "Sector density scan", "command": "sector.scan.density", "fixed": {}, "context_sector": true, "requires_fresh_sector": true})
 	_check(captured.size() == 1 and captured[0]["command"] == "sector.scan.density", "density scan did not emit with a fresh confirmed sector")
 	if captured.size() == 1:
@@ -76,7 +99,7 @@ func _run() -> void:
 	(menu._form_fields["target_player_id"] as LineEdit).text = "42"
 	menu._submit_form()
 	_check(captured.size() == stale_transfer_before, "stale ship roster selection emitted a transfer request")
-	menu._active_category = "COMPUTER"
+	menu._active_category = "TRADING"
 	menu._render_actions()
 	await process_frame
 	var shipyard_action_button := _action_button(menu, "Shipyard catalogue")
@@ -88,14 +111,38 @@ func _run() -> void:
 		shipyard_sale_button.pressed.emit()
 	_check(captured.size() == before_shipyard_sale, "unavailable shipyard sale emitted a fabricated server request")
 	menu._snapshot["ship"] = {"ported": 55}
-	menu._snapshot["sector"] = {"ports": [{"id": 55, "type": 9}]}
+	# Sector scans intentionally omit port class. A correlated port.info response
+	# supplies local eligibility context only after docking.
+	menu._snapshot["sector"] = {"ports": [{"port_id": 55, "name": "StarDock"}]}
+	menu.set_confirmed_port_context({"port": {"id": 55, "type": 9, "sector": 17}}, 17)
 	menu._render_actions()
 	await process_frame
 	shipyard_action_button = _action_button(menu, "Shipyard catalogue")
-	_check(shipyard_action_button != null and not shipyard_action_button.disabled, "shipyard action stayed disabled for a confirmed docked StarDock")
+	_check(shipyard_action_button != null and not shipyard_action_button.disabled, "server-confirmed docked StarDock did not enable its shipyard action when sector scan omits port class")
 	menu._active_category = "PORT"
 	menu._render_actions()
 	await process_frame
+	captured.clear()
+	var undock_action_button := _action_button(menu, "Undock from selected port")
+	_check(undock_action_button != null and not undock_action_button.disabled, "confirmed dock state did not expose undocking")
+	menu._snapshot["ship"]["ported"] = 0
+	menu._render_actions()
+	await process_frame
+	var dock_action_button := _action_button(menu, "Dock at selected port")
+	_check(dock_action_button != null and not dock_action_button.disabled, "undocked ship did not expose docking at the selected port")
+	if dock_action_button != null:
+		dock_action_button.pressed.emit()
+		_check(menu._form_dialog.visible, "docking mutation did not require confirmation")
+		(menu._form_dialog.get_ok_button() as Button).pressed.emit()
+	_check(captured.size() == 1 and captured[0]["command"] == "dock.status" and captured[0]["data"] == {"action": "dock"} and captured[0]["mutating"], "dock action did not use the canonical state transition contract: %s" % str(captured))
+	menu._snapshot["ship"]["ported"] = 55
+	menu._render_actions()
+	await process_frame
+	undock_action_button = _action_button(menu, "Undock from selected port")
+	if undock_action_button != null:
+		undock_action_button.pressed.emit()
+		(menu._form_dialog.get_ok_button() as Button).pressed.emit()
+	_check(captured.size() == 2 and captured[1]["command"] == "dock.status" and captured[1]["data"] == {"action": "undock"}, "undock action did not use the canonical state transition contract: %s" % str(captured))
 	captured.clear()
 	var dock_button := _action_button(menu, "Dock · open port screen")
 	_check(dock_button != null and not dock_button.disabled, "selected port docking action was unavailable")
@@ -141,27 +188,79 @@ func _run() -> void:
 	menu._render_actions()
 	menu._choose_action({"label": "Claim ship", "command": "ship.claim", "context_id": "ship_id", "mutating": true})
 	menu._submit_form()
-	_check(captured.size() == 2 and captured[1]["command"] == "ship.claim", "claim action did not emit for selected ship")
-	if captured.size() > 1:
-		_check(captured[1]["data"] == {"ship_id": 61} and captured[1]["mutating"], "claim action did not use selected ship identity")
+	_check(captured.size() == 3 and captured.back()["command"] == "ship.claim", "claim action did not emit for selected ship")
+	if not captured.is_empty():
+		_check(captured.back()["data"] == {"ship_id": 61} and captured.back()["mutating"], "claim action did not use selected ship identity")
 	menu._choose_action({"label": "Tow ship", "command": "ship.tow", "context_id": "target_ship_id", "mutating": true})
 	menu._submit_form()
-	_check(captured.size() == 3 and captured[2]["data"] == {"target_ship_id": 61}, "tow action did not bind selected ship identity")
+	_check(captured.size() == 4 and captured.back()["data"] == {"target_ship_id": 61}, "tow action did not bind selected ship identity")
 	menu._selection = {"kind": "planet", "name": "Nereid", "data": {"planet_id": 19}}
-	menu._snapshot["ship"] = {"onplanet": 19}
+	menu._snapshot["ship"] = {"id": 88, "onplanet": 1}
+	menu._snapshot["player"] = {"ship_id": 88, "last_planet_id": 19}
 	menu._active_category = "PLANET"
 	menu._render_actions()
-	var harvest_button := _action_button(menu, "Harvest planet production · unavailable")
-	_check(harvest_button != null and harvest_button.disabled and harvest_button.tooltip_text.contains("authoritative server implementation"), "unavailable planet harvest was hidden or presented as usable")
-	var before_unavailable_harvest := captured.size()
+	var planet_view_button := _action_button(menu, "Public planet overview")
+	_check(planet_view_button != null and not planet_view_button.disabled, "landed planet public overview was unavailable")
+	var before_planet_view := captured.size()
+	if planet_view_button != null:
+		planet_view_button.pressed.emit()
+	_check(captured.size() == before_planet_view + 1, "planet overview action did not dispatch")
+	if captured.size() > before_planet_view:
+		_check(captured[before_planet_view]["command"] == "planet.view", "public overview dispatched a non-overview command")
+		_check(captured[before_planet_view]["data"] == {"planet_id": 19}, "public overview did not bind the selected planet ID")
+		_check(not captured[before_planet_view]["mutating"], "read-only planet overview was marked as a mutation")
+	captured.resize(before_planet_view)
+	var harvest_button := _action_button(menu, "Harvest planet production")
+	_check(harvest_button != null and not harvest_button.disabled, "landed planet harvest workflow was unavailable despite its published V3 contract")
+	var before_harvest := captured.size()
 	if harvest_button != null:
 		harvest_button.pressed.emit()
-	_check(captured.size() == before_unavailable_harvest, "unavailable planet harvest emitted a fabricated server request")
+		_check(menu._form_dialog.visible, "planet harvest did not require confirmation before its mutating request")
+		if menu._form_dialog.visible:
+			(menu._form_dialog.get_ok_button() as Button).pressed.emit()
+	_check(captured.size() == before_harvest + 1, "confirmed planet harvest did not dispatch the server command")
+	if captured.size() > before_harvest:
+		_check(captured[before_harvest]["command"] == "planet.harvest", "harvest workflow dispatched the wrong command")
+		_check(captured[before_harvest]["data"] == {"planet_id": 19}, "harvest workflow did not bind the selected authoritative planet ID")
+		_check(captured[before_harvest]["mutating"], "harvest workflow was not marked as a server mutation")
+	# Keep the surrounding legacy command-count assertions independent of this
+	# focused harvest dispatch check.
+	captured.resize(before_harvest)
+	var emancipate_button := _action_button(menu, "Emancipate planet slaves")
+	_check(emancipate_button != null and not emancipate_button.disabled, "landed planet emancipation workflow was unavailable")
+	var before_emancipate := captured.size()
+	if emancipate_button != null:
+		emancipate_button.pressed.emit()
+		_check(menu._form_dialog.visible, "planet emancipation did not require confirmation")
+		if menu._form_dialog.visible:
+			(menu._form_dialog.get_ok_button() as Button).pressed.emit()
+	_check(captured.size() == before_emancipate + 1, "confirmed emancipation did not dispatch the server command")
+	if captured.size() > before_emancipate:
+		_check(captured[before_emancipate]["command"] == "planet.emancipate", "emancipation dispatched the wrong command")
+		_check(captured[before_emancipate]["data"] == {"planet_id": 19}, "emancipation did not bind the selected planet ID")
+		_check(captured[before_emancipate]["mutating"], "emancipation was not marked as a server mutation")
+	captured.resize(before_emancipate)
+	var exchange_sale_button := _action_button(menu, "Sell planet surplus to Exchange")
+	_check(exchange_sale_button != null and not exchange_sale_button.disabled, "landed planet Exchange sale workflow was unavailable")
+	var before_exchange_sale := captured.size()
+	if exchange_sale_button != null:
+		exchange_sale_button.pressed.emit()
+		_check(menu._inline_form_panel.visible, "Exchange sale did not open its input and confirmation form")
+		if menu._inline_form_panel.visible:
+			(menu._form_fields["commodity"] as LineEdit).text = "ORE"
+			(menu._form_fields["quantity"] as LineEdit).text = "6"
+			menu._inline_submit.pressed.emit()
+	_check(captured.size() == before_exchange_sale + 1, "confirmed Exchange sale did not dispatch the server command")
+	if captured.size() > before_exchange_sale:
+		_check(captured[before_exchange_sale]["command"] == "planet.market.sell", "planet Exchange action dispatched the wrong command")
+		_check(captured[before_exchange_sale]["data"] == {"planet_id": 19, "commodity": "ORE", "quantity": 6}, "planet Exchange action did not bind the selected planet and entered values")
+		_check(captured[before_exchange_sale]["mutating"], "Exchange sale was not marked as a server mutation")
+	captured.resize(before_exchange_sale)
 	menu._choose_action({"label": "Planet information", "command": "planet.info", "context_id": "planet_id"})
-	_check(captured.size() == before_unavailable_harvest + 1, "planet information did not emit a command")
-	if captured.size() > before_unavailable_harvest:
-		_check(captured[before_unavailable_harvest]["command"] == "planet.info", "planet command name changed")
-		_check(captured[before_unavailable_harvest]["data"] == {"planet_id": 19}, "planet ID was not bound from authoritative selection")
+	_check(captured.size() == before_harvest + 1, "planet information did not emit a command")
+	if captured.size() > before_harvest:
+		_check(captured[before_harvest]["command"] == "planet.info", "planet command name changed")
+		_check(captured[before_harvest]["data"] == {"planet_id": 19}, "planet ID was not bound from authoritative selection")
 	var before_invalid_planet := captured.size()
 	menu._selection = {"kind": "planet", "name": "Unidentified planet", "data": {"planet_id": 0}}
 	menu._choose_action({"label": "Land on planet", "command": "planet.land", "context_id": "planet_id", "mutating": true})
@@ -181,10 +280,10 @@ func _run() -> void:
 	menu._choose_action({"label": "Attack this planet", "command": "combat.attack_planet", "context_id": "planet_id", "mutating": true})
 	_check(captured.size() == before_malformed_planet, "malformed planet metadata emitted a request while rendering planet actions")
 	menu._selection = {"kind": "planet", "name": "Malformed landing context", "data": {"planet_id": 19}}
-	menu._snapshot["ship"] = {"onplanet": true}
+	menu._snapshot["ship"] = {"id": 88, "onplanet": true}
 	menu._render_actions()
 	_check(_action_button(menu, "Launch from planet") == null, "boolean onplanet metadata exposed a launch action")
-	menu._snapshot["ship"] = {"onplanet": 19.0}
+	menu._snapshot["ship"] = {"id": 88, "onplanet": 1.0}
 	menu._render_actions()
 	_check(_action_button(menu, "Launch from planet") == null, "floating-point onplanet metadata exposed a launch action")
 	menu._selection = {"kind": "ship", "name": "Unidentified vessel", "data": {"ship_id": "not-a-number"}}
@@ -206,44 +305,55 @@ func _run() -> void:
 	menu._form_fields["code"].text = "MARKER_BEACON"
 	menu._form_fields["quantity"].text = "2"
 	menu._submit_form()
-	_check(captured.size() == 5, "hardware purchase form did not emit")
-	if captured.size() > 4:
-		_check(captured[4]["command"] == "hardware.buy", "hardware purchase command changed")
-		_check(captured[4]["data"].get("code") == "MARKER_BEACON" and captured[4]["data"].get("quantity") == 2, "hardware request does not match the server schema")
-		_check(not str(captured[4]["data"].get("idempotency_key", "")).is_empty(), "hardware purchase omitted its idempotency key")
+	_check(captured.size() == 6, "hardware purchase form did not emit")
+	if captured.size() > 5:
+		_check(captured[5]["command"] == "hardware.buy", "hardware purchase command changed")
+		_check(captured[5]["data"].get("code") == "MARKER_BEACON" and captured[5]["data"].get("quantity") == 2, "hardware request does not match the server schema")
+		_check(not str(captured[5]["data"].get("idempotency_key", "")).is_empty(), "hardware purchase omitted its idempotency key")
 	menu._choose_action({"command": "mail.read", "label": "Read mail by ID", "mutating": true, "fields": [["mail_id", "integer", "Mail ID", ""]]})
 	(menu._form_fields["mail_id"] as LineEdit).text = "52"
 	menu._submit_form()
-	_check(captured.size() == 6, "mail read form did not emit")
-	if captured.size() > 5:
-		_check(captured[5]["data"] == {"mail_id": 52}, "mail read request did not use the authoritative mail_id schema")
+	_check(captured.size() == 7, "mail read form did not emit")
+	if captured.size() > 6:
+		_check(captured[6]["data"] == {"mail_id": 52}, "mail read request did not use the authoritative mail_id schema")
 	menu._choose_action({"command": "mail.inbox", "label": "Mail inbox", "fixed": {}})
-	_check(captured.size() == 7 and captured[6]["data"].is_empty(), "mail inbox sent unsupported fields")
+	_check(captured.size() == 8 and captured[7]["data"].is_empty(), "mail inbox sent unsupported fields")
 	menu.show_shipyard({"available": [
 		{"name": "Scout", "type_id": 7, "eligible": true, "net_cost": "100"},
 		{"name": "Capital", "type_id": 8, "eligible": false, "reasons": ["insufficient holds"]},
-	]}, "Bit Banger")
-	_check(menu._shipyard_rows.get_child_count() == 2, "shipyard list did not render available hull choices")
-	if menu._shipyard_rows.get_child_count() == 2:
+	], "used_available": [{"used_inventory_id": 91, "ship_id": 42, "name": "Retained Scout", "ship_type": "Scout", "price": 12345, "hull_value": 10000, "installed_equipment_value": 5431}]}, "Bit Banger")
+	_check(menu._shipyard_rows.get_child_count() == 4, "shipyard list did not render new and used hull choices")
+	if menu._shipyard_rows.get_child_count() >= 3:
 		_check((menu._shipyard_rows.get_child(0) as Button).disabled == false, "eligible shipyard hull was disabled")
 		_check((menu._shipyard_rows.get_child(1) as Button).disabled, "ineligible shipyard hull was selectable")
 	menu._choose_shipyard_hull(7, "Bit Banger")
 	menu._shipyard_name_input.text = "New Scout"
 	menu._submit_shipyard_upgrade()
-	_check(captured.size() == 8 and captured[7]["command"] == "shipyard.upgrade", "shipyard selection did not submit upgrade")
-	if captured.size() > 7:
-		_check(captured[7]["data"] == {"new_type_id": 7, "new_ship_name": "New Scout"} and captured[7]["mutating"], "shipyard upgrade payload was incorrect")
+	_check(captured.size() == 9 and captured[8]["command"] == "shipyard.upgrade", "shipyard selection did not submit upgrade")
+	if captured.size() > 8:
+		_check(captured[8]["data"] == {"new_type_id": 7, "new_ship_name": "New Scout"} and captured[8]["mutating"], "shipyard upgrade payload was incorrect")
+	var used_hull_button := menu._shipyard_rows.get_child(3) as Button
+	_check(not used_hull_button.disabled, "server-listed used hull was unavailable")
+	var before_used_purchase := captured.size()
+	used_hull_button.pressed.emit()
+	_check(menu._form_dialog.visible, "used-hull purchase did not require confirmation")
+	if menu._form_dialog.visible:
+		(menu._form_dialog.get_ok_button() as Button).pressed.emit()
+	_check(captured.size() == before_used_purchase + 1 and captured.back()["command"] == "shipyard.upgrade", "used-hull menu did not dispatch upgrade command")
+	if captured.size() > before_used_purchase:
+		_check(captured[before_used_purchase]["data"] == {"used_inventory_id": 91}, "used-hull request did not use the server-listed inventory ID")
+		_check(captured[before_used_purchase]["mutating"], "used-hull purchase was not marked as a mutation")
 	menu._choose_action({"command": "player.set_prefs", "label": "Set clock preference", "mutating": true, "preference_key": "ui.clock_24h", "preference_type": "bool", "fields": [["value", "boolean", "Use 24-hour clock", "false"]]})
 	(menu._form_fields["value"] as CheckBox).button_pressed = false
 	menu._submit_form()
-	_check(captured.size() == 9 and captured[8]["data"] == {"items": [{"key": "ui.clock_24h", "type": "bool", "value": false}]}, "preference form did not construct the server's items payload")
+	_check(captured.size() == 11 and captured[10]["data"] == {"items": [{"key": "ui.clock_24h", "type": "bool", "value": false}]}, "preference form did not construct the server's items payload")
 	menu.show_deployed_assets({"entries": [{"asset_id": 21, "count": 12, "offense_mode": "DEFEND"}]}, "fighters", 17)
 	await process_frame
 	_check(menu._shipyard_rows.get_child_count() == 1, "deployed fighter asset was not rendered")
 	menu._recall_asset(21)
-	_check(captured.size() == 10 and captured[9]["command"] == "fighters.recall", "fighter recall did not emit the server command")
-	if captured.size() > 9:
-		_check(captured[9]["data"] == {"sector_id": 17, "asset_id": 21} and captured[9]["mutating"], "fighter recall omitted sector or asset identity")
+	_check(captured.size() == 12 and captured[11]["command"] == "fighters.recall", "fighter recall did not emit the server command")
+	if captured.size() > 11:
+		_check(captured[11]["data"] == {"sector_id": 17, "asset_id": 21} and captured[11]["mutating"], "fighter recall omitted sector or asset identity")
 	menu.show_deployed_assets({"entries": [
 		{"asset_id": "22", "count": 4, "offense_mode": "DEFEND"},
 		{"asset_id": true, "count": 4, "offense_mode": "DEFEND"},
@@ -252,40 +362,40 @@ func _run() -> void:
 	await process_frame
 	_check(menu._shipyard_rows.get_child_count() == 1, "schema-mismatched deployment IDs became actionable recall rows")
 	menu._recall_asset(23)
-	_check(captured.size() == 11 and captured[10]["data"] == {"sector_id": 17, "asset_id": 23}, "valid authoritative deployment ID was not recallable")
+	_check(captured.size() == 13 and captured[12]["data"] == {"sector_id": 17, "asset_id": 23}, "valid authoritative deployment ID was not recallable")
 	_check(not menu._categories().has("TAVERN"), "Tavern commands were exposed outside the StarDock tavern")
 	menu._choose_action({"command": "tavern.dice.play", "label": "Play dice", "mutating": true})
-	_check(captured.size() == 11, "a Tavern RPC was sent without Tavern access")
+	_check(captured.size() == 13, "a Tavern RPC was sent without Tavern access")
 	menu.set_tavern_access(true)
 	_check(menu._categories().has("TAVERN") and menu._active_category == "TAVERN", "entering the Tavern did not expose its command category")
 	menu._choose_action({"label": "Post tavern graffiti", "command": "tavern.graffiti.post", "mutating": true, "fields": [["text", "text", "Graffiti", ""]]})
 	(menu._form_fields["text"] as LineEdit).text = "Hello, spacefarers"
 	menu._submit_form()
-	_check(captured.size() == 12 and captured[11]["data"] == {"text": "Hello, spacefarers"}, "tavern graffiti did not send its handler-confirmed text field")
+	_check(captured.size() == 14 and captured[13]["data"] == {"text": "Hello, spacefarers"}, "tavern graffiti did not send its handler-confirmed text field")
 	menu._choose_action({"label": "Buy a rumour hint · 50 CR", "command": "tavern.rumour.get_hint", "mutating": true})
 	menu._submit_form()
-	_check(captured.size() == 13 and captured[12]["command"] == "tavern.rumour.get_hint" and captured[12]["data"].is_empty(), "paid rumour action did not confirm and send the empty server payload")
+	_check(captured.size() == 15 and captured[14]["command"] == "tavern.rumour.get_hint" and captured[14]["data"].is_empty(), "paid rumour action did not confirm and send the empty server payload")
 	menu.set_tavern_access(false)
 	_check(not menu._categories().has("TAVERN") and menu._active_category != "TAVERN", "leaving the Tavern left its commands exposed")
 	menu.set_activity_history(["Maintenance · Scheduled in ten minutes."])
 	menu._choose_action({"local_activity": true})
-	_check(captured.size() == 13, "opening recent event history emitted a server command")
+	_check(captured.size() == 15, "opening recent event history emitted a server command")
 	_check(menu._result_text.text == "Maintenance · Scheduled in ten minutes.", "recent event history did not show the sanitized event summary")
 	menu._choose_action({"local_help": true})
-	_check(captured.size() == 13, "opening the field guide emitted a server command")
+	_check(captured.size() == 15, "opening the field guide emitted a server command")
 	_check(menu._result_text.text.contains("Actions are discrete requests") and menu._result_text.text.contains("screen position of a marker is decorative"), "field guide omitted the authoritative command and decorative-coordinate rules")
 	menu._choose_action({"label": "Jettison cargo", "command": "trade.jettison", "mutating": true, "form_notice": "Permanently destroys cargo and consumes one turn.", "fields": [["commodity", "text", "Commodity", "ore"], ["quantity", "integer", "Quantity", "1"]]})
 	var jettison_notice_shown := false
-	for form_child in menu._form_content.get_children():
+	for form_child in menu._inline_form_content.get_children():
 		if form_child is Label and (form_child as Label).text.contains("consumes one turn"):
 			jettison_notice_shown = true
 	_check(jettison_notice_shown, "jettison form did not explain cargo loss and turn cost")
 	menu._form_fields["commodity"].text = "ore"
 	menu._form_fields["quantity"].text = "3"
 	menu._submit_form()
-	_check(captured.size() == 14 and captured[13]["command"] == "trade.jettison", "handler-compatible cargo jettison command was not submitted")
-	if captured.size() > 12:
-		_check(captured[13]["data"] == {"commodity": "ore", "quantity": 3} and captured[13]["mutating"], "cargo jettison did not use the implemented commodity/quantity contract")
+	_check(captured.size() == 16 and captured[15]["command"] == "trade.jettison", "handler-compatible cargo jettison command was not submitted")
+	if captured.size() > 14:
+		_check(captured[15]["data"] == {"commodity": "ore", "quantity": 3} and captured[15]["mutating"], "cargo jettison did not use the implemented commodity/quantity contract")
 	menu._snapshot["freshness"] = {"sector": "fresh"}
 	var navigation_actions: Array = CommandMenu.COMMANDS.get("NAVIGATION", [])
 	var route_action: Dictionary = {}
@@ -296,16 +406,16 @@ func _run() -> void:
 	menu._choose_action(route_action)
 	(menu._form_fields["to_sector_id"] as LineEdit).text = "42"
 	menu._submit_form()
-	_check(captured.size() == 15 and captured[14]["command"] == "move.autopilot.start", "route planner did not use the implemented compatible command")
-	if captured.size() > 13:
-		_check(captured[14]["data"] == {"to_sector_id": 42} and captured[14]["mutating"], "route planner did not mark the saved-route update as mutating")
+	_check(captured.size() == 17 and captured[16]["command"] == "move.autopilot.start", "route planner did not use the implemented compatible command")
+	if captured.size() > 15:
+		_check(captured[16]["data"] == {"to_sector_id": 42} and captured[16]["mutating"], "route planner did not mark the saved-route update as mutating")
 	var autopilot_status_action: Dictionary = {}
 	for candidate in navigation_actions:
 		if str(candidate.get("command", "")) == "move.autopilot.status":
 			autopilot_status_action = candidate
 	_check(not autopilot_status_action.is_empty(), "navigation menu does not expose the implemented autopilot status query")
 	menu._choose_action(autopilot_status_action)
-	_check(captured.size() == 16 and captured[15]["command"] == "move.autopilot.status" and captured[15]["data"].is_empty() and not captured[15]["mutating"], "autopilot status did not issue the empty read-only command")
+	_check(captured.size() == 18 and captured[17]["command"] == "move.autopilot.status" and captured[17]["data"].is_empty() and not captured[17]["mutating"], "autopilot status did not issue the empty read-only command")
 	var expected_controls := [
 		{"label": "Autopilot · stop at next sector", "command": "move.autopilot.control", "data": {"action": "stop_at_next"}},
 		{"label": "Autopilot · continue route", "command": "move.autopilot.control", "data": {"action": "continue"}},
@@ -334,14 +444,18 @@ func _run() -> void:
 	menu._choose_action(warp_action)
 	(menu._form_fields["to_sector_id"] as LineEdit).text = "18"
 	menu._submit_form()
-	_check(captured.size() == 21 and captured[20]["command"] == "move.warp" and captured[20]["data"] == {"to_sector_id": 18} and captured[20]["mutating"], "numeric warp did not use the direct authoritative move command")
+	_check(captured.size() == 23 and captured[22]["command"] == "move.warp" and captured[22]["data"] == {"to_sector_id": 18} and captured[22]["mutating"], "numeric warp did not use the direct authoritative move command")
 	menu._snapshot["disconnected"] = false
+	menu._active_category = "COMPUTER"
+	menu._render_actions()
+	await process_frame
+	_check(_action_button(menu, "Log out to login screen") != null, "logout was registered but unavailable from a player-facing menu")
 	var session_commands: Array = CommandMenu.COMMANDS.get("SESSION", [])
 	_check(session_commands.size() == 1 and session_commands[0].get("local_logout", false), "session category does not expose confirmed logout")
 	menu._choose_action(session_commands[0])
 	_check(menu._logout_dialog.visible, "logout did not require a confirmation step")
 	menu._logout_dialog.confirmed.emit()
-	_check(captured.size() == 22 and captured[21]["command"] == "auth.logout" and captured[21]["data"].is_empty(), "confirmed logout did not send the documented empty payload")
+	_check(captured.size() == 24 and captured[23]["command"] == "auth.logout" and captured[23]["data"].is_empty(), "confirmed logout did not send the documented empty payload")
 	var pinned_help := {"label": "Controls and command flow", "local_help": true}
 	menu._pinned_actions.clear()
 	menu._key_bindings.clear()
@@ -366,11 +480,8 @@ func _run() -> void:
 	menu._selection.clear()
 	menu._active_category = "COMPUTER"
 	menu._render_actions()
-	var computer_help_button := _action_button(menu, "Help · controls and command flow")
-	_check(computer_help_button != null, "Computer menu omitted the direct Help shortcut")
-	if computer_help_button != null:
-		computer_help_button.pressed.emit()
-		_check(menu._result_text.text.contains("COMMANDS AND SHORTCUTS"), "Computer Help shortcut did not open the field guide")
+	_check(_action_button(menu, "Help · controls and command flow") == null, "gear-only Help shortcut leaked into the Computer tab")
+	_check(menu.invoke_local_action("Controls and command flow") and menu._result_text.text.contains("COMMANDS AND SHORTCUTS"), "gear Help shortcut did not open the field guide")
 	var rename_button := _action_button(menu, "Rename ship")
 	_check(rename_button != null and not rename_button.disabled, "supported ship rename stayed unavailable")
 	var before_rename := captured.size()
@@ -416,10 +527,34 @@ func _run() -> void:
 	var add_subscription_button := _action_button(menu, "Add subscription")
 	var remove_subscription_button := _action_button(menu, "Remove subscription")
 	_check(add_subscription_button != null and not add_subscription_button.disabled and remove_subscription_button != null and not remove_subscription_button.disabled, "documented subscription actions were disabled")
-	menu._active_category = "NEWS & RECORDS"
+	menu._active_category = "TRADING"
 	menu._render_actions()
-	var insurance_buy_button := _action_button(menu, "Buy insurance · server stub")
-	_check(insurance_buy_button != null and insurance_buy_button.disabled, "stub insurance operation was presented as usable")
+	await process_frame
+	var insurance_list_button := _action_button(menu, "List hull insurance policies")
+	var insurance_buy_button := _action_button(menu, "Buy hull insurance policy")
+	var insurance_claim_button := _action_button(menu, "File server-created insurance claim")
+	_check(insurance_list_button != null and not insurance_list_button.disabled and insurance_buy_button != null and not insurance_buy_button.disabled and insurance_claim_button != null and not insurance_claim_button.disabled, "implemented insurance workflows stayed unavailable")
+	var insurance_actions: Array = CommandMenu.COMMANDS.get("NEWS & RECORDS", [])
+	var insurance_buy_action: Dictionary = {}
+	var insurance_claim_action: Dictionary = {}
+	for candidate in insurance_actions:
+		if str(candidate.get("command", "")) == "insurance.policies.buy": insurance_buy_action = candidate
+		if str(candidate.get("command", "")) == "insurance.claim.file": insurance_claim_action = candidate
+	var before_insurance := captured.size()
+	menu._choose_action(insurance_buy_action)
+	(menu._form_fields["subject_id"] as LineEdit).text = "42"
+	(menu._form_fields["duration"] as LineEdit).text = "3600"
+	(menu._form_fields["premium"] as LineEdit).text = "10"
+	(menu._form_fields["payout"] as LineEdit).text = "500"
+	(menu._form_fields["fund_id"] as LineEdit).text = "3"
+	menu._submit_form()
+	_check(captured.size() == before_insurance + 1 and captured.back()["command"] == "insurance.policies.buy" and captured.back()["data"] == {"subject_type": "ship", "subject_id": 42, "duration": 3600, "premium": 10, "payout": 500, "fund_id": 3}, "insurance purchase form did not emit the hull-only V3 request")
+	menu._choose_action(insurance_claim_action)
+	(menu._form_fields["claim_id"] as LineEdit).text = "9"
+	(menu._form_fields["event_id"] as LineEdit).text = "destruction-17"
+	(menu._form_fields["amount"] as LineEdit).text = "500"
+	menu._submit_form()
+	_check(captured.size() == before_insurance + 2 and captured.back()["command"] == "insurance.claim.file" and captured.back()["data"] == {"claim_id": 9, "event_id": "destruction-17", "amount": 500}, "insurance claim form did not emit the documented request")
 	var count_before_unavailable := captured.size()
 	menu._choose_action({"label": "Synthetic unavailable action", "unavailable_reason": "test unavailable"})
 	_check(captured.size() == count_before_unavailable, "unavailable action emitted a server command")
@@ -509,6 +644,7 @@ func _run() -> void:
 	var repair_button := _action_button(menu, "Repair ship at shipyard")
 	_check(repair_button != null and repair_button.disabled, "ship repair was available without a shipyard dock")
 	menu._snapshot["ship"] = {"ported": 55}
+	menu.set_confirmed_port_context({"port": {"id": 55, "type": 9, "sector": 17}}, 17)
 	menu._render_actions()
 	await process_frame
 	repair_button = _action_button(menu, "Repair ship at shipyard")
@@ -528,6 +664,8 @@ func _run() -> void:
 	(menu._form_fields["old_password"] as LineEdit).text = "qa-old-ephemeral"
 	(menu._form_fields["new_password"] as LineEdit).text = "qa-new-ephemeral-a"
 	(menu._form_fields["confirm_password"] as LineEdit).text = "qa-new-ephemeral-b"
+	var old_password_field: LineEdit = menu._form_fields["old_password"]
+	var new_password_field: LineEdit = menu._form_fields["new_password"]
 	var before_password_change := captured.size()
 	menu._submit_form()
 	_check(captured.size() == before_password_change, "mismatched password confirmation reached the server")
@@ -538,7 +676,7 @@ func _run() -> void:
 		var password_request: Dictionary = captured.back()
 		_check(password_request["command"] == "auth.change_password" and password_request["mutating"], "password change used the wrong command or was not marked mutating")
 		_check(password_request["data"].keys().size() == 2 and password_request["data"].has("old_password") and password_request["data"].has("new_password"), "password confirmation leaked into or altered the published request fields")
-		_check(not password_request["data"].has("confirm_password") and (menu._form_fields["old_password"] as LineEdit).text.is_empty() and (menu._form_fields["new_password"] as LineEdit).text.is_empty(), "password values remained in the form after submission")
+		_check(not password_request["data"].has("confirm_password") and old_password_field.text.is_empty() and new_password_field.text.is_empty(), "password values remained in the form after submission")
 	var before_corporation_actions := captured.size()
 	menu._choose_action({"label": "Member roster", "command": "corp.roster", "context_player_corp_id": true})
 	_check(captured.size() == before_corporation_actions, "corporation roster guessed a missing corporation ID")
@@ -551,12 +689,12 @@ func _run() -> void:
 	menu._active_category = "CORPORATION"
 	menu._snapshot["player"] = {}
 	menu._render_actions()
-	var treasury_button := _action_button(menu, "Treasury balance")
-	_check(treasury_button != null and treasury_button.disabled and treasury_button.tooltip_text.contains("corporation"), "corporation treasury action was enabled without membership")
+	_check(not menu._categories().has("CORPORATION") and _action_button(menu, "Treasury balance") == null, "corporation actions were exposed without membership")
 	menu._snapshot["player"] = {"corp_id": 10}
+	menu._rebuild_categories()
 	menu._render_actions()
 	await process_frame
-	treasury_button = _action_button(menu, "Treasury balance")
+	var treasury_button := _action_button(menu, "Treasury balance")
 	_check(treasury_button != null and not treasury_button.disabled, "corporation treasury action stayed disabled for a member")
 	menu._active_category = "PLANET"
 	menu._selection = {"kind": "planet", "name": "Nereid", "data": {"planet_id": 19}}
@@ -564,9 +702,11 @@ func _run() -> void:
 	menu._render_actions()
 	var attack_planet_button := _action_button(menu, "Attack this planet")
 	_check(attack_planet_button != null and not attack_planet_button.disabled, "listed non-FedSpace planet attack was not available")
-	menu._choose_action({"label": "Attack this planet", "command": "combat.attack_planet", "context_id": "planet_id", "mutating": true})
+	menu._choose_action({"label": "Attack this planet", "command": "combat.attack_planet", "context_id": "planet_id", "mutating": true, "fields": [["enslave_colonists", "boolean", "Enslave colonists", "false"]]})
+	if menu._form_fields.get("enslave_colonists") is CheckBox:
+		(menu._form_fields["enslave_colonists"] as CheckBox).button_pressed = true
 	menu._submit_form()
-	_check(captured.size() == before_corporation_actions + 2 and captured.back()["data"] == {"planet_id": 19}, "planet attack did not use the selected authoritative planet ID")
+	_check(captured.size() == before_corporation_actions + 2 and captured.back()["data"] == {"planet_id": 19, "enslave_colonists": true}, "planet attack did not dispatch the selected planet and enslavement choice")
 	menu._snapshot["hud"]["sector_id"] = 5
 	menu._render_actions()
 	await process_frame
@@ -652,19 +792,35 @@ func _run() -> void:
 	_check(rankings_button != null and not rankings_button.disabled, "authoritative player rankings stayed unavailable")
 	menu._choose_action({"label": "Player rankings", "command": "player.rankings", "fixed": {"by": "net_worth", "limit": 10}})
 	_check(captured.back()["command"] == "player.rankings" and captured.back()["data"] == {"by": "net_worth", "limit": 10}, "player rankings did not use the authoritative ranking request")
+	menu._active_category = "TRADING"
+	menu._render_actions()
+	await process_frame
 	var upgrade_button := _action_button(menu, "Ship equipment upgrade · unavailable")
 	_check(upgrade_button != null and upgrade_button.disabled, "ship equipment upgrade was presented without an authoritative catalogue")
 	var before_upgrade := captured.size()
 	if upgrade_button != null:
 		upgrade_button.pressed.emit()
 	_check(captured.size() == before_upgrade, "uncatalogued ship equipment upgrade emitted a request")
-	menu._snapshot["ship"] = {"onplanet": 19}
+	menu._snapshot["ship"] = {"id": 88, "onplanet": 1}
+	menu._snapshot["player"] = {"ship_id": 88, "last_planet_id": 19}
 	menu._selection = {"kind": "planet", "name": "Landed planet", "data": {"planet_id": 19}}
 	menu._active_category = "PLANET"
 	menu._render_actions()
 	await process_frame
 	var citadel_button := _action_button(menu, "Build planet citadel")
 	_check(citadel_button != null and not citadel_button.disabled, "planet citadel action stayed unavailable while landed")
+	var starport_construct_button := _action_button(menu, "Construct StarPort")
+	_check(starport_construct_button != null and not starport_construct_button.disabled, "StarPort construction action stayed unavailable on the confirmed landed planet")
+	var before_starport_construct := captured.size()
+	menu._choose_action({"label": "Construct StarPort", "command": "planet.port.construct", "context_id": "planet_id", "fields": [["port_class", "integer", "Trading class (1–8)", "1"]], "mutating": true, "idempotency": true})
+	if menu._form_fields.has("port_class"):
+		(menu._form_fields["port_class"] as LineEdit).text = "8"
+		menu._submit_form()
+	_check(captured.size() == before_starport_construct + 1 and captured.back().get("command") == "planet.port.construct", "StarPort construction menu did not dispatch the server command")
+	if captured.size() > before_starport_construct:
+		var construction_data: Dictionary = captured.back().get("data", {})
+		_check(construction_data.get("planet_id") == 19 and construction_data.get("port_class") == 8, "StarPort construction did not use the confirmed planet ID and selected class")
+		_check(typeof(construction_data.get("idempotency_key", null)) == TYPE_STRING and not str(construction_data.get("idempotency_key", "")).is_empty(), "StarPort construction omitted its idempotency key")
 	menu._choose_action({"label": "Allocate planet colonists", "command": "planet.colonists.allocate", "context_id": "planet_id", "fields": [["ore", "integer", "Ore colonists", "0"], ["organics", "integer", "Organics colonists", "0"], ["equipment", "integer", "Equipment colonists", "0"]], "mutating": true})
 	(menu._form_fields["ore"] as LineEdit).text = "4"
 	(menu._form_fields["organics"] as LineEdit).text = "2"
@@ -702,6 +858,47 @@ func _run() -> void:
 	var mail_display := menu.format_result("Read mail by ID", {"id": 44, "sender_name": "Nova", "subject": "Welcome", "body": "Meet at the dock"})
 	_check(mail_display.contains("Mail #44") and mail_display.contains("Meet at the dock"), "mail read did not render the authoritative message body")
 	_check(menu.format_result("Read mail by ID", {"id": "44", "body": "forged"}).contains("no authoritative message ID"), "mail read accepted a schema-mismatched ID")
+	var bank_order_action: Dictionary = {}
+	for candidate in CommandMenu.COMMANDS.get("FINANCES", []):
+		if str(candidate.get("command", "")) == "bank.orders.create":
+			bank_order_action = candidate
+	_check(not bank_order_action.is_empty(), "finances menu does not expose standing-order creation")
+	if not bank_order_action.is_empty():
+		menu._choose_action(bank_order_action)
+		_check(menu._form_fields.has("recipient_player_id") and menu._form_fields.has("time_utc") and menu._form_fields.has("weekday") and menu._form_fields.has("day_of_month"), "standing-order form does not expose the published schedule fields")
+		menu._form_fields["recipient_player_id"].text = "43"
+		menu._form_fields["amount"].text = "250"
+		menu._form_fields["frequency"].text = "weekly"
+		menu._form_fields["time_utc"].text = "08:15"
+		menu._form_fields["weekday"].text = "7"
+		menu._form_fields["day_of_month"].text = ""
+		var before_bank_order := captured.size()
+		menu._submit_form()
+		_check(captured.size() == before_bank_order + 1 and captured.back()["command"] == "bank.orders.create", "valid weekly standing-order form did not dispatch")
+		if captured.size() > before_bank_order:
+			_check(captured.back()["data"] == {"recipient_player_id": 43, "amount": 250, "frequency": "weekly", "time_utc": "08:15", "weekday": 7}, "weekly form did not emit the exact V3 field names and ISO weekday")
+		menu._choose_action(bank_order_action)
+		menu._form_fields["recipient_player_id"].text = "43"
+		menu._form_fields["amount"].text = "250"
+		menu._form_fields["frequency"].text = "daily"
+		menu._form_fields["time_utc"].text = "08:15"
+		menu._form_fields["weekday"].text = ""
+		menu._form_fields["day_of_month"].text = ""
+		var before_daily_order := captured.size()
+		menu._submit_form()
+		_check(captured.size() == before_daily_order + 1 and captured.back()["data"] == {"recipient_player_id": 43, "amount": 250, "frequency": "daily", "time_utc": "08:15"}, "daily form included conditional schedule fields or omitted required V3 fields")
+	menu._snapshot["freshness"] = {"sector": "fresh"}
+	var transwarp_action: Dictionary = {}
+	for candidate in CommandMenu.COMMANDS.get("NAVIGATION", []):
+		if str(candidate.get("command", "")) == "move.transwarp":
+			transwarp_action = candidate
+	_check(not transwarp_action.is_empty(), "navigation menu does not expose transwarp")
+	if not transwarp_action.is_empty():
+		menu._choose_action(transwarp_action)
+		menu._form_fields["to_sector_id"].text = "10"
+		var before_transwarp := captured.size()
+		menu._submit_form()
+		_check(captured.size() == before_transwarp + 1 and captured.back()["command"] == "move.transwarp" and captured.back()["data"] == {"to_sector_id": 10}, "Godot transwarp UI did not send the documented destination request")
 	menu.queue_free()
 	await process_frame
 	if failures.is_empty():

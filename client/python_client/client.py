@@ -41,6 +41,7 @@ from settings_model import (
 from money import MoneyError, parse_credits, format_credits
 import hud as hud_module
 from events import render_event_text, targets_player_ship_destruction
+from diagnostics import sanitize_text
 
 
 def _hud_rpc(ctx: "Context", command: str, data: dict) -> dict:
@@ -1112,6 +1113,11 @@ def ctx_refresh_port_context(ctx):
         # a success-shaped response that was rejected as another port.
         if "port_inventory" in ctx.state:
             ctx.state["is_stardock"] = _authoritative_is_stardock({"port": port_data})
+            # Stardock is the V3 shipyard. Keep the menu capability tied to
+            # the same server-authoritative port type; otherwise the Shipyard
+            # entry stays hidden even though dock/status correctly identifies
+            # the Stardock and the server exposes shipyard commands there.
+            ctx.state["is_shipyard_port"] = ctx.state["is_stardock"]
         else:
             error = r.get("error") if isinstance(r, dict) else {}
             message = error.get("message") if isinstance(error, dict) else None
@@ -1121,6 +1127,59 @@ def ctx_refresh_port_context(ctx):
         error = r.get("error") if isinstance(r, dict) else {}
         message = error.get("message") if isinstance(error, dict) else None
         print(f"Port details unavailable · {message or 'the server did not disclose this port here.'}")
+
+
+@register("dock_status_flow")
+def dock_status_flow(ctx: Context):
+    """Dock or undock the active ship at the local port using server state."""
+    def read_status(response):
+        if (not isinstance(response, dict) or response.get("status") != "ok"
+                or response.get("type") != "dock.status_v1"):
+            return None
+        data = get_data(response)
+        if not isinstance(data, dict) or type(data.get("docked")) is not bool:
+            return None
+        sector_id = _authoritative_positive_integer_id(data.get("sector_id"))
+        if sector_id != _authoritative_positive_integer_id(ctx.current_sector_id):
+            return None
+        port_id = data.get("port_id")
+        if type(port_id) is not int or port_id < 0:
+            return None
+        if data["docked"] != (port_id > 0):
+            return None
+        return data
+
+    status = ctx.conn.rpc("dock.status", {})
+    data = read_status(status)
+    if data is None:
+        print("Docking status could not be confirmed from the server.")
+        return
+    if data["docked"]:
+        action = "undock"
+        expected_port_id = data["port_id"]
+        prompt = f"Undock from port {expected_port_id}? [y/N]: "
+    else:
+        port = (ctx.last_sector_desc or {}).get("port") or {}
+        expected_port_id = _authoritative_positive_integer_id(port.get("id"))
+        if expected_port_id is None:
+            print("There is no confirmed local port to dock at.")
+            return
+        action = "dock"
+        prompt = f"Dock at port {expected_port_id}? [y/N]: "
+    if input(prompt).strip().lower() != "y":
+        print("Docking action cancelled.")
+        return
+    result = ctx.conn.rpc("dock.status", {"action": action})
+    confirmed = read_status(result)
+    should_be_docked = action == "dock"
+    if (confirmed is None or confirmed["docked"] is not should_be_docked
+            or (should_be_docked and confirmed["port_id"] != expected_port_id)
+            or (not should_be_docked and confirmed["port_id"] != 0)):
+        print("Docking action was not confirmed; refresh ship status before continuing.")
+        return
+    ctx.state["docked_port_id"] = confirmed["port_id"]
+    print("Ship docked at the local port." if should_be_docked else "Ship undocked.")
+    _refresh_ship_after_move(ctx)
 
 
 def normalize_port_info(resp: dict) -> dict:
@@ -1178,7 +1237,7 @@ def normalize_port_info(resp: dict) -> dict:
         # boolean/object/string to look actionable or reach money formatting.
         if isinstance(price, bool) or not isinstance(price, int) or price < 0:
             price = None
-        rows.append({
+        normalized_row = {
             # Preserve the authoritative server code exactly.  Commodity
             # identity is not a presentation value: Godot forwards this code
             # unchanged and the quote/receipt contract owns any canonical
@@ -1189,8 +1248,14 @@ def normalize_port_info(resp: dict) -> dict:
             "max_quantity": maximum if type(maximum) is int and maximum >= 0 else None,
             "base_price": price,
             # Fixed direction is server policy; never derive it from stock.
-            **{key: item[key] for key in ("sells", "buys") if key in item},
-        })
+            # Preserve omission as omission: _trade_rows distinguishes an
+            # undisclosed legacy flag from explicit malformed null metadata.
+        }
+        if isinstance(sells, bool):
+            normalized_row["sells"] = sells
+        if isinstance(buys, bool):
+            normalized_row["buys"] = buys
+        rows.append(normalized_row)
     return {"id": port_id, "name": raw.get("name") or "Port",
             "commodities": rows, "raw": raw}
 
@@ -1772,6 +1837,32 @@ def transwarp_flow(ctx: Context):
         _safe_move_error_refresh(ctx)
         print("Reconnect before attempting another move so location, turns, and ship state can be refreshed.")
         return False
+    if (isinstance(response, dict) and response.get("status") == "ok"
+            and response.get("type") == "move.toll_offer_v1"):
+        offer = get_data(response)
+        if (not isinstance(offer, dict)
+                or not isinstance(offer.get("offer_id"), str)
+                or offer.get("sector_id", offer.get("to_sector_id")) != target):
+            print("Transwarp toll offer was incomplete or did not match the requested sector.")
+            _safe_move_error_refresh(ctx)
+            return False
+        print(f"Toll fighters demand {offer.get('amount')} credits ({offer.get('fighter_count')} fighters).")
+        answer = input("Accept the toll and continue? [y/N]: ").strip().lower()
+        accept = answer in ("y", "yes")
+        try:
+            response = ctx.conn.rpc("move.transwarp", {
+                "to_sector_id": target,
+                "toll_offer_id": offer["offer_id"],
+                "toll_accept": accept,
+            })
+        except (ConnectionError, OSError) as exc:
+            ctx.state["last_rpc"] = None
+            print(f"Transwarp toll outcome is uncertain after connection loss: {exc}")
+            _safe_move_error_refresh(ctx)
+            print("Reconnect before retrying so toll, fuel, turns, location, and ship state can be reconciled.")
+            return False
+        if not accept:
+            print("Toll refused; the toll fighters will treat your arrival as hostile.")
     ok, message = present_move_result(response)
     if not _movement_response_type_matches(response, "move.transwarp"):
         print("Transwarp response had an unexpected type; refreshing confirmed player, ship and sector state.")
@@ -2006,6 +2097,36 @@ def _perform_warp(ctx: Context, target: int) -> bool:
         print(f"Warp outcome is uncertain after connection loss: {exc}")
         print("Reconnect before attempting another move so location, turns, and ship state can be refreshed.")
         return False
+    if not isinstance(resp, dict):
+        ctx.state["last_rpc"] = None
+        print("Warp returned a malformed response; destination could not be confirmed, refreshing confirmed player, ship and sector state.")
+        _safe_move_error_refresh(ctx)
+        return False
+    if (resp.get("status") == "ok"
+            and resp.get("type") == "move.toll_offer_v1"):
+        offer = resp.get("data")
+        if not isinstance(offer, dict) or not isinstance(offer.get("offer_id"), str):
+            print("Toll offer response was incomplete; movement was not attempted.")
+            _safe_move_error_refresh(ctx)
+            return False
+        amount = offer.get("amount")
+        fighters = offer.get("fighter_count")
+        print(f"Toll fighters demand {amount} credits ({fighters} fighters).")
+        answer = input("Accept the toll and continue? [y/N]: ").strip().lower()
+        accept = answer in ("y", "yes")
+        try:
+            resp = ctx.conn.rpc("move.warp", {
+                "to_sector_id": target,
+                "toll_offer_id": offer["offer_id"],
+                "toll_accept": accept,
+            })
+        except (ConnectionError, OSError) as exc:
+            ctx.state["last_rpc"] = None
+            print(f"Toll passage outcome is uncertain after connection loss: {exc}")
+            print("Reconnect before retrying so the offer, credits, and location can be reconciled.")
+            return False
+        if not accept:
+            print("Toll refused; the toll fighters will treat your arrival as hostile.")
     ok, message = present_move_result(resp)
     if not _movement_response_type_matches(resp, "move.result"):
         print("Warp response had an unexpected type; destination could not be confirmed, refreshing confirmed player, ship and sector state.")
@@ -2670,61 +2791,47 @@ def _update_corp_context(ctx: Context, force: bool = False):
     Fetches and updates corporation-related context flags in ctx.state.
     Should be called after player_info changes or a corp-related action.
     """
-    if not force and ctx.player_info:
-        # player.my_info publishes membership as player.corp_id. Older client
-        # code looked for a nested corporation object the server does not send.
-        corp_data = ctx.player_info.get("corporation")
-        player_data = ctx.player_info.get("player", {})
-        corp_id = player_data.get("corp_id") if isinstance(player_data, dict) else None
-        if corp_id is None:
-            corp_id = ctx.player_info.get("corp_id")
-        ctx.state["corp_id"] = int(corp_id) if isinstance(corp_id, int) and corp_id > 0 else None
-        ctx.state["in_corporation"] = bool(ctx.state["corp_id"] or (corp_data and isinstance(corp_data, dict)))
-        ctx.state["is_corp_member"] = ctx.state["in_corporation"]
-        return
+    if force or not ctx.player_info:
+        ctx.state["in_corporation"] = False
+        ctx.state["is_corp_member"] = False
+        ctx.state["corp_id"] = None
+        my_info_resp = _hud_rpc(ctx, "player.my_info", {})
+        if my_info_resp.get("status") != "ok":
+            return
+        ctx.player_info = get_data(my_info_resp)
 
-    ctx.state["in_corporation"] = False
+    # player.my_info publishes membership as player.corp_id. The role is only
+    # available from corp.status, so resolve it on login/reconnect as well as
+    # after an explicit corporation change. Menu-gated treasury and member
+    # administration actions must reflect the server's current role.
+    corp_data = ctx.player_info.get("corporation") if isinstance(ctx.player_info, dict) else None
+    player_data = ctx.player_info.get("player", {}) if isinstance(ctx.player_info, dict) else {}
+    corp_id = player_data.get("corp_id") if isinstance(player_data, dict) else None
+    if corp_id is None and isinstance(ctx.player_info, dict):
+        corp_id = ctx.player_info.get("corp_id")
+    ctx.state["corp_id"] = int(corp_id) if isinstance(corp_id, int) and corp_id > 0 else None
+    ctx.state["in_corporation"] = bool(ctx.state["corp_id"] or (corp_data and isinstance(corp_data, dict)))
+    ctx.state["is_corp_member"] = ctx.state["in_corporation"]
     ctx.state["is_ceo"] = False
     ctx.state["is_ceo_or_officer"] = False
     ctx.state["corp_is_public"] = False
     ctx.state["corp_not_public"] = True # Default until proven otherwise
-
-    # Fetch player_info to get basic corp membership status
-    my_info_resp = _hud_rpc(ctx, "player.my_info", {})
-    if my_info_resp.get("status") == "ok":
-        ctx.player_info = get_data(my_info_resp)
-    else:
-        # If player_info can't be fetched, can't determine corp status
+    if not ctx.state["in_corporation"]:
         return
 
-    corp_data = ctx.player_info.get("corporation")
-    player_data = ctx.player_info.get("player", {})
-    corp_id = player_data.get("corp_id") if isinstance(player_data, dict) else None
-    if corp_id is None:
-        corp_id = ctx.player_info.get("corp_id")
-    ctx.state["corp_id"] = int(corp_id) if isinstance(corp_id, int) and corp_id > 0 else None
-    if ctx.state["corp_id"] or (corp_data and isinstance(corp_data, dict)):
-        ctx.state["in_corporation"] = True
-        ctx.state["is_corp_member"] = True
-        
-        # Only do the heavy lifting if forced
-        if not force:
-            return
-
-        # Fetch corp.status to get role and public status
-        corp_status_resp = ctx.conn.rpc("corp.status", {})
-        if corp_status_resp.get("status") == "ok":
-            corp_status_data = get_data(corp_status_resp)
-            ctx.state["corp_id"] = corp_status_data.get("corp_id", ctx.state.get("corp_id"))
-            if corp_status_data.get("your_role") in ("Leader", "CEO"):
-                ctx.state["is_ceo"] = True
-                ctx.state["is_ceo_or_officer"] = True
-            elif corp_status_data.get("your_role") == "Officer":
-                ctx.state["is_ceo_or_officer"] = True
-            # Note: No read endpoint exists for public corporation status.
-            # corp_is_public stays False/unverified; validation is server-owned.
-        else:
-            print("[Warning] Could not fetch corporation status.")
+    corp_status_resp = ctx.conn.rpc("corp.status", {})
+    if corp_status_resp.get("status") == "ok":
+        corp_status_data = get_data(corp_status_resp)
+        ctx.state["corp_id"] = corp_status_data.get("corp_id", ctx.state.get("corp_id"))
+        if corp_status_data.get("your_role") in ("Leader", "CEO"):
+            ctx.state["is_ceo"] = True
+            ctx.state["is_ceo_or_officer"] = True
+        elif corp_status_data.get("your_role") == "Officer":
+            ctx.state["is_ceo_or_officer"] = True
+        # Note: No read endpoint exists for public corporation status.
+        # corp_is_public stays False/unverified; validation is server-owned.
+    else:
+        print("[Warning] Could not fetch corporation status.")
     
 @register("print_last_rpc")
 def print_last_rpc(ctx):
@@ -2738,6 +2845,14 @@ def print_last_rpc(ctx):
         message = error.get("message") if isinstance(error, dict) else None
         print(message or "The server could not complete the request.")
         return
+    if isinstance(resp, dict) and resp.get("type") == "combat.photon_fired_v1" and resp.get("status") == "ok":
+        data = get_data(resp)
+        if data.get("direct_impact_applied") is True:
+            print("Photon fired: target ship combat systems disabled until {0}; sector defenses suppressed until {1}.".format(
+                data.get("target_disabled_until", "unknown"), data.get("expires_at", "unknown")))
+        else:
+            print("Photon fired: target ship shields blocked direct impact; sector defenses suppressed until {0}.".format(
+                data.get("expires_at", "unknown")))
     print(json.dumps(resp, ensure_ascii=False, indent=2))
 
 @register("pretty_print_trade_quote")
@@ -2955,6 +3070,17 @@ def pretty_print_shipyard_list(ctx):
     else:
         print("No ships available at this shipyard.")
 
+    used_ships = data.get("used_available", [])
+    print("\nUsed hulls (existing ships; identity and installed equipment retained):")
+    if isinstance(used_ships, list) and used_ships:
+        for used in used_ships:
+            if isinstance(used, dict):
+                print(f"  - {used.get('name')} [{used.get('ship_type')}] ship {used.get('ship_id')} "
+                      f"· {used.get('price')} cr · hull {used.get('hull_value')} + equipment "
+                      f"{used.get('installed_equipment_value')} (inventory {used.get('used_inventory_id')})")
+    else:
+        print("  No used hulls are listed.")
+
 @register("pretty_print_hardware_list")
 def pretty_print_hardware_list(ctx):
     resp = ctx.state.get("last_rpc")
@@ -3145,6 +3271,75 @@ def pretty_print_bank_leaderboard(ctx):
             print(f" {i+1:<4} | {item.get('player_name', 'Unknown'):<17} | {balance_display}")
     else:
         print("No bank leaderboard data available.")
+
+@register("bank_order_create_flow")
+def bank_order_create_flow(ctx: Context):
+    """Create a recurring payment using the documented V3 schedule fields."""
+    try:
+        recipient_player_id = int(input("Recipient player ID: ").strip())
+        amount = int(input("Amount in whole credits: ").strip())
+    except ValueError:
+        print("Recipient and amount must be whole numbers.")
+        return
+    if recipient_player_id <= 0 or amount <= 0:
+        print("Recipient player ID and amount must be positive.")
+        return
+    frequency = input("Frequency (daily, weekly, monthly): ").strip().lower()
+    if frequency not in {"daily", "weekly", "monthly"}:
+        print("Frequency must be daily, weekly or monthly.")
+        return
+    time_utc = input("Execution time in UTC (HH:MM): ").strip()
+    if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", time_utc):
+        print("Execution time must use 24-hour HH:MM UTC format.")
+        return
+    payload = {
+        "recipient_player_id": recipient_player_id,
+        "amount": amount,
+        "frequency": frequency,
+        "time_utc": time_utc,
+    }
+    if frequency == "weekly":
+        try:
+            weekday = int(input("ISO weekday (Monday=1 through Sunday=7): ").strip())
+        except ValueError:
+            print("ISO weekday must be a whole number from 1 to 7.")
+            return
+        if not 1 <= weekday <= 7:
+            print("ISO weekday must be from 1 to 7.")
+            return
+        payload["weekday"] = weekday
+    elif frequency == "monthly":
+        try:
+            day_of_month = int(input("Day of month (1–31): ").strip())
+        except ValueError:
+            print("Day of month must be a whole number from 1 to 31.")
+            return
+        if not 1 <= day_of_month <= 31:
+            print("Day of month must be from 1 to 31.")
+            return
+        payload["day_of_month"] = day_of_month
+
+    response = ctx.conn.rpc("bank.orders.create", payload)
+    ctx.state["last_rpc"] = response
+    data = get_data(response) if isinstance(response, dict) else None
+    valid_receipt = (
+        isinstance(response, dict) and response.get("status") == "ok"
+        and response.get("type") == "bank.orders.created"
+        and isinstance(data, dict)
+        and type(data.get("order_id")) is int and data["order_id"] > 0
+        and data.get("recipient_player_id") == recipient_player_id
+        and data.get("amount") == amount
+        and data.get("frequency") == frequency
+        and data.get("time_utc") == time_utc
+        and type(data.get("next_run_at")) is int and data["next_run_at"] > 0
+    )
+    if valid_receipt:
+        print(f"Standing order {data['order_id']} scheduled for {frequency} at {time_utc} UTC.")
+        return
+    error = response.get("error", {}) if isinstance(response, dict) else {}
+    message = error.get("message", "The server did not return a matching schedule receipt.") if isinstance(error, dict) else str(error)
+    print(f"[Error] Standing order was not confirmed: {message}")
+    _pp(response)
 
 @register("pretty_print_corp_status")
 def pretty_print_corp_status(ctx):
@@ -3888,11 +4083,90 @@ def stock_dividend_set_flow(ctx: Context):
 
 @register("insurance_buy_flow")
 def insurance_buy_flow(ctx: Context):
-    insurance_unavailable_flow(ctx)
+    """Buy hull-only coverage for a ship the server confirms the player owns."""
+    try:
+        subject_id = int(input("Owned ship ID to insure: ").strip())
+        duration = int(input("Coverage duration in seconds: ").strip())
+        premium = int(input("Premium in whole credits: ").strip())
+        payout = int(input("Hull payout in whole credits: ").strip())
+        fund_id = int(input("Insurance fund ID: ").strip())
+    except ValueError:
+        print("Ship, duration, premium, payout and fund ID must be whole numbers.")
+        return
+    if subject_id <= 0 or duration <= 0 or premium < 0 or payout < 0 or fund_id <= 0:
+        print("Ship, duration and fund ID must be positive; premium and payout cannot be negative.")
+        return
+    response = ctx.conn.rpc("insurance.policies.buy", {
+        "subject_type": "ship", "subject_id": subject_id,
+        "duration": duration, "premium": premium,
+        "payout": payout, "fund_id": fund_id,
+    })
+    ctx.state["last_rpc"] = response
+    data = get_data(response) if isinstance(response, dict) else None
+    if (isinstance(response, dict) and response.get("status") == "ok"
+            and response.get("type") == "insurance.policies.buy.response"
+            and isinstance(data, dict) and type(data.get("policy_id")) is int
+            and data["policy_id"] > 0 and data.get("status") == "purchased"):
+        print(f"Hull insurance policy {data['policy_id']} purchased for ship {subject_id}.")
+        return
+    error = response.get("error", {}) if isinstance(response, dict) else {}
+    message = error.get("message", "The server did not return a matching policy receipt.") if isinstance(error, dict) else str(error)
+    print(f"[Error] Hull insurance was not confirmed: {message}")
+    _pp(response)
+
+
+@register("insurance_list_flow")
+def insurance_list_flow(ctx: Context):
+    response = ctx.conn.rpc("insurance.policies.list", {})
+    ctx.state["last_rpc"] = response
+    data = get_data(response) if isinstance(response, dict) else None
+    if (not isinstance(response, dict) or response.get("status") != "ok"
+            or response.get("type") != "insurance.policies.list.response"
+            or not isinstance(data, dict) or not isinstance(data.get("policies"), list)):
+        print("[Error] The server did not return a valid insurance policy list.")
+        _pp(response)
+        return
+    policies = data["policies"]
+    if not policies:
+        print("No hull insurance policies are on file.")
+        return
+    print("\n--- Hull Insurance Policies ---")
+    for policy in policies:
+        if not isinstance(policy, dict):
+            print("[Error] Invalid policy row in server response.")
+            return
+        print(f"Policy {policy.get('policy_id')}: ship {policy.get('subject_id')}, "
+              f"payout {present_money(policy.get('payout'))}, "
+              f"active={bool(policy.get('active'))}, expires={policy.get('expiry_ts', 'never')}")
 
 @register("insurance_claim_flow")
 def insurance_claim_flow(ctx: Context):
-    insurance_unavailable_flow(ctx)
+    """Settle a server-created claim; destruction claims normally auto-settle."""
+    try:
+        claim_id = int(input("Server-created claim ID: ").strip())
+        amount = int(input("Approved whole-credit amount: ").strip())
+    except ValueError:
+        print("Claim ID and amount must be whole numbers.")
+        return
+    event_id = input("Destruction event ID: ").strip()
+    if claim_id <= 0 or amount < 0 or not event_id:
+        print("Claim ID must be positive, amount nonnegative, and event ID nonempty.")
+        return
+    response = ctx.conn.rpc("insurance.claim.file", {
+        "claim_id": claim_id, "event_id": event_id, "amount": amount,
+    })
+    ctx.state["last_rpc"] = response
+    data = get_data(response) if isinstance(response, dict) else None
+    if (isinstance(response, dict) and response.get("status") == "ok"
+            and response.get("type") == "insurance.claim.file.response"
+            and isinstance(data, dict) and data.get("claim_id") == claim_id
+            and data.get("status") == "settled"):
+        print(f"Insurance claim {claim_id} settled. Qualifying destruction claims normally settle automatically.")
+        return
+    error = response.get("error", {}) if isinstance(response, dict) else {}
+    message = error.get("message", "The server did not return a matching claim receipt.") if isinstance(error, dict) else str(error)
+    print(f"[Error] Insurance claim was not confirmed: {message}")
+    _pp(response)
 
 
 @register("insurance_unavailable_flow")
@@ -4315,7 +4589,7 @@ def refresh_sector_and_display(ctx: Context):
         if not _response_type_matches(resp, "sector.info"):
             print("[Error] Sector refresh returned an unexpected response type; keeping the last confirmed state.")
             return False
-        payload = resp.get("data")
+        payload = get_data(resp)
         if not isinstance(payload, dict):
             print("[Error] Sector refresh returned malformed data; keeping the last confirmed state.")
             return False
@@ -4433,22 +4707,23 @@ def deploy_mines_flow(ctx: Context):
         print("Cannot deploy mines: current sector ID is unknown.")
         return
 
-    # Prompt user for amount and offensive setting
+    # Mine type, rather than fighter offensive setting, selects Armid/Limpet.
     amount_str = input("Amount to deploy: ").strip()
     if not amount_str.isdigit():
         print("Invalid amount. Please enter a number.")
         return
     amount = int(amount_str)
 
-    offense_str = input("Offensive setting (1=TOLL, 2=DEFEND, 3=ATTACK): ").strip()
-    if not offense_str.isdigit() or int(offense_str) not in [1, 2, 3]:
-        print("Invalid offensive setting. Please choose 1, 2, or 3.")
+    print("Mine type: 1) Armid  2) Limpet")
+    choice = input("Mine type: ").strip().lower()
+    mine_type = {"1": "armid", "2": "limpet", "armid": "armid", "limpet": "limpet"}.get(choice)
+    if mine_type is None:
+        print("Invalid mine type. Choose armid or limpet.")
         return
-    offense = int(offense_str)
 
     deploy_resp = ctx.conn.rpc("combat.deploy_mines", {
         "amount": amount,
-        "offense": offense
+        "mine_type": mine_type
     })
 
     if deploy_resp.get("status") == "ok":
@@ -4635,11 +4910,18 @@ def _render_scan_card(scan: dict) -> str:
         adjacent_known = "adjacent" in d or "adjacent_sectors" in d
         raw_adj = d.get("adjacent", d.get("adjacent_sectors", []))
         # Scan metadata is displayable only when each destination is a real
-        # server ID.  Do not let bool/float/string values become actionable
-        # destinations through presentation or the cache merge below.
-        adj = ([value for value in raw_adj
-                if _authoritative_positive_integer_id(value) is not None]
-               if isinstance(raw_adj, list) else [])
+        # server ID. The scan protocol emits the same {to_sector: id} rows as
+        # sector.info; accepting that shape keeps the scan usable without
+        # weakening the positive-integer validation.
+        adj = []
+        if isinstance(raw_adj, list):
+            for value in raw_adj:
+                if _authoritative_positive_integer_id(value) is not None:
+                    adj.append(value)
+                elif isinstance(value, dict):
+                    target = value.get("to_sector")
+                    if _authoritative_positive_integer_id(target) is not None:
+                        adj.append(target)
 
         # A non-empty array is visibility evidence only when every row has
         # the authoritative object shape.  Do not turn malformed rows into a
@@ -4668,6 +4950,13 @@ def _render_scan_card(scan: dict) -> str:
                 if (isinstance(value, int) and not isinstance(value, bool)
                         and value >= 0):
                     return str(value)
+            # The current-sector scan includes these arrays as part of its
+            # documented payload. Their lengths are authoritative counts when
+            # an older server omits the summary aliases.
+            rows_key = {"ships": "ships_present", "planets": "celestial_objects"}.get(key)
+            rows = d.get(rows_key) if rows_key else None
+            if isinstance(rows, list) and all(isinstance(row, dict) for row in rows):
+                return str(len(rows))
             return "unknown"
 
         beacon = d.get("beacon")
@@ -5243,7 +5532,7 @@ def ship_list_flow(ctx: Context, response: Optional[Dict[str, Any]] = None):
         ctx.state["last_rpc"] = response
     if not isinstance(response, dict):
         print("Ship roster unavailable: the server returned an invalid response.")
-        _refresh_ship_roster_state(ctx, include_roster=True)
+        _refresh_ship_roster_state(ctx)
         return
     if response.get("status") != "ok":
         print(f"Ship roster unavailable: {response.get('error', {}).get('message', 'The server did not return a ship roster.')}")
@@ -5298,7 +5587,24 @@ def ship_list_flow(ctx: Context, response: Optional[Dict[str, Any]] = None):
     if rows:
         print("\n".join(rows))
     else:
-        print("No ships are currently owned.")
+        # Every authenticated player must have a current ship (including an
+        # escape pod), so an empty roster needs independent active-ship
+        # confirmation before it can be shown as a real zero-ship state.
+        try:
+            active = ctx.conn.rpc("ship.status", {})
+        except (ConnectionError, OSError) as exc:
+            print(f"No authoritative ships were returned; active-ship confirmation was lost: {exc}")
+            return
+        active_record = _authoritative_hud_record(active, "ship")
+        active_id = (_authoritative_positive_integer_id(
+            active_record.get("id", active_record.get("ship_id"))
+        ) if isinstance(active_record, dict) else None)
+        if not _refresh_response_type_matches(active, "ship.status"):
+            print("No authoritative ships were returned: active-ship status had an unexpected response type.")
+        elif active_id is not None:
+            print("Ship roster unavailable: the empty ownership list conflicts with the confirmed active ship.")
+        else:
+            print("No authoritative ships were returned: the active ship could not be confirmed.")
 
 
 @register("ship_roster_inspect_flow")
@@ -6474,9 +6780,16 @@ def dock_trade_flow(ctx: Context, direction: str):
         _refresh_trade_views(ctx, port_id)
         return
     receipt = resp.get("data")
-    if (not _trade_receipt_type_matches(resp, direction)
-            or not _trade_receipt_lines_match(resp, payload)):
+    if not _trade_receipt_type_matches(resp, direction):
         print("Trade response had an unexpected receipt type; settlement was not displayed.")
+        _refresh_trade_views(ctx, port_id)
+        return
+    if not _trade_receipt_lines_match(resp, payload):
+        print("Trade receipt did not match the requested commodity and quantity; settlement was not displayed.")
+        _refresh_trade_views(ctx, port_id)
+        return
+    if not _trade_receipt_player_matches(resp, _known_player_id(ctx)):
+        print("Trade response did not identify the confirmed player; settlement was not displayed.")
         _refresh_trade_views(ctx, port_id)
         return
     receipt_port_id = _authoritative_positive_integer_id(
@@ -6808,6 +7121,46 @@ def _planet_info(ctx: Context, planet_id: int) -> Optional[dict]:
     return payload
 
 
+def _restore_landed_surface_after_login(
+    ctx: Context, player_record: Optional[dict], ship_response: Any
+) -> bool:
+    """Restore a persisted surface only from correlated player/ship/planet reads."""
+    player_id = _authoritative_positive_integer_id(ctx.state.get("player_id"))
+    if (player_id is None or not isinstance(player_record, dict)
+            or _authoritative_positive_integer_id(player_record.get("id")) != player_id):
+        return False
+    planet_id = _authoritative_positive_integer_id(player_record.get("last_planet_id"))
+    active_ship_id = _authoritative_positive_integer_id(player_record.get("ship_id"))
+    if planet_id is None or active_ship_id is None:
+        return False
+    ship_record = _authoritative_hud_record(ship_response, "ship")
+    if not _refresh_response_type_matches(ship_response, "ship.status") or ship_record is None:
+        return False
+    returned_ship_id = _authoritative_positive_integer_id(
+        ship_record.get("id", ship_record.get("ship_id"))
+    )
+    # ship.status reports onplanet as the documented 0/1 flag. The persisted
+    # planet ID is supplied by player.my_info, not encoded in this flag.
+    if returned_ship_id != active_ship_id or type(ship_record.get("onplanet")) is not int or ship_record["onplanet"] != 1:
+        return False
+    try:
+        planet = _planet_info(ctx, planet_id)
+    except (ConnectionError, OSError) as exc:
+        print(f"Landed-planet reconnect check could not be confirmed: {exc}")
+        return False
+    if planet is None:
+        return False
+    sector_id = _authoritative_positive_integer_id(ctx.current_sector_id)
+    if (_authoritative_positive_integer_id(planet.get("sector_id")) != sector_id
+            or _authoritative_positive_integer_id(player_record.get("sector")) != sector_id):
+        return False
+    ctx.state["on_planet"] = True
+    ctx.state["current_planet_id"] = planet_id
+    ctx.menu_stack.append("SURFACE")
+    _print_planet_overview(planet)
+    return True
+
+
 def _print_planet_overview(planet: dict) -> None:
     """Present only server-confirmed values; do not estimate stock/population."""
     print("\n--- Planet Overview ---")
@@ -6841,6 +7194,37 @@ def _refresh_planet_overview(ctx: Context, planet_id: int) -> None:
     planet = _planet_info(ctx, planet_id)
     if planet is not None:
         _print_planet_overview(planet)
+
+
+@register("planet_view_flow")
+def planet_view_flow(ctx: Context):
+    """Display the server's public, read-only planet view response."""
+    planet_id = _current_or_selected_planet_id(ctx)
+    if planet_id is None:
+        return
+    response = ctx.conn.rpc("planet.view", {"planet_id": planet_id})
+    ctx.state["last_rpc"] = response
+    if not isinstance(response, dict) or response.get("status") != "ok":
+        print(f"[Error] Planet overview refused: {_planet_error(response)}")
+        return
+    if response.get("type") != "planet.view_v1":
+        print("[Error] Planet overview response type was unexpected.")
+        return
+    data = get_data(response)
+    if not isinstance(data, dict) or data.get("planet_id") != planet_id:
+        print("[Error] Planet overview did not identify the selected planet.")
+        return
+    print("\n--- Planet Public Overview ---")
+    for key, label in (("name", "Name"), ("class", "Class"),
+                       ("population", "Population"),
+                       ("population_type", "Population type"),
+                       ("morale_status", "Morale status"),
+                       ("treasury", "Authorized treasury")):
+        if key in data:
+            print(f"{label}: {data[key]}")
+    for key in ("goods", "production", "citadel"):
+        if key in data:
+            print(f"{key.title()}: {json.dumps(data[key], sort_keys=True)}")
 
 
 def _current_or_selected_planet_id(ctx: Context) -> Optional[int]:
@@ -6959,18 +7343,283 @@ def planet_workforce_flow(ctx: Context):
     _refresh_planet_overview(ctx, planet_id)
 
 
-@register("planet_harvest_unavailable_flow")
-def planet_harvest_unavailable_flow(ctx: Context):
-    """Explain why harvest cannot be requested from the client yet.
+@register("planet_harvest_flow")
+def planet_harvest_flow(ctx: Context):
+    """Collect the server-settled production into the landed active ship."""
+    planet_id = _planet_id(ctx)
+    if planet_id is None:
+        print("Harvest requires a server-confirmed landing on a planet.")
+        return
+    if input(f"Harvest stored production from planet {planet_id} into your ship? [y/N]: ").strip().lower() != "y":
+        print("Harvest cancelled.")
+        return
+    response = ctx.conn.rpc("planet.harvest", {"planet_id": planet_id})
+    ctx.state["last_rpc"] = response
+    if not isinstance(response, dict) or response.get("status") != "ok":
+        print(f"[Error] Planet harvest refused: {_planet_error(response)}")
+        return
+    if response.get("type") != "planet.harvest_v1":
+        print("[Error] Harvest response type was unexpected; refresh the planet and ship before continuing.")
+        return
+    data = get_data(response)
+    if not isinstance(data, dict) or data.get("planet_id") != planet_id:
+        print("[Error] Harvest response did not identify the landed planet; refresh before continuing.")
+        return
+    print("Planetary production harvested into the active ship:")
+    print("  Ore: {ore_harvested}; Organics: {organics_harvested}; Equipment: {equipment_harvested}".format(
+        ore_harvested=data.get("ore_harvested", 0),
+        organics_harvested=data.get("organics_harvested", 0),
+        equipment_harvested=data.get("equipment_harvested", 0),
+    ))
+    print(f"  Turns charged: {data.get('turns_charged', 'not reported')}")
+    ship = _hud_rpc(ctx, "ship.status", {})
+    if ship.get("status") != "ok" or ship.get("type") != "ship.status":
+        print("Warning: harvest succeeded, but active ship cargo could not be refreshed.")
+    _refresh_planet_overview(ctx, planet_id)
 
-    The protocol exposes a harvest-shaped command, but the authoritative
-    server handler is still unavailable and V3 has no pinned harvest policy.
-    Keep the capability visible while refusing to fabricate a formula or RPC.
-    """
-    print(
-        "Planet harvest unavailable: the authoritative server handler and "
-        "V3 production policy are not released, so no request was sent."
-    )
+
+@register("planet_emancipate_flow")
+def planet_emancipate_flow(ctx: Context):
+    """Convert the landed planet's complete slave population as authorized."""
+    planet_id = _planet_id(ctx)
+    if planet_id is None:
+        print("Emancipation requires a server-confirmed landing on the planet.")
+        return
+    if input(f"Convert all slaves on planet {planet_id} to colonists? [y/N]: ").strip().lower() != "y":
+        print("Emancipation cancelled.")
+        return
+    response = ctx.conn.rpc("planet.emancipate", {"planet_id": planet_id})
+    ctx.state["last_rpc"] = response
+    if not isinstance(response, dict) or response.get("status") != "ok":
+        print(f"[Error] Planet emancipation refused: {_planet_error(response)}")
+        return
+    if response.get("type") != "planet.emancipated_v1":
+        print("[Error] Emancipation response type was unexpected; refresh the planet before continuing.")
+        return
+    data = get_data(response)
+    if not isinstance(data, dict) or data.get("planet_id") != planet_id:
+        print("[Error] Emancipation response did not identify the landed planet; refresh before continuing.")
+        return
+    print(f"Planet {planet_id}: {data.get('population', 'unknown')} population is now COLONIST.")
+    print(f"  Turns charged: {data.get('turns_charged', 'not reported')}; credits charged: {data.get('credits_charged', 'not reported')}")
+    _refresh_planet_overview(ctx, planet_id)
+
+
+@register("planet_market_sell_flow")
+def planet_market_sell_flow(ctx: Context):
+    """Sell controlled planetary surplus to the Galactic Exchange."""
+    planet_id = _planet_id(ctx)
+    if planet_id is None:
+        print("Exchange sale requires a server-confirmed planetary landing.")
+        return
+    commodity = input("Commodity to sell (ORE, ORG, EQU): ").strip().upper()
+    if commodity not in {"ORE", "ORG", "EQU"}:
+        print("Choose ORE, ORG, or EQU.")
+        return
+    try:
+        quantity = int(input("Quantity to sell: ").strip())
+    except ValueError:
+        print("Quantity must be a positive whole number.")
+        return
+    if quantity <= 0:
+        print("Quantity must be a positive whole number.")
+        return
+    if input(f"Sell {quantity} {commodity} from planet {planet_id} to the Galactic Exchange? [y/N]: ").strip().lower() != "y":
+        print("Planetary Exchange sale cancelled.")
+        return
+    response = ctx.conn.rpc("planet.market.sell", {
+        "planet_id": planet_id, "commodity": commodity, "quantity": quantity,
+    })
+    ctx.state["last_rpc"] = response
+    if not isinstance(response, dict) or response.get("status") != "ok":
+        print(f"[Error] Planetary Exchange sale refused: {_planet_error(response)}")
+        return
+    data = get_data(response)
+    if (response.get("type") != "planet.market.sell" or not isinstance(data, dict)
+            or data.get("planet_id") != planet_id
+            or data.get("commodity") != commodity
+            or data.get("quantity_sold") != quantity
+            or type(data.get("total_credits_received")) is not int
+            or data["total_credits_received"] < 0):
+        print("[Error] Exchange sale was not confirmed by a matching receipt; refresh before relying on the result.")
+        return
+    print(f"Planetary Exchange sale confirmed: {quantity} {commodity}; received {data['total_credits_received']} credits.")
+    _refresh_planet_overview(ctx, planet_id)
+    _hud_rpc(ctx, "player.my_info", {})
+
+
+@register("planet_trade_port_flow")
+def planet_trade_port_flow(ctx: Context):
+    """Sell accumulated planetary stock directly to a local buying port."""
+    planet_id = _planet_id(ctx)
+    if planet_id is None:
+        print("Planetary port trade requires a server-confirmed planetary landing.")
+        return
+    sector = ctx.last_sector_desc or {}
+    port = sector.get("port") if isinstance(sector, dict) else None
+    port_id = port.get("id") if isinstance(port, dict) else None
+    if type(port_id) is not int or port_id <= 0:
+        print("No local port is reported in the current sector.")
+        return
+    commodity = input("Commodity to sell (ORE, ORG, EQU): ").strip().upper()
+    if commodity not in {"ORE", "ORG", "EQU"}:
+        print("Choose ORE, ORG, or EQU.")
+        return
+    try:
+        quantity = int(input("Quantity to sell: ").strip())
+    except ValueError:
+        print("Quantity must be a positive whole number.")
+        return
+    if quantity <= 0:
+        print("Quantity must be a positive whole number.")
+        return
+    if input(f"Sell {quantity} {commodity} from planet {planet_id} to local port {port_id}? [y/N]: ").strip().lower() != "y":
+        print("Planetary trade cancelled.")
+        return
+    request = {
+        "planet_id": planet_id,
+        "port_id": port_id,
+        "items": [{"commodity": commodity, "quantity": quantity}],
+        "idempotency_key": str(uuid.uuid4()),
+    }
+    response = ctx.conn.rpc("planet.trade.port", request)
+    ctx.state["last_rpc"] = response
+    if not isinstance(response, dict) or response.get("status") != "ok":
+        print(f"[Error] Planetary port trade refused: {_planet_error(response)}")
+        return
+    if response.get("type") != "planet.trade.port_receipt_v1":
+        print("[Error] Planetary trade returned an unexpected receipt type; refresh before continuing.")
+        return
+    receipt = get_data(response)
+    if not isinstance(receipt, dict) or receipt.get("planet_id") != planet_id or receipt.get("port_id") != port_id:
+        print("[Error] Planetary trade receipt did not identify the requested planet and port.")
+        return
+    print("Planetary Trade Agreement settled by the server:")
+    _pp(receipt)
+    player = _hud_rpc(ctx, "player.my_info", {})
+    if player.get("status") != "ok" or player.get("type") != "player.info":
+        print("Warning: the sale succeeded, but player credits could not be refreshed.")
+    _refresh_planet_overview(ctx, planet_id)
+
+
+@register("planet_port_construct_flow")
+def planet_port_construct_flow(ctx: Context):
+    """Fund a new local StarPort from an authorized planet's materials."""
+    planet_id = _planet_id(ctx)
+    if planet_id is None:
+        print("StarPort construction requires a server-confirmed planetary landing.")
+        return
+    classes = {
+        1: "SBB", 2: "SSB", 3: "BSS", 4: "BSB",
+        5: "BBS", 6: "SBS", 7: "BBB", 8: "SSS",
+    }
+    for number, code in classes.items():
+        print(f"  {number}) {code}")
+    try:
+        port_class = int(input("New StarPort trading class: ").strip())
+    except ValueError:
+        print("Choose a class from 1 through 8.")
+        return
+    if port_class not in classes:
+        print("Choose a class from 1 through 8.")
+        return
+    if input(f"Start class {classes[port_class]} construction from planet {planet_id}? [y/N]: ").strip().lower() != "y":
+        print("StarPort construction cancelled.")
+        return
+    pending = ctx.state.get("pending_port_construction")
+    if not isinstance(pending, dict) or pending.get("planet_id") != planet_id or pending.get("port_class") != port_class:
+        pending = {"planet_id": planet_id, "port_class": port_class, "idempotency_key": str(uuid.uuid4())}
+        ctx.state["pending_port_construction"] = pending
+    try:
+        response = ctx.conn.rpc("planet.port.construct", dict(pending))
+    except (ConnectionError, OSError) as exc:
+        print(f"Construction outcome is uncertain; retry the same planet and class after reconnecting: {exc}")
+        return
+    ctx.state["last_rpc"] = response
+    if not isinstance(response, dict) or response.get("status") != "ok":
+        print(f"[Error] StarPort construction refused: {_planet_error(response)}")
+        return
+    if response.get("type") != "planet.port_construction_v1":
+        print("[Error] StarPort construction returned an unexpected receipt type.")
+        return
+    result = get_data(response)
+    if not isinstance(result, dict) or result.get("planet_id") != planet_id:
+        print("[Error] Construction receipt did not identify this planet.")
+        return
+    ctx.state.pop("pending_port_construction", None)
+    print(f"StarPort construction {result.get('construction_id')} started; "
+          f"{result.get('deliveries_required')} scheduled deliveries remain.")
+    _refresh_planet_overview(ctx, planet_id)
+
+
+@register("corp_member_asset_transfer_flow")
+def corp_member_asset_transfer_flow(ctx: Context):
+    """Transfer a supported asset to a fellow corporation member."""
+    if not ctx.state.get("in_corporation"):
+        print("You must be a corporation member to transfer assets.")
+        return
+    try:
+        target_player_id = int(input("Recipient corporation member ID: ").strip())
+    except ValueError:
+        print("Enter a valid player ID.")
+        return
+    if target_player_id <= 0:
+        print("Player ID must be positive.")
+        return
+    assets = {"1": "credits", "2": "fighters", "3": "mines", "4": "shields"}
+    print("Transferable assets: 1) credits  2) fighters  3) mines  4) shields")
+    asset_choice = input("Asset: ").strip().lower()
+    asset = assets.get(asset_choice, asset_choice)
+    if asset not in {"credits", "fighters", "mines", "shields"}:
+        print("Choose credits, fighters, mines, or shields.")
+        return
+    try:
+        quantity = int(input("Quantity: ").strip())
+    except ValueError:
+        print("Quantity must be a positive whole number.")
+        return
+    if quantity <= 0:
+        print("Quantity must be a positive whole number.")
+        return
+    response = ctx.conn.rpc("corp.status", {})
+    if response.get("status") != "ok" or response.get("type") != "corp.status.success":
+        print("Could not confirm corporation membership; no transfer was sent.")
+        return
+    corp_id = get_data(response).get("corp_id")
+    if type(corp_id) is not int or corp_id <= 0:
+        print("You are not currently in a corporation.")
+        return
+    roster_response = ctx.conn.rpc("corp.roster", {"corp_id": corp_id})
+    if roster_response.get("status") != "ok":
+        print(f"Could not load the member roster: {_planet_error(roster_response)}")
+        return
+    roster = get_data(roster_response).get("roster", [])
+    member = next((row for row in roster if isinstance(row, dict) and row.get("player_id") == target_player_id), None)
+    if member is None:
+        print("That player is not in your corporation roster; no transfer was sent.")
+        return
+    recipient = member.get("name") or f"player {target_player_id}"
+    if input(f"Transfer {quantity} {asset} to {recipient}? [y/N]: ").strip().lower() != "y":
+        print("Asset transfer cancelled.")
+        return
+    result = ctx.conn.rpc("corp.member.transfer", {
+        "target_player_id": target_player_id,
+        "asset": asset,
+        "quantity": quantity,
+    })
+    ctx.state["last_rpc"] = result
+    if result.get("status") != "ok" or result.get("type") != "corp.member.asset_transferred_v1":
+        print(f"[Error] Corporation asset transfer refused: {_planet_error(result)}")
+        return
+    receipt = get_data(result)
+    if receipt.get("sender_player_id") != ctx.state.get("player_id") or receipt.get("recipient_player_id") != target_player_id:
+        print("[Error] Transfer receipt identity did not match the requested members.")
+        return
+    print(f"Transferred {quantity} {asset} to {recipient}.")
+    print(f"  Sender remaining: {receipt.get('sender_remaining')}; recipient total: {receipt.get('recipient_total')}")
+    refreshed = _hud_rpc(ctx, "player.my_info", {})
+    if refreshed.get("status") != "ok" or refreshed.get("type") != "player.info":
+        print("Warning: the transfer succeeded, but player balance could not be refreshed.")
 
 
 def _select_planet_commodity(planet: dict, include_credits: bool = False) -> Optional[str]:
@@ -7060,6 +7709,45 @@ def combat_attack_flow(ctx: Context):
     _hud_rpc(ctx, "ship.status", {})
     sector_response = ctx.conn.rpc("sector.info", {})
     if isinstance(sector_response, dict) and sector_response.get("status") == "ok":
+        ctx.last_sector_desc = normalize_sector(get_data(sector_response))
+
+
+@register("combat_attack_port_flow")
+def combat_attack_port_flow(ctx: Context):
+    """Attack only the active StarPort authoritatively present in this sector."""
+    ctx_refresh_port_context(ctx)
+    info = ctx.state.get("port_inventory")
+    port = info if isinstance(info, dict) else None
+    port_id = _authoritative_positive_integer_id(port.get("id")) if isinstance(port, dict) else None
+    if port_id is None:
+        print("No active StarPort is confirmed in this sector.")
+        return
+    pending = ctx.state.get("pending_port_attack")
+    if not isinstance(pending, dict) or pending.get("port_id") != port_id:
+        pending = {"port_id": port_id, "idempotency_key": str(uuid.uuid4())}
+        ctx.state["pending_port_attack"] = pending
+    if not _trade_confirmation(f"Attack StarPort {port_id}?", default_no=True):
+        print("Attack cancelled; no command was sent.")
+        return
+    try:
+        response = ctx.conn.rpc("combat.attack.port", dict(pending))
+    except (ConnectionError, OSError) as exc:
+        print(f"Attack outcome is uncertain; retry the same port after reconnecting: {exc}")
+        return
+    ctx.state["last_rpc"] = response
+    result = get_data(response) if isinstance(response, dict) else None
+    if (not isinstance(response, dict) or response.get("status") != "ok"
+            or response.get("type") != "combat.port_strike.v1" or not isinstance(result, dict)
+            or result.get("port_id") != port_id):
+        print("StarPort attack was not confirmed:")
+        _pp(response)
+        return
+    ctx.state.pop("pending_port_attack", None)
+    print("Server combat result:")
+    _pp(result)
+    _hud_rpc(ctx, "ship.status", {})
+    sector_response = ctx.conn.rpc("sector.info", {})
+    if isinstance(sector_response, dict) and sector_response.get("status") == "ok" and _response_type_matches(sector_response, "sector.info"):
         ctx.last_sector_desc = normalize_sector(get_data(sector_response))
 
 
@@ -7350,6 +8038,7 @@ def land_flow(ctx: Context):
         # Landing consumes a turn and changes ship/planet state. Refresh the
         # authoritative HUD domains before opening the surface menu so the
         # next render cannot show pre-landing turns or ship state.
+        expected_ship_id = ctx.hud.ship_id
         player_resp = _safe_landing_refresh(ctx, "player.my_info", {})
         player_data = _authoritative_hud_record(player_resp, "player")
         player_refreshed = _landing_player_refresh_is_current(
@@ -7381,15 +8070,17 @@ def land_flow(ctx: Context):
             # the server-owned active ship.  Do not accept a partial ship
             # object merely because it contains display fields such as hull.
             and type(actual_ship_id) is int and actual_ship_id > 0
+            and expected_ship_id is not None
             and actual_ship_id == expected_ship_id
         )
         if ship_refreshed:
-            # ship.status exposes the server-owned landed planet ID. It is the
-            # final identity check before exposing planet actions: omission is
-            # also a partial refresh, because a ship-only record cannot prove
-            # that this active ship is on the planet returned by planet.land.
-            landed_planet_id = _authoritative_positive_integer_id(ship_record.get("onplanet"))
-            ship_refreshed = landed_planet_id == landed_pid
+            # ship.status exposes ``onplanet`` as a 0/1 flag (the landing
+            # response above supplies the confirmed planet ID). Require the
+            # authoritative active ship to remain landed after that response;
+            # comparing this boolean with the planet ID rejects every planet
+            # whose ID is not 1 and strands the player outside the surface UI.
+            onplanet = ship_record.get("onplanet")
+            ship_refreshed = type(onplanet) is int and onplanet == 1
         sector_refreshed = _safe_landing_sector_refresh(ctx)
         if not player_refreshed or not ship_refreshed or not sector_refreshed:
             # The landing envelope is not enough to make planet actions
@@ -7595,6 +8286,8 @@ def _planet_attack_result_is_authoritative(data: Any, planet_id: int) -> bool:
         return False
     if data.get("planet_id") != planet_id or type(data.get("captured")) is not bool:
         return False
+    if type(data.get("enslaved_colonists")) is not bool:
+        return False
     return all(
         type(data.get(field)) is int and data[field] >= 0
         for field in ("attacker_remaining_fighters", "defender_remaining_fighters")
@@ -7716,8 +8409,18 @@ def combat_attack_planet_flow(ctx: Context):
     if input(f"Attack {planet.get('name', 'this planet')} (ID {planet_id})? This can destroy fighters and change ownership. (y/N): ").strip().lower() != "y":
         print("Cancelled.")
         return
+    enslavement_answer = input(
+        "If you are evil-aligned, enslave colonists if capture succeeds? [y/N]: "
+    ).strip().lower()
+    if enslavement_answer not in ("", "y", "yes", "n", "no"):
+        print("Invalid enslavement choice; no request was sent.")
+        return
+    enslave_colonists = enslavement_answer in ("y", "yes")
     try:
-        response = ctx.conn.rpc("combat.attack_planet", {"planet_id": planet_id})
+        response = ctx.conn.rpc("combat.attack_planet", {
+            "planet_id": planet_id,
+            "enslave_colonists": enslave_colonists,
+        })
     except (ConnectionError, OSError) as exc:
         ctx.state["last_rpc"] = None
         print(f"Planet attack outcome is uncertain after connection loss: {exc}")
@@ -7758,6 +8461,8 @@ def combat_attack_planet_flow(ctx: Context):
     print(f"  Captured: {data.get('captured', 'not reported')}")
     print(f"  Attacker fighters remaining: {data.get('attacker_remaining_fighters', 'not reported')}")
     print(f"  Planet fighters remaining: {data.get('defender_remaining_fighters', 'not reported')}")
+    if isinstance(data.get("enslaved_colonists"), bool):
+        print(f"  Colonists enslaved: {data['enslaved_colonists']}")
     _refresh_after_planet_attack(ctx)
 
 
@@ -8168,8 +8873,18 @@ def shipyard_sell_flow(ctx: Context, selected_ship_id: Optional[int] = None):
         print(f"Ship sale confirmed: {present_money(receipt['sale_proceeds'])} credits received.")
         print(f"  Cargo forfeited: {bool(receipt.get('cargo_forfeited'))}; "
               f"insurance terminated: {bool(receipt.get('insurance_terminated'))}.")
-    _hud_rpc(ctx, "player.my_info", {})
-    _refresh_ship_after_move(ctx)
+    player_response = _hud_rpc(ctx, "player.my_info", {})
+    if (isinstance(player_response, dict)
+            and player_response.get("status") == "ok"
+            and _refresh_response_type_matches(player_response, "player.info")):
+        ctx.player_info = get_data(player_response)
+        replacement_ship_id = get_my_ship_id(ctx.conn, ctx)
+    else:
+        replacement_ship_id = None
+    if type(replacement_ship_id) is int and replacement_ship_id > 0:
+        _refresh_ship_after_move(ctx, expected_ship_id=replacement_ship_id)
+    else:
+        print("Warning: ship sale succeeded, but the active replacement ship could not be identified; ship HUD remains unchanged.")
     _refresh_sector_after_shipyard(ctx)
 
 
@@ -8204,6 +8919,42 @@ def ship_repair_flow(ctx: Context):
     ship = _refresh_ship_after_move(ctx)
     if player.get("status") != "ok" or not _refresh_response_type_matches(ship, "ship.status"):
         print("Warning: repair succeeded, but authoritative credits or ship state could not be refreshed.")
+
+
+@register("port_upgrade_flow")
+def port_upgrade_flow(ctx: Context):
+    """Upgrade one traded commodity's capacity at the local StarPort."""
+    port = (ctx.state.get("port_inventory") or {}).get("port") or {}
+    port_id = _authoritative_positive_integer_id(port.get("id"))
+    if port_id is None:
+        port_id = _authoritative_positive_integer_id((ctx.last_sector_desc.get("port") or {}).get("id"))
+    if port_id is None:
+        print("StarPort upgrade unavailable: refresh this sector's port details first.")
+        return
+    commodity = input("Commodity capacity to upgrade [ORE/ORG/EQU]: ").strip().upper()
+    if commodity not in {"ORE", "ORG", "EQU"}:
+        print("Choose ORE, ORG, or EQU.")
+        return
+    pending = ctx.state.get("pending_port_upgrade")
+    if not isinstance(pending, dict) or pending.get("port_id") != port_id or pending.get("commodity") != commodity:
+        pending = {"port_id": port_id, "commodity": commodity, "idempotency_key": str(uuid.uuid4())}
+        ctx.state["pending_port_upgrade"] = pending
+    try:
+        response = ctx.conn.rpc("port.upgrade", dict(pending))
+    except (ConnectionError, OSError) as exc:
+        print(f"Upgrade outcome is uncertain; retry the same commodity after reconnecting: {exc}")
+        return
+    ctx.state["last_rpc"] = response
+    result = get_data(response) if isinstance(response, dict) else None
+    if (not isinstance(response, dict) or response.get("status") != "ok"
+            or response.get("type") != "port.upgrade.v1" or not isinstance(result, dict)
+            or result.get("port_id") != port_id or result.get("commodity") != commodity):
+        print("StarPort upgrade was not confirmed:")
+        _pp(response)
+        return
+    ctx.state.pop("pending_port_upgrade", None)
+    print("StarPort commodity capacity upgraded:")
+    _pp(result)
 
 
 @register("shipyard_upgrade_flow")
@@ -8325,6 +9076,80 @@ def shipyard_upgrade_flow(ctx: Context):
     else:
         print(f"[Error] Ship upgrade failed: {upgrade_resp.get('error', {}).get('message', 'Unknown error')}")
         _pp(upgrade_resp)
+
+@register("shipyard_used_purchase_flow")
+def shipyard_used_purchase_flow(ctx: Context):
+    """Purchase a server-listed existing used hull without replacing its ID."""
+    list_resp = ctx.conn.rpc("shipyard.list", {})
+    ctx.state["last_rpc"] = list_resp
+    if (not isinstance(list_resp, dict) or list_resp.get("status") != "ok"
+            or list_resp.get("type") != "shipyard.list_v1"):
+        print("[Error] Could not retrieve the authoritative used-hull list.")
+        return
+    data = list_resp.get("data")
+    used = data.get("used_available") if isinstance(data, dict) else None
+    if not isinstance(used, list):
+        print("[Error] The shipyard response did not contain used_available.")
+        return
+    valid_used = [entry for entry in used if isinstance(entry, dict)
+                  and type(entry.get("used_inventory_id")) is int
+                  and entry["used_inventory_id"] > 0
+                  and type(entry.get("ship_id")) is int and entry["ship_id"] > 0
+                  and type(entry.get("price")) is int and entry["price"] >= 0]
+    if not valid_used:
+        print("No used hulls are currently available at this shipyard.")
+        return
+    print("\n--- Used Hulls Available at this Shipyard ---")
+    for index, entry in enumerate(valid_used, 1):
+        print(f"  {index}. {entry.get('name', 'Unnamed hull')} ({entry.get('ship_type', 'Unknown type')}) "
+              f"ID {entry['ship_id']} · price {entry['price']} credits · hull value {entry.get('hull_value')} "
+              f"+ retained equipment {entry.get('installed_equipment_value')}")
+    try:
+        choice = int(input("Enter used hull number to purchase: ").strip())
+    except ValueError:
+        print("Invalid choice.")
+        return
+    if not 1 <= choice <= len(valid_used):
+        print("Invalid choice.")
+        return
+    selected = valid_used[choice - 1]
+    inventory_id = selected["used_inventory_id"]
+    original_ship_id = selected["ship_id"]
+    price = selected["price"]
+    if input(f"Purchase existing hull {selected.get('name', original_ship_id)} for {price} credits? [y/N]: ").strip().lower() != "y":
+        print("Used-hull purchase cancelled.")
+        return
+    result = ctx.conn.rpc("shipyard.upgrade", {"used_inventory_id": inventory_id})
+    ctx.state["last_rpc"] = result
+    receipt = get_data(result) if isinstance(result, dict) else None
+    valid_receipt = (
+        isinstance(result, dict) and result.get("status") == "ok"
+        and result.get("type") == "shipyard.upgraded_v1"
+        and isinstance(receipt, dict)
+        and receipt.get("used_inventory_id") == inventory_id
+        and receipt.get("ship_id") == original_ship_id
+        and receipt.get("credits_spent") == price
+    )
+    if not valid_receipt:
+        if isinstance(result, dict) and result.get("status") != "ok":
+            print(f"[Error] Used-hull purchase refused: {_planet_error(result)}")
+        else:
+            print("[Warning] Used-hull purchase was not confirmed by a matching server receipt.")
+        _hud_rpc(ctx, "player.my_info", {})
+        _hud_rpc(ctx, "ship.status", {})
+        if not _refresh_sector_after_shipyard(ctx):
+            print("[Warning] Could not refresh sector after the uncertain used-hull response.")
+        return
+    print(f"Purchased existing ship {original_ship_id} for {price} credits; hull and equipment identity were retained.")
+    my_info = _hud_rpc(ctx, "player.my_info", {})
+    if my_info.get("status") == "ok":
+        ctx.player_info = get_data(my_info)
+    else:
+        print("[Warning] Could not refresh player credits after used-hull purchase.")
+    if _hud_rpc(ctx, "ship.status", {}).get("status") != "ok":
+        print("[Warning] Could not refresh the active used ship status.")
+    if not _refresh_sector_after_shipyard(ctx):
+        print("[Warning] Could not refresh sector after used-hull purchase.")
 
 @register("buy_ship_flow")
 def buy_ship_flow(ctx: Context):
@@ -8608,6 +9433,107 @@ def raw_json_handler(ctx: Context) -> None:
     except Exception as e:
         print(f"An error occurred: {e}")
 
+
+@register("feedback_report_flow")
+def feedback_report_flow(ctx: Context) -> None:
+    """Submit a sanitized bug/suggestion report through the authenticated API."""
+    print("--- Report Bug / Suggest Improvement ---")
+    kind = input("Type (b)ug or (s)uggestion [b]: ").strip().lower() or "b"
+    if kind not in ("b", "s"):
+        print("Choose b or s.")
+        return
+    report_type = "bug" if kind == "b" else "suggestion"
+    failure = ctx.state.pop("feedback_failure_context", None)
+    default_subject = "Command failed: " + str(failure.get("command", "")) if isinstance(failure, dict) else ""
+    default_description = ("The server returned %s (error code %s) for %s." % (
+        str(failure.get("status", "error")), str(failure.get("error_code", "unknown")),
+        str(failure.get("command", "command")))) if isinstance(failure, dict) else ""
+    subject = input(("Subject [%s]: " % default_subject) if default_subject else "Subject: ").strip() or default_subject
+    description = input(("Description [%s]: " % default_description) if default_description else "Description: ").strip() or default_description
+    if not subject or not description:
+        print("A subject and description are required.")
+        return
+    expected = actual = ""
+    if report_type == "bug":
+        expected = input("Expected behaviour: ").strip()
+        actual = input("Actual behaviour: ").strip()
+        if not expected or not actual:
+            print("Bug reports require expected and actual behaviour.")
+            return
+    steps = input("Reproduction steps (optional): ").strip()
+    include = (input("Include recent diagnostics? [Y/n]: ").strip().lower() or "y") == "y"
+    count_raw = input("Recent exchanges (10/25/50/100) [25]: ").strip() or "25"
+    try:
+        count = int(count_raw)
+        diagnostics = ctx.conn.diagnostics.recent(count) if include else []
+    except ValueError:
+        print("Choose 10, 25, 50 or 100.")
+        return
+    report = {
+        "report_type": report_type, "subject": sanitize_text(subject),
+        "description": sanitize_text(description), "expected_behavior": sanitize_text(expected),
+        "actual_behavior": sanitize_text(actual), "reproduction_steps": sanitize_text(steps),
+    }
+    payload = {**report, "diagnostics": diagnostics, "client_name": "python",
+               "client_version": "3", "build_id": "", "protocol_version": "v3",
+               "idempotency_key": str(uuid.uuid4())}
+    try:
+        preview_response = ctx.conn.rpc("feedback.preview", payload)
+        preview_data = get_data(preview_response)
+        if preview_response.get("status") != "ok" or not preview_data.get("title") or not preview_data.get("body"):
+            print("The server could not prepare a safe public preview; report not submitted.")
+            return
+        print("\n--- Exact public issue preview ---\n" + str(preview_data["title"]) + "\n\n" + str(preview_data["body"]))
+        if input("Submit this report? Type YES to confirm: ").strip() != "YES":
+            print("Report cancelled.")
+            return
+        response = ctx.conn.rpc("feedback.submit", payload)
+        data = get_data(response)
+        if response.get("status") != "ok":
+            print("Report was not accepted: " + str((response.get("error") or {}).get("message", "server refused submission")))
+            return
+        print("Report reference: " + str(data.get("report_id", "unavailable")))
+        print("Submission status: " + str(data.get("state", "pending")))
+        if data.get("github_issue_url"):
+            print("GitHub issue: " + str(data["github_issue_url"]))
+    except Exception:
+        # Deliberately avoid printing raw exception text, which could contain
+        # endpoint or local-path information.
+        print("Report submission failed. It could not be queued locally because the server was unavailable.")
+
+
+@register("feedback_error_flow")
+def feedback_error_flow(ctx: Context) -> None:
+    """Open a report prefilled with the last failed player command metadata."""
+    failure = getattr(ctx.conn, "last_failed_command", None)
+    if not isinstance(failure, dict):
+        print("There is no recent failed command to report.")
+        return
+    ctx.state["feedback_failure_context"] = dict(failure)
+    feedback_report_flow(ctx)
+
+
+@register("feedback_status_flow")
+def feedback_status_flow(ctx: Context) -> None:
+    """Look up publication status for a report owned by this player."""
+    report_id = input("Feedback report UUID: ").strip()
+    if not report_id:
+        print("No report UUID entered.")
+        return
+    try:
+        response = ctx.conn.rpc("feedback.status", {"report_id": report_id})
+    except Exception:
+        print("Feedback status is unavailable while disconnected.")
+        return
+    if response.get("status") != "ok":
+        print("Feedback report was not found for this player.")
+        return
+    data = get_data(response)
+    print("Report reference: " + str(data.get("report_id", report_id)))
+    print("Submission status: " + str(data.get("state", "unknown")))
+    if data.get("github_issue_url"):
+        print("GitHub issue: " + str(data["github_issue_url"]))
+
 # ---------------------------
 # Quit
 # ---------------------------
@@ -8759,12 +9685,19 @@ def main():
             if not isinstance(current, int):
                 my_info_resp = conn.rpc("player.my_info", {})
                 current = extract_current_sector(my_info_resp) or 1
+            # Login often includes the current sector, so it does not need
+            # player.my_info for navigation. The same authoritative read is
+            # still required to hydrate the player's ID for later client-side
+            # receipt checks and permission-aware workflows.
+            if my_info_resp is None:
+                my_info_resp = conn.rpc("player.my_info", {})
 
             # describe sector and normalize
             desc = conn.rpc("move.describe_sector", {"sector_id": int(current)})
             norm = normalize_sector(get_data(desc))
 
             ctx = Context(conn=conn, menus=menus, last_sector_desc=norm, capabilities=capabilities)
+            conn.ctx = ctx
             ctx.state["cli"] = {"host": args.host, "port": args.port, "user": user, "debug": bool(args.debug)}
             ctx.state["debug"] = bool(args.debug)
             initial_player = _authoritative_hud_record(my_info_resp, "player")
@@ -8774,8 +9707,6 @@ def main():
             # Authoritative HUD hydration: only confirmed, non-consuming
             # handlers are used (see hud.py module docstring for provenance
             # of every field, including the login-only unread-news snapshot).
-            if my_info_resp is None:
-                my_info_resp = conn.rpc("player.my_info", {})
             ship_resp = conn.rpc("ship.status", {})
             mail_resp = None
             notice_resp = None
@@ -8792,6 +9723,8 @@ def main():
                 my_info_resp=my_info_resp, ship_resp=ship_resp, sector_resp=norm,
                 mail_resp=mail_resp, notice_resp=notice_resp,
             )
+
+            _restore_landed_surface_after_login(ctx, initial_player, ship_resp)
 
             # Initial update of corporation context after login
             _update_corp_context(ctx)

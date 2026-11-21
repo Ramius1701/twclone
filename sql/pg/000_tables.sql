@@ -132,6 +132,7 @@ CREATE TABLE ships (
     ported integer DEFAULT 0,
     onplanet boolean NOT NULL DEFAULT FALSE,
     destroyed boolean NOT NULL DEFAULT FALSE,
+    combat_disabled_until bigint NOT NULL DEFAULT 0,
     hull bigint NOT NULL DEFAULT 100,
     perms bigint NOT NULL DEFAULT 731,
     personality text CHECK (personality IS NULL OR personality IN ('balanced', 'offensive', 'defensive', 'looter', 'blockader')),
@@ -306,12 +307,13 @@ CREATE TABLE alignment_band (
 );
 
 CREATE TABLE trade_idempotency (
-    key TEXT PRIMARY KEY,
+    key TEXT NOT NULL,
     player_id integer NOT NULL,
     sector_id integer NOT NULL,
     request_json text NOT NULL,
     response_json text NOT NULL,
-    created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP
+    created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (key, player_id)
 );
 
 CREATE TABLE used_sectors (
@@ -442,17 +444,31 @@ CREATE TABLE ports (
     type BIGINT DEFAULT 1,
     economy_curve_id bigint NOT NULL DEFAULT 1,
     porttype_id integer,
+    durability integer NOT NULL DEFAULT 0,
+    defensive_strength integer NOT NULL DEFAULT 0,
     FOREIGN KEY (economy_curve_id) REFERENCES economy_curve (economy_curve_id),
     FOREIGN KEY (sector_id) REFERENCES sectors (sector_id)
 );
+
+CREATE UNIQUE INDEX ports_one_active_per_sector
+    ON ports(sector_id) WHERE is_active=TRUE;
 
 CREATE TABLE port_trade (
     port_trade_id serial PRIMARY KEY,
     port_id integer NOT NULL,
     maxproduct bigint,
+    capacity_level integer NOT NULL DEFAULT 0,
     commodity text CHECK (commodity IN ('ORE', 'ORG', 'EQU', 'SLV', 'WPN', 'DRG')),
     mode text CHECK (mode IN ('buy', 'sell')),
     FOREIGN KEY (port_id) REFERENCES ports (port_id)
+);
+
+CREATE TABLE v3_port_economy_rules (
+    rule_key text PRIMARY KEY,
+    rule_version integer NOT NULL,
+    value bigint NOT NULL CHECK (value >= 0),
+    description text NOT NULL,
+    updated_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE sector_warps (
@@ -515,11 +531,39 @@ CREATE TABLE planets (
     colonists_weapons bigint NOT NULL DEFAULT 0,
     fighter_production_remainder bigint NOT NULL DEFAULT 0,
     fighter_production_last_tick bigint NOT NULL DEFAULT -1,
+    ore_production_remainder bigint NOT NULL DEFAULT 0,
+    organics_production_remainder bigint NOT NULL DEFAULT 0,
+    equipment_production_remainder bigint NOT NULL DEFAULT 0,
     colonists_unassigned bigint NOT NULL DEFAULT 0,
     terraform_turns_left bigint NOT NULL DEFAULT 1,
     FOREIGN KEY (sector_id) REFERENCES sectors (sector_id),
     FOREIGN KEY (type) REFERENCES planettypes (planettypes_id)
 );
+
+CREATE TABLE planet_port_constructions (
+    construction_id bigserial PRIMARY KEY,
+    request_id text NOT NULL,
+    player_id integer NOT NULL REFERENCES players(player_id),
+    planet_id integer NOT NULL REFERENCES planets(planet_id),
+    sector_id integer NOT NULL REFERENCES sectors(sector_id),
+    port_class integer NOT NULL CHECK (port_class BETWEEN 1 AND 8),
+    deliveries_completed integer NOT NULL DEFAULT 0,
+    deliveries_required integer NOT NULL,
+    delivery_amount integer NOT NULL,
+    delivery_interval_seconds integer NOT NULL,
+    next_delivery_at timestamptz NOT NULL,
+    status text NOT NULL CHECK (status IN ('building','completed','cancelled')),
+    port_id integer REFERENCES ports(port_id),
+    created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    completed_at timestamptz,
+    UNIQUE(player_id, request_id)
+);
+
+CREATE UNIQUE INDEX planet_port_constructions_one_active_sector
+    ON planet_port_constructions(sector_id) WHERE status='building';
+
+CREATE INDEX planet_port_constructions_due
+    ON planet_port_constructions(next_delivery_at) WHERE status='building';
 
 CREATE TABLE chat (
     chat_id serial PRIMARY KEY,
@@ -724,6 +768,51 @@ CREATE TABLE sector_assets (
     quantity integer,
     ttl integer,
     deployed_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE sector_photon_effects (
+    sector_id integer PRIMARY KEY REFERENCES sectors (sector_id) ON DELETE CASCADE,
+    source_player_id integer NOT NULL REFERENCES players (player_id),
+    expires_at bigint NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE photon_fire_requests (
+    request_id text PRIMARY KEY,
+    player_id integer NOT NULL REFERENCES players (player_id),
+    ship_id integer NOT NULL REFERENCES ships (ship_id),
+    sector_id integer NOT NULL REFERENCES sectors (sector_id),
+    target_ship_id integer REFERENCES ships (ship_id),
+    direct_impact_applied boolean NOT NULL DEFAULT FALSE,
+    target_disabled_until bigint NOT NULL DEFAULT 0,
+    expires_at bigint NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE toll_passage_offers (
+    offer_id text PRIMARY KEY,
+    request_id text NOT NULL,
+    player_id integer NOT NULL REFERENCES players(player_id),
+    ship_id integer NOT NULL REFERENCES ships(ship_id),
+    from_sector_id integer NOT NULL REFERENCES sectors(sector_id),
+    to_sector_id integer NOT NULL REFERENCES sectors(sector_id),
+    owner_player_id integer NOT NULL REFERENCES players(player_id),
+    fighter_count integer NOT NULL CHECK (fighter_count > 0),
+    unit_rate integer NOT NULL CHECK (unit_rate >= 0),
+    amount bigint NOT NULL CHECK (amount >= 0),
+    state text NOT NULL CHECK (state IN ('pending','accepted','refused')),
+    expires_at bigint NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    resolved_at timestamptz,
+    UNIQUE(player_id, request_id)
+);
+
+CREATE TABLE toll_passage_payees (
+    offer_id text NOT NULL REFERENCES toll_passage_offers(offer_id) ON DELETE CASCADE,
+    owner_player_id integer NOT NULL REFERENCES players(player_id),
+    fighter_count integer NOT NULL CHECK (fighter_count > 0),
+    amount bigint NOT NULL CHECK (amount >= 0),
+    PRIMARY KEY (offer_id, owner_player_id)
 );
 
 CREATE TABLE limpet_attached (
@@ -947,6 +1036,7 @@ CREATE TABLE planet_production (
     commodity_code text NOT NULL,
     base_prod_rate integer NOT NULL,
     base_cons_rate integer NOT NULL,
+    workers_per_unit integer NOT NULL DEFAULT 0,
     PRIMARY KEY (planet_type_id, commodity_code),
     FOREIGN KEY (planet_type_id) REFERENCES planettypes (planettypes_id) ON DELETE CASCADE,
     FOREIGN KEY (commodity_code) REFERENCES commodities (code) ON DELETE CASCADE
