@@ -45,14 +45,14 @@ def _game_state():
     }
 
 
-def test_configured_ollama_url_points_to_generate_api_and_model_default_is_realistic():
-    assert ollama_generate_url() == "http://192.168.25.5:11434/api/generate"
+def test_configured_ollama_url_points_to_chat_api_and_model_default_is_exact():
+    assert ollama_generate_url() == "http://192.168.25.5:11434/api/chat"
     assert json.loads((AI_PLAYER_DIR / "config.json").read_text())["ollama_url"] == "http://192.168.25.5:11434"
     assert ollama_generate_url("http://192.168.25.20:11434") == (
-        "http://192.168.25.20:11434/api/generate"
+        "http://192.168.25.20:11434/api/chat"
     )
     assert ollama_generate_url("http://ollama:11434/api/generate") == (
-        "http://ollama:11434/api/generate"
+        "http://ollama:11434/api/chat"
     )
     assert DEFAULT_MODEL == "qwen3:8b"
 
@@ -63,7 +63,7 @@ def test_ollama_plan_is_selected_and_retained_as_controller_strategy(monkeypatch
     call = {}
 
     def fake_ollama(state, model, prompt_key, override_prompt=None, endpoint=None,
-                    error_report=None):
+                    error_report=None, **_kwargs):
         call.update({"state": state, "model": model, "endpoint": endpoint,
                      "prompt": override_prompt})
         return json.dumps({"plan": ["goto: 42"]})
@@ -88,6 +88,57 @@ def test_ollama_plan_is_selected_and_retained_as_controller_strategy(monkeypatch
     assert manager.get("strategy_inference_status") == {"status": "succeeded", "reason": None}
 
 
+def test_role_observation_is_compact_and_includes_objective_turns_capabilities_and_failures(monkeypatch, tmp_path):
+    manager = StateManager(str(tmp_path / "state.json"), {"role_name": "Coloniser"})
+    manager.set("command_retry_info", {"trade.buy": {"failures": 2}})
+    state = _game_state()
+    state["ship_info"]["genesis_torpedoes"] = 1
+    state["sector_data"] = {str(i): {"is_msl": False} for i in range(1, 501)}
+    observed = {}
+
+    def fake_ollama(_state, _model, _key, override_prompt=None, **_kwargs):
+        observed["prompt"] = override_prompt
+        return json.dumps({"plan": ["planet: create"]})
+
+    monkeypatch.setattr(main, "get_ollama_response", fake_ollama)
+    monkeypatch.setattr(main.time, "sleep", lambda _seconds: None)
+    plan = main.get_strategy_from_llm(
+        state, "qwen3:8b", "explore", manager, planner=PlannerStub(),
+        role_name="Coloniser", primary_objective="Acquire and develop planets",
+    )
+    assert plan == ["planet: create"]
+    prompt = observed["prompt"]
+    assert "Acquire and develop planets" in prompt
+    assert '"turns":100' in prompt
+    assert '"current_goal"' in prompt
+    assert '"available_actions"' in prompt
+    assert '"recent_failures":[{"command":"trade.buy","count":2}]' in prompt
+    assert '"known_sector_count":500' in prompt
+    assert '"known_sector_ids"' not in prompt
+
+
+def test_strict_playtest_never_substitutes_a_deterministic_plan(monkeypatch, tmp_path):
+    manager = StateManager(str(tmp_path / "state.json"), {})
+    monkeypatch.setattr(main, "get_strategy_from_llm", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main, "_get_fallback_plan",
+                        lambda *args, **kwargs: pytest.fail("scripted fallback used"))
+    plan = main.select_strategy_plan(
+        _game_state(), {"strategy_mode": "ollama", "require_llm_decisions": True},
+        manager, PlannerStub(),
+    )
+    assert plan == []
+    assert manager.get("strategy_plan_source") == "ollama_wait"
+    assert manager.get("ollama_retry_after") > 0
+
+
+def test_zero_turn_pause_leaves_room_for_session_heartbeat(monkeypatch):
+    requested = []
+    monkeypatch.setattr(main.time, "sleep", requested.append)
+    monkeypatch.setattr(main, "shutdown_flag", False)
+    main._pause_for_turn_refresh(object(), seconds=5, heartbeat_interval=4)
+    assert requested == [2.0]
+
+
 def test_ollama_prompt_uses_the_selected_population_profile(monkeypatch, tmp_path):
     manager = StateManager(str(tmp_path / "state.json"), {})
     manager.set("valid_commodity_names", ["ORE", "ORG", "EQU"])
@@ -100,6 +151,7 @@ def test_ollama_prompt_uses_the_selected_population_profile(monkeypatch, tmp_pat
     monkeypatch.setattr(main, "get_ollama_response", fake_ollama)
     monkeypatch.setattr(main.time, "sleep", lambda _seconds: None)
     for profile in ("explorer", "cautious", "opportunist"):
+        manager.set("ollama_next_decision_at", 0)
         main.select_strategy_plan(
             _game_state(),
             {"ollama_model": "qwen3:8b", "behavior_profile": profile},

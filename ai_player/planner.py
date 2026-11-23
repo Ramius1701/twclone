@@ -8,6 +8,7 @@ from bandit_policy import BanditPolicy, make_context_key # Import the unified co
 from typing import Optional, Any, Dict
 from helpers import canon_commodity, generate_idempotency_key
 from bug_reporter import redact_secrets
+from v3_capabilities import eligible_combat_targets
 
 logger = logging.getLogger(__name__)
 
@@ -159,6 +160,9 @@ class Planner:
 
     def _combat_readiness_command(self, current_state):
         """Repair or retreat before taking avoidable combat risk."""
+        if str(self.config.get("role_name", "")).strip().lower() not in (
+                "pirate", "bounty hunter", "opportunist"):
+            return None
         ship = current_state.get("ship_info") or {}
         try:
             hull = float(ship.get("hull"))
@@ -174,14 +178,146 @@ class Planner:
 
         try:
             fighters = int(ship.get("fighters", 0) or 0)
-            min_fighters = int(self.config.get("combat_min_fighters", 10))
+            min_fighters = max(1, int(self.config.get("combat_min_fighters", 10)))
+            shields = int(ship.get("shields", 0) or 0)
+            min_shields = max(0, int(self.config.get("combat_min_shields", 5)))
+            max_fighters = int(ship.get("max_fighters", min_fighters))
+            max_shields = int(ship.get("max_shields", min_shields))
         except (TypeError, ValueError):
-            fighters, min_fighters = 0, 10
-        if fighters < min_fighters and self._at_port(current_state):
+            return None
+        requirements = self._recovery_capability_requirements()
+        for capability, required_capacity in requirements.items():
+            if not capability.startswith("max_"):
+                continue
+            try:
+                actual_capacity = int(ship.get(capability, required_capacity))
+            except (TypeError, ValueError):
+                continue
+            if actual_capacity < required_capacity:
+                return self._achieve_goal(current_state, "shipyard: recover")
+        min_fighters = min(min_fighters, max_fighters) if max_fighters >= 0 else min_fighters
+        min_shields = min(min_shields, max_shields) if max_shields >= 0 else min_shields
+        needs_fighters = fighters < min_fighters
+        needs_shields = shields < min_shields
+        if needs_fighters or needs_shields:
             advertised = set(current_state.get("server_commands", []))
-            if "hardware.buy" in advertised and self._is_command_ready("hardware.buy", current_state.get("command_retry_info", {})):
-                return {"command": "hardware.buy", "data": {"item": "fighters", "quantity": min_fighters - fighters}}
+            if not self._at_port(current_state):
+                ports = set(current_state.get("port_info_by_sector", {}).keys())
+                ports.update(str(item.get("sector_id")) for item in
+                             (current_state.get("known_ports") or {}).values()
+                             if isinstance(item, dict) and item.get("sector_id") is not None)
+                target = self._nearest_known_sector(current_state, ports)
+                if target is not None:
+                    return self._achieve_goal(current_state, f"goto: {target}")
+                return None
+            if "hardware.list" in advertised:
+                sector_key = str(current_state.get("player_location_sector"))
+                checked = {str(value) for value in current_state.get("hardware_catalog_checked_sectors", [])}
+                if sector_key not in checked:
+                    return {"command": "hardware.list", "data": {}}
+            if "hardware.buy" not in advertised:
+                return None
+            catalog = (current_state.get("hardware_catalog_by_sector") or {}).get(
+                str(current_state.get("player_location_sector")),
+                current_state.get("hardware_catalog"),
+            ) or {}
+            if (isinstance(catalog, dict)
+                    and str(catalog.get("location_type", "")).upper() == "CLASS0"):
+                # Class-0 hardware.list is a general catalogue, not a promise
+                # that every listed item is sold there. Combat hardware is
+                # Stardock-only; route using public shipyard discovery data.
+                stardocks = {
+                    str(item.get("sector_id"))
+                    for item in (current_state.get("shipyard_search_results") or [])
+                    if isinstance(item, dict) and item.get("sector_id") is not None
+                    and "stardock" in str(item.get("name", "")).lower()
+                }
+                for sector_id, sector in (current_state.get("sector_data") or {}).items():
+                    if not isinstance(sector, dict):
+                        continue
+                    if any("stardock" in str(port.get("name", "")).lower()
+                           for port in (sector.get("ports") or []) if isinstance(port, dict)):
+                        stardocks.add(str(sector_id))
+                target = self._nearest_known_sector(current_state, stardocks)
+                if target is not None and str(target) != str(current_state.get("player_location_sector")):
+                    return self._achieve_goal(current_state, f"goto: {target}")
+                return None
+            items = catalog.get("items", []) if isinstance(catalog, dict) else []
+            wanted_code = "FIGHTERS" if needs_fighters else "SHIELDS"
+            item = next((value for value in items if isinstance(value, dict)
+                         and str(value.get("code", "")).upper() == wanted_code), None)
+            if item is None:
+                # Combat hardware is sold at Stardock. A refreshed catalogue at
+                # an ordinary port may be valid while omitting the requested
+                # item; keep the readiness goal moving toward the publicly
+                # discovered source instead of leaving the bot idle there.
+                stardocks = {
+                    str(value.get("sector_id"))
+                    for value in (current_state.get("shipyard_search_results") or [])
+                    if isinstance(value, dict)
+                    and value.get("sector_id") is not None
+                    and "stardock" in str(value.get("name", "")).lower()
+                }
+                for sector_id, sector in (current_state.get("sector_data") or {}).items():
+                    if not isinstance(sector, dict):
+                        continue
+                    if any("stardock" in str(port.get("name", "")).lower()
+                           for port in (sector.get("ports") or [])
+                           if isinstance(port, dict)):
+                        stardocks.add(str(sector_id))
+                target = self._nearest_known_sector(current_state, stardocks)
+                if target is not None:
+                    return self._achieve_goal(current_state, f"goto: {target}")
+                return None
+            try:
+                credits = int(float(((current_state.get("player_info") or {}).get("player") or {}).get("credits", 0) or 0))
+                unit_price = int(float(item.get("price", item.get("base_price", 0)) or 0))
+                stock_value = item.get("stock_quantity", item.get("stock"))
+                stock = None if stock_value is None else int(stock_value)
+                target = min_fighters if needs_fighters else min_shields
+                capacity = max_fighters if needs_fighters else max_shields
+                current = fighters if needs_fighters else shields
+                needed = max(0, min(capacity, target) - current)
+                max_purchase = int(item.get("max_purchase", needed) or 0)
+                quantity = max(0, min(needed, max_purchase,
+                                      stock if stock is not None else needed))
+                # Build a viable kit incrementally when the bot cannot afford
+                # the full target in one transaction. Each receipt refreshes
+                # authoritative ship state before the next purchase decision.
+                affordable = credits // unit_price if unit_price > 0 else 0
+                quantity = min(quantity, affordable)
+            except (TypeError, ValueError):
+                return None
+            if quantity <= 0 or unit_price <= 0:
+                return None
+            if not self._is_command_ready("hardware.buy", current_state.get("command_retry_info", {})):
+                return None
+            return {"command": "hardware.buy", "data": {"code": wanted_code, "quantity": quantity}}
         return None
+
+    @staticmethod
+    def _needs_ship_recovery(current_state):
+        """Recognize an escape pod or a hull unable to resume its configured role."""
+        ship = current_state.get("ship_info") or {}
+        if not ship:
+            return False
+        name = str(ship.get("type") or ship.get("ship_type") or ship.get("name") or "").lower()
+        if "escape pod" in name:
+            return True
+        if "holds" not in ship:
+            return False
+        try:
+            if int(ship.get("holds", -1)) <= 0:
+                return True
+        except (TypeError, ValueError):
+            return False
+        for capability, minimum in (current_state.get("ship_recovery_requirements") or {}).items():
+            try:
+                if int(ship.get(capability, -1)) < int(minimum):
+                    return True
+            except (TypeError, ValueError):
+                return True
+        return False
 
     def _mission_goal(self, current_state):
         """Return the next mission goal, honoring deadline and credit budget."""
@@ -265,6 +401,173 @@ class Planner:
             hops = len(path) - 1 if isinstance(path, list) and path else float("inf")
             ranked.append((hops, target))
         return min(ranked)[1] if ranked else None
+
+    @staticmethod
+    def _public_shipyard_sectors(current_state):
+        """Find shipyards only from public observations or protocol search results."""
+        found = set()
+        for sector_key, sector in (current_state.get("sector_data") or {}).items():
+            if not isinstance(sector, dict):
+                continue
+            ports = sector.get("ports") or []
+            for port in ports:
+                if not isinstance(port, dict):
+                    continue
+                name = str(port.get("name") or "").strip().lower()
+                if name == "stardock" or port.get("is_shipyard") is True:
+                    try:
+                        found.add(int(sector.get("sector_id", sector_key)))
+                    except (TypeError, ValueError):
+                        pass
+            if sector.get("is_shipyard") is True:
+                try:
+                    found.add(int(sector.get("sector_id", sector_key)))
+                except (TypeError, ValueError):
+                    pass
+        for sector_key, port in (current_state.get("port_info_by_sector") or {}).items():
+            if not isinstance(port, dict):
+                continue
+            if str(port.get("name") or "").strip().lower() == "stardock" or port.get("is_shipyard") is True:
+                try:
+                    found.add(int(port.get("sector_id", sector_key)))
+                except (TypeError, ValueError):
+                    pass
+        catalog = current_state.get("shipyard_catalog") or {}
+        if isinstance(catalog, dict) and catalog.get("is_shipyard") is True:
+            try:
+                found.add(int(catalog.get("sector_id")))
+            except (TypeError, ValueError):
+                pass
+        # sector.search is an ordinary, documented V3 command. Keep search
+        # results separate from locally observed sectors so the bot never
+        # mistakes a global catalog response for a scan of its surroundings.
+        for item in current_state.get("shipyard_search_results") or []:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("name") or "").strip().lower() != "stardock":
+                continue
+            try:
+                found.add(int(item.get("sector_id")))
+            except (TypeError, ValueError):
+                pass
+        return sorted(found)
+
+    def _recovery_capability_requirements(self):
+        """Public hull capabilities needed to resume this bot's role."""
+        role = str(self.config.get("role_name", "")).strip().lower()
+        if role in ("coloniser", "colonizer", "industrialist"):
+            try:
+                min_holds = max(1, int(self.config.get("planet_recovery_min_holds", 25)))
+            except (TypeError, ValueError):
+                min_holds = 25
+            return {"max_genesis": 1, "max_holds": min_holds}
+        if role in ("pirate", "bounty hunter", "opportunist"):
+            try:
+                min_fighters = max(1, int(self.config.get("combat_min_fighters", 10)))
+                min_shields = max(0, int(self.config.get("combat_min_shields", 5)))
+            except (TypeError, ValueError):
+                min_fighters, min_shields = 10, 5
+            return {"max_fighters": min_fighters, "max_shields": min_shields}
+        if role in ("trader", "merchant"):
+            try:
+                min_holds = max(1, int(self.config.get("trade_recovery_min_holds", 20)))
+            except (TypeError, ValueError):
+                min_holds = 20
+            return {"max_holds": min_holds}
+        return {}
+
+    def _role_prerequisite_goal(self, current_state):
+        """Preempt stale plans until a required role capability is available."""
+        if not self.config.get("playtest_bot"):
+            return None
+        role = str(self.config.get("role_name", "")).strip().lower()
+        if role not in ("coloniser", "colonizer", "industrialist"):
+            return None
+        ship = current_state.get("ship_info") or {}
+        try:
+            required_holds = max(1, int(self.config.get("planet_recovery_min_holds", 25)))
+            max_genesis = int(ship.get("max_genesis", -1))
+            max_holds = int(ship.get("max_holds", -1))
+            genesis = int(ship.get("genesis_torpedoes", ship.get("genesis", 0)) or 0)
+        except (TypeError, ValueError):
+            return "shipyard: recover"
+        if max_genesis < 1 or max_holds < required_holds or self._needs_ship_recovery(current_state):
+            return "shipyard: recover"
+        owned_planets = [item for item in (current_state.get("owned_planets") or [])
+                         if isinstance(item, dict) and item.get("planet_id") is not None]
+        if owned_planets:
+            ship_colonists = self._ship_colonist_count(ship)
+            try:
+                terra_population = int((current_state.get("planet_colonist_state") or {})
+                                       .get("planet_colonists", 0) or 0)
+                terra_planet_id = int((current_state.get("planet_colonist_state") or {})
+                                      .get("planet_id", 0) or 0)
+            except (TypeError, ValueError):
+                terra_population = terra_planet_id = 0
+            transfer = current_state.get("planet_colonist_state") or {}
+            terra_known_empty = terra_planet_id == 1 and terra_population <= 0
+            if ship_colonists > 0 or (int(current_state.get("player_location_sector", 0) or 0) != 1
+                                      and not terra_known_empty):
+                return "planet: develop"
+        if genesis <= 0 and not owned_planets:
+            return "hardware: genesis"
+        if genesis > 0 and not owned_planets:
+            sector_id = current_state.get("player_location_sector")
+            sector = (current_state.get("sector_data") or {}).get(str(sector_id), {}) or {}
+            try:
+                # An omitted zone flag is not evidence that Genesis is legal.
+                # sector.info now includes this authoritative public value.
+                eligible_sector = (int(sector_id) > 10 and sector.get("is_msl") is False
+                                   and not sector.get("has_planet"))
+            except (TypeError, ValueError):
+                eligible_sector = False
+            if eligible_sector:
+                return "planet: create"
+            # Keep the colonisation objective ahead of an old saved movement or
+            # trading plan while the current sector's eligibility is resolved.
+            return "planet: create"
+        return None
+
+    def _preserves_playtest_goal(self, current_goal):
+        """Avoid replacing a role's route/objective with opportunistic movement."""
+        prefixes = tuple(self.config.get("turn_reserve_priority_prefixes") or ()) + (
+            "hardware:", "combat:", "corp:", "goto:",
+        )
+        return bool(self.config.get("playtest_bot") and current_goal
+                    and any(str(current_goal).startswith(prefix) for prefix in prefixes))
+
+    @staticmethod
+    def _ship_colonist_count(ship):
+        """Read colonists from the authoritative ship field or cargo snapshot."""
+        ship = ship if isinstance(ship, dict) else {}
+        try:
+            count = int(ship.get("colonists", 0) or 0)
+        except (TypeError, ValueError):
+            count = 0
+        cargo = ship.get("cargo") or []
+        if isinstance(cargo, list):
+            for item in cargo:
+                if not isinstance(item, dict):
+                    continue
+                commodity = str(item.get("commodity", "")).strip().lower()
+                if commodity in ("colonist", "colonists"):
+                    try:
+                        count = max(count, int(item.get("quantity", 0) or 0))
+                    except (TypeError, ValueError):
+                        continue
+        return max(0, count)
+
+    def _ship_meets_recovery_requirements(self, hull):
+        requirements = self._recovery_capability_requirements()
+        for capability, minimum in requirements.items():
+            try:
+                if int(hull.get(capability)) < minimum:
+                    return False
+            except (AttributeError, TypeError, ValueError):
+                # Missing public capability information is not evidence that a
+                # candidate can perform the role's required operation.
+                return False
+        return True
 
     def handle_trade_response(self, sent_command: dict, resp: dict):
         """Processes trade command responses and informs state manager of failures."""
@@ -387,9 +690,20 @@ class Planner:
                 adjacent_sectors = []
                 for item in adjacent_list:
                     if isinstance(item, dict):
-                        adjacent_sectors.append(item.get("to_sector"))
+                        value = item.get("to_sector", item.get("to_sector_id"))
                     else:
-                        adjacent_sectors.append(item)
+                        value = item
+                    try:
+                        if value is not None:
+                            adjacent_sectors.append(int(value))
+                    except (TypeError, ValueError):
+                        continue
+
+                try:
+                    target_sector = int(target_sector)
+                    current_sector = int(current_sector)
+                except (TypeError, ValueError):
+                    return None
 
                 # 0. Missing Adjacency Data -> Fetch it
                 # Note: "adjacent" not in sector_data means we lack data; empty [] means no warp links exist
@@ -409,10 +723,13 @@ class Planner:
                 # 2. Try Local Pathfinding (BFS on known sectors)
                 local_path = self.state_manager.find_path(current_sector, target_sector)
                 if local_path and len(local_path) > 1:
-                    next_hop = local_path[1]
+                    try:
+                        next_hop = int(local_path[1])
+                    except (TypeError, ValueError):
+                        next_hop = None
                     # DOUBLE CHECK: Is the next hop actually adjacent? 
                     # BFS should guarantee this, but if sector_data is corrupt, we verify.
-                    if next_hop in adjacent_sectors and str(next_hop) not in warp_blacklist:
+                    if next_hop is not None and next_hop in adjacent_sectors and str(next_hop) not in warp_blacklist:
                         logger.info(f"Local path found to {target_sector}: {local_path}. Next hop: {next_hop}")
                         if self._is_command_ready("move.warp", current_state.get("command_retry_info", {})):
                             return {"command": "move.warp", "data": {"to_sector_id": next_hop}}
@@ -427,8 +744,11 @@ class Planner:
                 if (server_path and len(server_path) > 1 and 
                     server_path[0] == current_sector and server_path[-1] == target_sector):
                     
-                    next_hop = server_path[1]
-                    if next_hop in adjacent_sectors and str(next_hop) not in warp_blacklist:
+                    try:
+                        next_hop = int(server_path[1])
+                    except (TypeError, ValueError):
+                        next_hop = None
+                    if next_hop is not None and next_hop in adjacent_sectors and str(next_hop) not in warp_blacklist:
                         logger.info(f"Using cached server path to {target_sector}. Next hop: {next_hop}")
                         if self._is_command_ready("move.warp", current_state.get("command_retry_info", {})):
                             return {"command": "move.warp", "data": {"to_sector_id": next_hop}}
@@ -477,6 +797,121 @@ class Planner:
                     logger.info(f"Goto {target_sector} path unknown; exploring via warp to {chosen}.")
                     return {"command": "move.warp", "data": {"to_sector_id": chosen}}
                 
+                return None
+
+            if goal_type == "shipyard" and goal_target.lower() == "recover":
+                ship = current_state.get("ship_info") or {}
+                commands = set(current_state.get("server_commands") or [])
+                if current_state.get("shipyard_recovery_pending_refresh"):
+                    if not commands or "ship.info" in commands:
+                        return {"command": "ship.info", "data": {}}
+                    return None
+                if ship.get("onplanet"):
+                    if not commands or "planet.launch" in commands:
+                        return {"command": "planet.launch", "data": {}}
+                    return None
+
+                current_sector_id = int(current_sector) if current_sector is not None else None
+                shipyard_sectors = self._public_shipyard_sectors(current_state)
+                if current_sector_id not in shipyard_sectors:
+                    target = self._nearest_known_sector(current_state, shipyard_sectors)
+                    if target is not None:
+                        return self._achieve_goal(current_state, f"goto: {target}")
+                    if (not current_state.get("shipyard_search_complete")
+                            and (not commands or "sector.search" in commands)):
+                        return {"command": "sector.search", "data": {
+                            "q": "Stardock", "type": "port", "limit": 20}}
+                    target = self._get_next_warp_target(current_state)
+                    if target is not None and (not commands or "move.warp" in commands):
+                        return {"command": "move.warp", "data": {"to_sector_id": int(target)}}
+                    if not commands or "sector.scan.density" in commands:
+                        return {"command": "sector.scan.density", "data": {}}
+                    return None
+
+                if not bool(ship.get("ported")):
+                    if not commands or "dock.status" in commands:
+                        return {"command": "dock.status", "data": {"action": "dock"}}
+                    return None
+
+                catalog = current_state.get("shipyard_catalog") or {}
+                try:
+                    catalog_sector = int(catalog.get("sector_id"))
+                except (AttributeError, TypeError, ValueError):
+                    catalog_sector = None
+                if catalog_sector != current_sector_id:
+                    if not commands or "shipyard.list" in commands:
+                        return {"command": "shipyard.list", "data": {}}
+                    return None
+
+                player = (current_state.get("player_info") or {}).get("player", {})
+                try:
+                    credits = int(float(player.get("credits", 0) or 0))
+                    current_type = int(ship.get("type_id", 0) or 0)
+                except (TypeError, ValueError):
+                    return None
+                available = catalog.get("available") or []
+                requirements = self._recovery_capability_requirements()
+                missing_capability_catalog = bool(requirements) and any(
+                    isinstance(hull, dict) and hull.get("eligible")
+                    and any(capability not in hull for capability in requirements)
+                    for hull in available
+                )
+                if missing_capability_catalog:
+                    try:
+                        refreshed_at = float(catalog.get("_refreshed_at", 0) or 0)
+                    except (TypeError, ValueError):
+                        refreshed_at = 0
+                    if time.time() - refreshed_at > 60 and "shipyard.list" in commands:
+                        return {"command": "shipyard.list", "data": {}}
+                    # An up-to-date server that does not publish required
+                    # capabilities cannot safely support role-specific hull
+                    # selection. Do not guess or buy an unsuitable hull.
+                    return None
+                candidates = []
+                for hull in available:
+                    if not isinstance(hull, dict) or not hull.get("eligible"):
+                        continue
+                    try:
+                        type_id = int(hull.get("type_id"))
+                        price = int(hull.get("net_cost", hull.get("shipyard_price", hull.get("base_price", 0))) or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    hull_name = str(hull.get("type") or hull.get("name") or "")
+                    if type_id == current_type or "escape pod" in hull_name.lower() or price < 0 or price > credits:
+                        continue
+                    if not self._ship_meets_recovery_requirements(hull):
+                        continue
+                    candidates.append((price, type_id, hull_name))
+                if candidates and (not commands or "shipyard.upgrade" in commands):
+                    price, type_id, hull_name = min(candidates)
+                    bot_name = str(self.config.get("playtest_bot") or "Playtest")[:24]
+                    return {"command": "shipyard.upgrade", "data": {
+                        "new_type_id": type_id,
+                        "new_ship_name": f"{bot_name} Recovery"[:32],
+                    }}
+
+                # Used entries do not publish ship-type capability limits.
+                # Do not buy one for a role-specific recovery unless those
+                # prerequisites can be verified from the public catalogue.
+                used = catalog.get("used_available") or []
+                used_candidates = []
+                for hull in used:
+                    if not isinstance(hull, dict):
+                        continue
+                    if self._recovery_capability_requirements():
+                        continue
+                    try:
+                        inventory_id = int(hull.get("used_inventory_id"))
+                        price = int(hull.get("price", 0) or 0)
+                        used_ship_id = int(hull.get("ship_id", 0) or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    hull_name = str(hull.get("ship_type") or hull.get("name") or "")
+                    if used_ship_id != int(ship.get("id", 0) or 0) and "escape pod" not in hull_name.lower() and 0 <= price <= credits:
+                        used_candidates.append((price, inventory_id))
+                if used_candidates and (not commands or "shipyard.upgrade" in commands):
+                    _, inventory_id = min(used_candidates)
+                    return {"command": "shipyard.upgrade", "data": {"used_inventory_id": inventory_id}}
                 return None
 
             elif goal_type == "sell":
@@ -757,6 +1192,25 @@ class Planner:
                     logger.warning("Refusing combat goal in protected FedSpace.")
                     return None
 
+                ship = current_state.get("ship_info") or {}
+                try:
+                    hull = float(ship.get("hull", 0) or 0)
+                    max_hull = max(1.0, float(ship.get("max_hull", 100) or 100))
+                    fighters = int(ship.get("fighters", 0) or 0)
+                    minimum_fighters = max(1, int(self.config.get("combat_min_fighters", 10)))
+                    minimum_hull_ratio = float(self.config.get("combat_min_hull_ratio", 0.65))
+                except (TypeError, ValueError):
+                    return None
+                if hull / max_hull < minimum_hull_ratio or fighters < minimum_fighters:
+                    logger.info("Deferring attack: own ship is below configured combat readiness.")
+                    return self._combat_readiness_command(current_state)
+
+                sector_key = str(current_state.get("player_location_sector"))
+                known_danger = (current_state.get("sector_danger") or {}).get(sector_key)
+                if isinstance(known_danger, dict) and int(known_danger.get("severity", 0) or 0) >= 3:
+                    logger.info("Deferring attack in a sector with a recorded severe hazard.")
+                    return self._survival_command(current_state)
+
                 # Check if there are targets
                 sector_id = str(current_state.get("player_location_sector"))
                 sector_data = current_state.get("sector_data", {}).get(sector_id, {})
@@ -765,6 +1219,10 @@ class Planner:
                 # Filter out our own ship
                 my_ship_id = current_state.get("ship_info", {}).get("id")
                 targets = [s for s in ships if str(self._visible_ship_id(s)) != str(my_ship_id)]
+                targets = eligible_combat_targets(
+                    targets, current_state.get("opponent_model"),
+                    float(self.config.get("combat_target_threat_threshold", 25.0)),
+                )
                 
                 if targets:
                     logger.info("Executing goal 'combat: attack'")
@@ -773,6 +1231,28 @@ class Planner:
                 else:
                     logger.warning("Goal 'combat: attack' failed: No targets in sector.")
                     return None
+
+            elif goal_type == "combat" and goal_target == "photon":
+                ship = current_state.get("ship_info") or {}
+                targets = current_state.get("adjacent_ship_targets") or []
+                commands = set(current_state.get("server_commands", []))
+                if int(ship.get("photons", 0) or 0) <= 0 or not targets:
+                    return None
+                if commands and "combat.fire_photon" not in commands:
+                    return None
+                targets = eligible_combat_targets(
+                    targets, current_state.get("opponent_model"),
+                    float(self.config.get("combat_target_threat_threshold", 25.0)),
+                )
+                target = next((item for item in targets if isinstance(item, dict)
+                               and item.get("ship_id") is not None
+                               and item.get("sector_id") is not None), None)
+                if target:
+                    return {"command": "combat.fire_photon", "data": {
+                        "sector_id": int(target["sector_id"]),
+                        "target_ship_id": int(target["ship_id"]),
+                    }}
+                return None
 
             elif goal_type == "planet" and goal_target == "land":
                 # Check for planet
@@ -829,10 +1309,73 @@ class Planner:
                     return None
                 sector_id = current_state.get("player_location_sector")
                 sector = current_state.get("sector_data", {}).get(str(sector_id), {})
-                if sector_id is None or sector.get("has_planet"):
+                ship = current_state.get("ship_info") or {}
+                try:
+                    genesis = int(ship.get("genesis_torpedoes", ship.get("genesis", 0)) or 0)
+                    sector_number = int(sector_id)
+                except (TypeError, ValueError):
+                    return None
+                if genesis <= 0:
+                    return self._achieve_goal(current_state, "hardware: genesis")
+                advertised = set(current_state.get("server_commands", []))
+                if sector.get("is_msl") not in (True, False):
+                    return ({"command": "sector.info", "data": {"sector_id": sector_number}}
+                            if not advertised or "sector.info" in advertised else None)
+                if self._observed_sector_has_planet(sector) is None:
+                    return ({"command": "sector.info", "data": {"sector_id": sector_number}}
+                            if not advertised or "sector.info" in advertised else None)
+                sector_has_planet = self._observed_sector_has_planet(sector)
+                if (sector_number > 10 and sector.get("is_msl") is False
+                        and sector_has_planet is False):
+                    pass
+                else:
+                    # A planet can be present without being ours. Landing or
+                    # scanning does not grant ownership, so route to a sector
+                    # whose public zone and empty-planet state are explicitly
+                    # known before firing Genesis.
+                    known_sectors = current_state.get("sector_data") or {}
+                    candidates = [int(sid) for sid, details in known_sectors.items()
+                                  if str(sid).isdigit() and int(sid) > 10
+                                  and isinstance(details, dict)
+                                  and details.get("is_msl") is False
+                                  and self._observed_sector_has_planet(details) is False]
+                    target = self._nearest_known_sector(current_state, candidates)
+                    if target is not None and int(target) != sector_number:
+                        return self._achieve_goal(current_state, f"goto: {int(target)}")
+
+                    adjacent = sector.get("adjacent") or sector.get("adjacent_sectors") or []
+                    neighbours = []
+                    for item in adjacent:
+                        target_id = item.get("to_sector", item.get("to_sector_id")) if isinstance(item, dict) else item
+                        try:
+                            target_id = int(target_id)
+                        except (TypeError, ValueError):
+                            continue
+                        details = known_sectors.get(str(target_id), {}) or {}
+                        if (details.get("is_msl") not in (True, False)
+                                or self._observed_sector_has_planet(details) is None):
+                            if not advertised or "sector.info" in advertised:
+                                return {"command": "sector.info", "data": {"sector_id": target_id}}
+                            continue
+                        if target_id > 10 and details.get("is_msl") is False:
+                            neighbours.append((target_id, details))
+                    for target_id, details in neighbours:
+                        if self._observed_sector_has_planet(details) is False:
+                            return self._achieve_goal(current_state, f"goto: {target_id}")
+                    # All currently known neighbours are occupied. Move via a
+                    # safe, less recently visited sector to discover further
+                    # opportunities; never infer that an occupied world is
+                    # claimable.
+                    recent = {str(value) for value in (current_state.get("recent_sectors") or [])}
+                    transit = next((sid for sid, _ in sorted(neighbours,
+                                     key=lambda pair: str(pair[0]) in recent)
+                                   if str(sid) not in recent), None)
+                    if transit is not None:
+                        return self._achieve_goal(current_state, f"goto: {transit}")
+                    return None
+                if sector_id is None:
                     return None
                 command = "planet.genesis_create"
-                advertised = set(current_state.get("server_commands", []))
                 if advertised and command not in advertised:
                     command = "planet.create"
                 if advertised and command not in advertised:
@@ -843,6 +1386,276 @@ class Planner:
                     "name": str(name)[:64],
                     "owner_entity_type": "player",
                 }}
+
+            elif goal_type == "planet" and goal_target == "develop":
+                ship = current_state.get("ship_info") or {}
+                sector = current_state.get("sector_data", {}).get(str(current_sector), {}) or {}
+                planet = current_state.get("planet_info") or {}
+                commands = set(current_state.get("server_commands", []))
+                player = (current_state.get("player_info") or {}).get("player") or {}
+                try:
+                    player_id = int(player.get("player_id", player.get("id", 0)) or 0)
+                    corp_id = int(player.get("corp_id", 0) or 0)
+                except (TypeError, ValueError):
+                    player_id = corp_id = 0
+                owned_planets = [item for item in (current_state.get("owned_planets") or [])
+                                 if isinstance(item, dict) and item.get("planet_id") is not None
+                                 and item.get("sector_id") is not None]
+
+                if ship.get("onplanet"):
+                    planet_id = (planet.get("planet_id", planet.get("id"))
+                                 or ship.get("planet_id"))
+                    if planet_id is None:
+                        return None
+                    if not planet:
+                        return {"command": "planet.info", "data": {"planet_id": int(planet_id)}}
+
+                    # Terra is a public colonist source, not a claimable planet.
+                    if int(planet_id) == 1:
+                        if not owned_planets:
+                            if not commands or "planet.launch" in commands:
+                                return {"command": "planet.launch", "data": {}}
+                            return None
+                        ship_colonists = self._ship_colonist_count(ship)
+                        if ship_colonists > 0:
+                            if not commands or "planet.launch" in commands:
+                                return {"command": "planet.launch", "data": {}}
+                            return None
+                        transfer = current_state.get("planet_colonist_state") or {}
+                        if int(transfer.get("planet_id", 0) or 0) != 1:
+                            if not commands or "planet.colonists.get" in commands:
+                                return {"command": "planet.colonists.get", "data": {"planet_id": 1}}
+                            return None
+                        available = int(transfer.get("planet_colonists", 0) or 0)
+                        holds = int(transfer.get("ship_holds_available", 0) or 0)
+                        quantity = min(available, holds)
+                        if quantity > 0 and (not commands or "planet.colonists.set" in commands):
+                            return {"command": "planet.colonists.set", "data": {
+                                "planet_id": 1, "action": "pickup", "quantity": quantity,
+                            }}
+                        if available <= 0 and holds > 0:
+                            self.state_manager.set("blocked_objective", {
+                                "goal": "planet: develop",
+                                "reason": "Terra has no transferable colonists",
+                                "updated_at": time.time(),
+                            })
+                            return None
+                        # Leave Terra cleanly when it has no transferable
+                        # population or the current ship has no free holds.
+                        if not commands or "planet.launch" in commands:
+                            return {"command": "planet.launch", "data": {}}
+                        return None
+
+                    owner_type = str(planet.get("owner_type", "")).lower()
+                    try:
+                        owner_id = int(planet.get("owner_id", 0) or 0)
+                    except (TypeError, ValueError):
+                        owner_id = 0
+                    owned = ((owner_type == "player" and player_id > 0 and owner_id == player_id)
+                             or (owner_type in ("corp", "corporation") and corp_id > 0
+                                 and owner_id == corp_id))
+                    if not owned:
+                        # Landing is not acquisition. Do not issue colony,
+                        # production, or ownership actions on an unowned world.
+                        if not commands or "planet.launch" in commands:
+                            return {"command": "planet.launch", "data": {}}
+                        return None
+
+                    ship_colonists = self._ship_colonist_count(ship)
+                    if ship_colonists > 0 and (not commands or "planet.colonists.set" in commands):
+                        transfer = current_state.get("planet_colonist_state") or {}
+                        quantity = ship_colonists
+                        if transfer.get("planet_id") == int(planet_id):
+                            quantity = min(quantity, int(transfer.get("ship_colonists", quantity) or quantity))
+                        return {"command": "planet.colonists.set", "data": {
+                            "planet_id": int(planet_id), "action": "dropoff", "quantity": quantity,
+                        }}
+                    unassigned = int(planet.get("colonists_unassigned", 0) or 0)
+                    if unassigned > 0 and (not commands or "planet.colonists.allocate" in commands):
+                        ore, organic, equipment = int(unassigned * .4), int(unassigned * .2), int(unassigned * .3)
+                        return {"command": "planet.colonists.allocate", "data": {
+                            "planet_id": int(planet_id), "ore": ore, "organics": organic,
+                            "equipment": equipment, "weapons": unassigned - ore - organic - equipment,
+                        }}
+                    if "planet.harvest" in commands and any(
+                            int(planet.get(key, 0) or 0) > 0
+                            for key in ("ore", "organics", "equipment", "weapons")):
+                        return {"command": "planet.harvest", "data": {"planet_id": int(planet_id)}}
+                    try:
+                        refresh_interval = max(1.0, float(self.config.get(
+                            "planet_state_refresh_interval_seconds", 60)))
+                        latest_refresh = max(
+                            float(current_state.get("planet_info_received_at", 0) or 0),
+                            float(current_state.get("planet_info_refresh_requested_at", 0) or 0),
+                        )
+                    except (TypeError, ValueError):
+                        refresh_interval, latest_refresh = 60.0, 0.0
+                    if (time.time() - latest_refresh >= refresh_interval
+                            and (not commands or "planet.info" in commands)):
+                        # Production is scheduled server-side; a previously
+                        # valid planet snapshot can become stale while the ship
+                        # remains landed. Refresh before deciding the world has
+                        # no work or launching away from it.
+                        self.state_manager.set("planet_info_refresh_requested_at", time.time())
+                        return {"command": "planet.info", "data": {"planet_id": int(planet_id)}}
+                    population = int(planet.get("population", planet.get("colonists_total", 0)) or 0)
+                    if population <= 0:
+                        if not commands or "planet.launch" in commands:
+                            return {"command": "planet.launch", "data": {}}
+                        return None
+                    return None
+
+                # Empty owned worlds need colonists before landing can make
+                # progress. Fetch them from public Terra first; otherwise the
+                # planner repeatedly lands and launches from the empty world.
+                ship_colonists = self._ship_colonist_count(ship)
+                known_planet = next((item for item in owned_planets
+                                     if int(item.get("sector_id", 0)) == int(current_sector or 0)), None)
+                if owned_planets and ship_colonists <= 0 and int(current_sector or 0) != 1:
+                    if known_planet:
+                        snapshot = current_state.get("planet_info") or {}
+                        if int(snapshot.get("planet_id", 0) or 0) != int(known_planet["planet_id"]):
+                            return {"command": "planet.info", "data": {
+                                "planet_id": int(known_planet["planet_id"])
+                            }}
+                        try:
+                            developed_population = int(snapshot.get("population", 0) or 0)
+                            developed_population += int(snapshot.get("colonists_unassigned", 0) or 0)
+                            developed_population += sum(int(snapshot.get(key, 0) or 0) for key in (
+                                "colonists_ore", "colonists_org", "colonists_eq", "colonists_weapons"))
+                        except (TypeError, ValueError):
+                            developed_population = 0
+                        if developed_population > 0:
+                            if not commands or "planet.land" in commands:
+                                return {"command": "planet.land", "data": {
+                                    "planet_id": int(known_planet["planet_id"])
+                                }}
+                            return None
+                    return self._achieve_goal(current_state, "goto: 1")
+
+                # Only land on a player/corporation-owned world already
+                # confirmed by a server creation/info receipt. Terra is the
+                # sole public exception, and is used only for colonist pickup.
+                if int(current_sector or 0) == 1 and (not owned_planets or ship_colonists <= 0):
+                    planet_id = 1
+                elif known_planet:
+                    planet_id = int(known_planet["planet_id"])
+                else:
+                    planet_id = None
+                if planet_id is not None:
+                    if not commands or "planet.land" in commands:
+                        return {"command": "planet.land", "data": {"planet_id": planet_id}}
+                    return None
+
+                if owned_planets:
+                    ship_colonists = self._ship_colonist_count(ship)
+                    if ship_colonists > 0:
+                        target = min(owned_planets, key=lambda item: abs(
+                            int(item["sector_id"]) - int(current_sector or 1)))
+                    else:
+                        target = {"planet_id": 1, "sector_id": 1}
+                    if int(target["sector_id"]) != int(current_sector or 0):
+                        return self._achieve_goal(current_state, f"goto: {int(target['sector_id'])}")
+
+                if sector.get("has_planet"):
+                    # An unowned planet is not an acquisition method.
+                    return None
+
+                if owned_planets:
+                    return self._achieve_goal(current_state, "goto: 1")
+
+                genesis = int(ship.get("genesis_torpedoes", ship.get("genesis", 0)) or 0)
+                if genesis > 0 and int(current_sector or 0) > 10:
+                    return self._achieve_goal(current_state, "planet: create")
+                if genesis <= 0:
+                    return self._achieve_goal(current_state, "hardware: genesis")
+
+            elif goal_type == "hardware" and goal_target == "genesis":
+                if int((current_state.get("ship_info") or {}).get(
+                        "genesis_torpedoes", (current_state.get("ship_info") or {}).get("genesis", 0)) or 0) > 0:
+                    return self._achieve_goal(current_state, "planet: create")
+                ship = current_state.get("ship_info") or {}
+                max_genesis = ship.get("max_genesis")
+                if max_genesis is not None:
+                    try:
+                        if int(max_genesis) < 1:
+                            return self._achieve_goal(current_state, "shipyard: recover")
+                    except (TypeError, ValueError):
+                        return None
+                current_key = str(current_sector)
+                checked = {str(value) for value in current_state.get("hardware_catalog_checked_sectors", [])}
+                catalogs = current_state.get("hardware_catalog_by_sector", {}) or {}
+                known = current_state.get("known_ports", {}) or {}
+                port_sectors = {str(value.get("sector_id")) for value in known.values()
+                                if isinstance(value, dict) and value.get("sector_id") is not None}
+                port_sectors.update(str(key) for key in
+                                    (current_state.get("port_info_by_sector", {}) or {}))
+                port_sectors.update(str(key) for key, value in
+                                    (current_state.get("sector_data", {}) or {}).items()
+                                    if isinstance(value, dict) and value.get("has_port"))
+                shipyard_sectors = {str(value) for value in self._public_shipyard_sectors(current_state)}
+                untried_shipyards = [value for value in shipyard_sectors if value not in checked]
+
+                # Visit the public Stardock shipyard first when Genesis stock
+                # has not been found at another inspected port. Ordinary
+                # trade ports often do not sell hardware and must not form a
+                # two-sector movement loop around one another.
+                if current_key in port_sectors and current_key not in checked and not self._at_port(current_state):
+                    if not current_state.get("server_commands") or "dock.status" in current_state.get("server_commands", []):
+                        return {"command": "dock.status", "data": {"action": "dock"}}
+                if untried_shipyards:
+                    target = self._nearest_known_sector(current_state, untried_shipyards)
+                    if target is not None and int(target) != int(current_sector or 0):
+                        return self._achieve_goal(current_state, f"goto: {target}")
+                if self._at_port(current_state):
+                    if current_key not in checked:
+                        return {"command": "hardware.list", "data": {}}
+                    catalog = catalogs.get(current_key, current_state.get("hardware_catalog"))
+                else:
+                    catalog = None
+                items = catalog.get("items", []) if isinstance(catalog, dict) else []
+                item = next((value for value in items if isinstance(value, dict)
+                             and str(value.get("code", "")).upper() in ("GENESIS", "GENESIS_TORPEDO")), None)
+                if item and (not current_state.get("server_commands")
+                             or "hardware.buy" in current_state.get("server_commands", [])):
+                    try:
+                        price = int(float(item.get("price")))
+                        max_purchase = int(item.get("max_purchase", 1) or 0)
+                        stock_value = item.get("stock_quantity")
+                        stock = 1 if stock_value is None else int(stock_value)
+                        credits = int(float(((current_state.get("player_info") or {}).get(
+                            "player") or {}).get("credits", 0) or 0))
+                    except (TypeError, ValueError):
+                        price = max_purchase = stock = credits = 0
+                    if price > 0 and max_purchase >= 1 and stock >= 1 and credits >= price:
+                        return {"command": "hardware.buy", "data": {"code": item["code"], "quantity": 1}}
+                if self._at_port(current_state):
+                    untried = [int(value) for value in port_sectors
+                               if str(value) not in checked and str(value) != current_key]
+                    target = self._nearest_known_sector(current_state, untried)
+                    if target is not None:
+                        return self._achieve_goal(current_state, f"goto: {target}")
+                else:
+                    # Do not oscillate between already-inspected ports when a
+                    # required item was absent. Route only to an untried
+                    # public port, then explore new adjacent sectors if none
+                    # remain.
+                    untried = [value for value in port_sectors if str(value) not in checked]
+                    target = self._nearest_known_sector(current_state, untried)
+                    if target is not None:
+                        return self._achieve_goal(current_state, f"goto: {target}")
+                    player = (current_state.get("player_info") or {}).get("player") or {}
+                    try:
+                        turns_remaining = int(player.get("turns_remaining", 1) or 0)
+                    except (TypeError, ValueError):
+                        turns_remaining = 0
+                    if turns_remaining <= 0:
+                        return None
+                    target = self._get_next_warp_target(current_state)
+                    if target is not None:
+                        return {"command": "move.warp", "data": {"to_sector_id": int(target)}}
+                logger.info("No known untried port can supply Genesis hardware; awaiting new public port information.")
+                return None
 
             elif goal_type == "victory" and goal_target == "claim":
                 victory = current_state.get("victory_status") or {}
@@ -928,13 +1741,144 @@ class Planner:
                 }}
 
             elif goal_type == "corp":
-                logger.info("Solo empire policy refuses corporation goal %s", goal_str)
+                if not self._corporation_action_allowed("corp.create"):
+                    logger.info("Corporation goal is disabled by playtest policy.")
+                    return None
+                player = (current_state.get("player_info") or {}).get("player", {})
+                corp_id = int(player.get("corp_id", 0) or 0)
+                commands = set(current_state.get("server_commands", []))
+                if goal_target == "found":
+                    if corp_id:
+                        online = current_state.get("online_players")
+                        presence_at = float(current_state.get("online_players_refreshed_at", 0) or 0)
+                        presence_ttl = max(5, int(self.config.get(
+                            "corporation_presence_refresh_seconds", 15)))
+                        if online is None or time.time() - presence_at >= presence_ttl:
+                            return {"command": "player.list_online", "data": {"page": 1, "limit": 100}}
+                        partner = str(self.config.get("corporation_partner_username", "playbot09"))
+                        target = next((item for item in online if isinstance(item, dict)
+                                       and item.get("username") == partner), None)
+                        own_name = str(self.config.get("corporation_name", "TWClone Playtest Founders"))
+                        if target and target.get("corporation") != own_name:
+                            if not commands or "corp.invite" in commands:
+                                return {"command": "corp.invite", "data": {
+                                    "target_player_id": int(target["player_id"])
+                                }}
+                        return None
+                    name = str(self.config.get("corporation_name", "TWClone Playtest Founders"))[:64]
+                    fee = max(0, int(self.config.get("corporation_creation_fee", 1000)))
+                    bank_balance = int(current_state.get("bank_balance", 0) or 0)
+                    if bank_balance < fee:
+                        player_credits = int(float(player.get("credits", 0) or 0))
+                        deposit = fee - bank_balance
+                        if player_credits >= deposit and "bank.deposit" in commands:
+                            return {"command": "bank.deposit", "data": {"amount": deposit}}
+                        logger.warning("Corporation creation is blocked: insufficient bank funds or petty cash for the configured fee.")
+                        return None
+                    if not commands or "corp.create" in commands:
+                        return {"command": "corp.create", "data": {"name": name}}
+                elif goal_target == "join":
+                    if corp_id:
+                        return {"command": "corp.status", "data": {}}
+                    corporations = current_state.get("corporations")
+                    refreshed_at = float(current_state.get("corporations_refreshed_at", 0) or 0)
+                    refresh_after = max(5, int(self.config.get(
+                        "corporation_list_refresh_seconds", 30)))
+                    if (corporations is None or time.time() - refreshed_at >= refresh_after):
+                        return {"command": "corp.list", "data": {}}
+                    wanted = str(self.config.get("corporation_partner_name", "TWClone Playtest Founders"))
+                    candidate = next((item for item in corporations if isinstance(item, dict)
+                                      and item.get("name") == wanted), None)
+                    if candidate and (not commands or "corp.join" in commands):
+                        return {"command": "corp.join", "data": {"corp_id": int(candidate["corp_id"])}}
+                elif goal_target == "operate" and corp_id:
+                    if current_state.get("corporation_transfer_completed"):
+                        return {"command": "corp.status", "data": {}}
+                    online = current_state.get("online_players")
+                    presence_at = float(current_state.get("online_players_refreshed_at", 0) or 0)
+                    presence_ttl = max(5, int(self.config.get(
+                        "corporation_presence_refresh_seconds", 15)))
+                    if online is None or time.time() - presence_at >= presence_ttl:
+                        return {"command": "player.list_online", "data": {"page": 1, "limit": 100}}
+                    partner = str(self.config.get("corporation_partner_username", "playbot08"))
+                    target = next((item for item in online if isinstance(item, dict)
+                                   and item.get("username") == partner), None)
+                    if not target:
+                        return None
+                    own_name = str(self.config.get("corporation_name", "TWClone Playtest Founders"))
+                    if target.get("corporation") != own_name:
+                        return None
+                    # player.list_online intentionally omits locations. Both
+                    # opted-in playtest members rendezvous at this configured
+                    # sector; this uses normal public navigation and reveals no
+                    # private player location.
+                    meeting_sector = int(self.config.get("corporation_meeting_sector", 1))
+                    if int(current_state.get("player_location_sector") or 0) != meeting_sector:
+                        return self._achieve_goal(current_state, f"goto: {meeting_sector}")
+                    if "corp.member.transfer" in commands:
+                        return {"command": "corp.member.transfer", "data": {
+                            "target_player_id": int(target["player_id"]),
+                            "asset": "credits", "quantity": 1,
+                        }}
                 return None
 
         except Exception as e:
             logger.error(f"Error in _achieve_goal for '{goal_str}': {e}", exc_info=True)
         
         return None # Fallback
+
+    @staticmethod
+    def _observed_sector_has_planet(sector):
+        """Return public planet presence, or None when the observation is incomplete."""
+        if not isinstance(sector, dict):
+            return None
+        value = sector.get("has_planet")
+        if isinstance(value, bool):
+            return value
+        counts = sector.get("counts")
+        if isinstance(counts, dict) and counts.get("planets") is not None:
+            try:
+                return int(counts["planets"]) > 0
+            except (TypeError, ValueError):
+                return None
+        objects = sector.get("celestial_objects")
+        if isinstance(objects, list):
+            return any(isinstance(item, dict) and item.get("planet_id") is not None
+                       for item in objects)
+        return None
+
+    def _playtest_block_reason(self, current_state, goal):
+        """Explain a role objective that has no safe public action available."""
+        normalized = str(goal or "").strip().lower()
+        if normalized.startswith("planet:"):
+            ship = current_state.get("ship_info") or {}
+            sector = current_state.get("sector_data", {}).get(
+                str(current_state.get("player_location_sector")), {}) or {}
+            if ship.get("onplanet"):
+                planet = current_state.get("planet_info") or {}
+                if int(planet.get("colonists_unassigned", 0) or 0) <= 0:
+                    return "landed world has no unassigned colonists or harvestable resources"
+            elif not sector.get("has_planet") and int(ship.get(
+                    "genesis_torpedoes", ship.get("genesis", 0)) or 0) <= 0:
+                return "no Genesis torpedo; must reach a known port that offers one"
+            elif sector.get("has_planet"):
+                return "planet is present but its public identity or landing eligibility is unavailable"
+        if normalized == "hardware: genesis":
+            ship = current_state.get("ship_info") or {}
+            player = (current_state.get("player_info") or {}).get("player") or {}
+            try:
+                if int(player.get("turns_remaining", 1) or 0) <= 0:
+                    return "turn budget exhausted before reaching a port that offers Genesis hardware"
+                if int(ship.get("max_genesis", 1)) < 1:
+                    return "active hull cannot carry Genesis; a capable shipyard replacement is required"
+            except (TypeError, ValueError):
+                return "authoritative ship capacity or turn state is unavailable"
+            return "no known untried port currently advertises Genesis hardware"
+        if normalized.startswith("corp:"):
+            return "required corporation state or configured partner is not currently available"
+        if normalized.startswith("combat:"):
+            return "no eligible visible target, ammunition or combat capability is available"
+        return "required public action or prerequisite is unavailable in the current observation"
 
     # --- Bootstrap Logic (Priority 0) ---
     def ensure_minimum_world_state(self, current_state):
@@ -995,7 +1939,22 @@ class Planner:
             if "has_port" not in sector_data:
                 logger.info(f"Bootstrap: Missing port info for sector {current_sector}. Fetching sector.info.")
                 return {"command": "sector.info", "data": {"sector_id": int(current_sector)}}
-            
+            # Landing context is not always included in the initial player and
+            # ship snapshots (notably after a bot process restart). Never treat
+            # an absent planet snapshot as zero population/resources: refresh
+            # the authoritative planet record before planning surface actions.
+            ship_info = current_state.get("ship_info") or {}
+            if ship_info.get("onplanet") and not current_state.get("planet_info"):
+                planet_id = ship_info.get("planet_id")
+                if planet_id is None:
+                    objects = sector_data.get("celestial_objects") or []
+                    planet = next((item for item in objects if isinstance(item, dict)
+                                   and item.get("planet_id") is not None), None)
+                    planet_id = planet.get("planet_id") if planet else None
+                if planet_id is not None and "planet.info" in current_state.get("server_commands", []):
+                    logger.info("Bootstrap: Restoring authoritative planet context for landed ship.")
+                    return {"command": "planet.info", "data": {"planet_id": int(planet_id)}}
+
             # NEW: Periodic refresh (every 60 seconds) to detect enemy ships
             # Get the last refresh timestamp for this sector
             last_refresh = sector_data.get("_last_refreshed", 0)
@@ -1014,6 +1973,20 @@ class Planner:
         """
         Selects the next command, prioritizing the strategic goal.
         """
+
+        # A completed purchase/transfer receipt can omit one of the affected
+        # balances or inventory views. Do not let a new mutation consume the
+        # same stale snapshot before the required public readbacks arrive.
+        pending_refreshes = current_state.get("post_mutation_readbacks") or []
+        if pending_refreshes:
+            refresh = pending_refreshes[0]
+            command_name = refresh.get("command")
+            advertised = set(current_state.get("server_commands", []))
+            if (not command_name or (advertised and command_name not in advertised)
+                    or not self._is_command_ready(command_name,
+                                                  current_state.get("command_retry_info", {}))):
+                return None
+            return {"command": command_name, "data": refresh.get("data", {})}
         
         # --- QA Workflow Mode: Direct Command Execution ---
         # If goal is "execute: <command>", extract and execute the command directly (no overrides)
@@ -1054,11 +2027,27 @@ class Planner:
                 logger.debug(f"QA Mode: Command '{command_name}' is on cooldown. Waiting.")
                 return None
 
+        # Ship loss recovery preempts persisted combat, trade, and planet goals.
+        # The recovery flow uses the public catalogue and validates eligibility
+        # and affordability before issuing a purchase.
+        if self._needs_ship_recovery(current_state):
+            recovery = self._achieve_goal(current_state, "shipyard: recover")
+            if recovery:
+                return recovery
+            return None
+
+        role_prerequisite = self._role_prerequisite_goal(current_state)
+        if role_prerequisite:
+            if current_goal != role_prerequisite:
+                logger.info("Role prerequisite %s preempts stale goal %s.", role_prerequisite, current_goal)
+                self.state_manager.set("strategy_plan", [role_prerequisite])
+            current_goal = role_prerequisite
+
         # Survival override: repair before spending turns on trading or
         # exploration, and route to a known port when damaged away from one.
         # This is deliberately conservative; it never invents combat or
         # police actions from incomplete state.
-        safety_command = self._survival_command(current_state)
+        safety_command = self._combat_readiness_command(current_state)
         if safety_command:
             return safety_command
         
@@ -1071,12 +2060,6 @@ class Planner:
                 logger.debug(f"Bootstrap command '{bootstrap_cmd['command']}' is on cooldown. Waiting.")
                 return None
         
-        # --- Check for turns remaining ---
-        player_turns_remaining = (current_state.get("player_info") or {}).get("player", {}).get("turns_remaining")
-        if player_turns_remaining is not None and player_turns_remaining <= 0:
-            logger.warning("No turns remaining. Skipping command execution.")
-            return None
-
         # --- 1. Check Invariants (Must-Do Actions) ---
 
         invariant_command = self._check_invariants(current_state)
@@ -1088,9 +2071,14 @@ class Planner:
                 logger.debug(f"Invariant command '{invariant_command['command']}' is on cooldown. Waiting.")
                 return None
 
+        # A playtest role goal reserves its chosen opportunity from opportunistic
+        # trading. Otherwise every role can be pulled back into the same trade
+        # loop before its own objective is executed.
+        preserve_role_goal = self._preserves_playtest_goal(current_goal)
+
         # --- 1.6 Tactical Override: Mandatory Survey & Sell ---
         # Prioritize local port interactions over long-distance travel goals.
-        if self._at_port(current_state):
+        if self._at_port(current_state) and not preserve_role_goal:
             # A. Ensure Survey is Complete
             if not self._survey_complete(current_state):
                 if self._is_command_ready("trade.quote", current_state.get("command_retry_info", {})):
@@ -1127,7 +2115,7 @@ class Planner:
 
         # Continue the same cargo route through intermediate sectors. The
         # destination may require several individual public warp commands.
-        else:
+        elif not preserve_role_goal:
             cargo_route = self._find_port_for_cargo(current_state)
             if cargo_route:
                 target_sector, _commodity = cargo_route
@@ -1136,7 +2124,7 @@ class Planner:
         # --- 1.5. Stress-safe micro-trade loop (forces progress) ---
         # If we're at a port and have completed survey, always try to trade 1 unit.
         # This prevents the bandit picking non-gameplay cmds (e.g. bank.deposit) and stalling.
-        if (not current_goal) and self._at_port(current_state) and self._survey_complete(current_state):
+        if (not current_goal and not preserve_role_goal) and self._at_port(current_state) and self._survey_complete(current_state):
             current_sector = current_state.get("player_location_sector")
             port_id = self._find_port_in_sector(current_state, current_sector)
             if port_id and port_id not in current_state.get("port_trade_blacklist", []):
@@ -1175,7 +2163,7 @@ class Planner:
             goal_type, _, goal_target = current_goal.partition(":")
             goal_type = goal_type.strip()
 
-            if goal_type == "corp":
+            if goal_type == "corp" and not self._corporation_action_allowed("corp.status"):
                 return None
 
             # Pre-check for credits if the goal is to buy
@@ -1219,6 +2207,14 @@ class Planner:
                         return None
             else:
                 logger.debug(f"Could not find a valid command for goal: {current_goal}. Falling back to stage logic.")
+                if self.config.get("playtest_bot") and self.config.get("role_name"):
+                    reason = self._playtest_block_reason(current_state, current_goal)
+                    self.state_manager.set("blocked_objective", {
+                        "goal": current_goal, "reason": reason, "updated_at": time.time(),
+                    })
+                    logger.warning("PLAYTEST_OBJECTIVE_BLOCKED role=%s goal=%s reason=%s",
+                                   self.config.get("role_name"), current_goal, reason)
+                    return None
         
         # --- 3. Fallback to Stage-Based Logic ---
         
@@ -1854,12 +2850,20 @@ class Planner:
         
         if field_name == "target_ship_id":
             if command_name in ("combat.attack", "combat.attack.ship"):
-                # Find any other ships in current sector
+                # Select only the target that passed the planner's public
+                # hostility/NPC eligibility check.  A second, independent
+                # first-ship lookup here could otherwise attack a different
+                # ordinary player than the one the goal approved.
                 sector_data = current_state.get("sector_data", {}).get(str(current_sector), {})
                 ships = sector_data.get("ships_present", sector_data.get("ships", []))
                 other_ships = [s for s in ships if str(self._visible_ship_id(s)) != str(ship_id)]
-                if other_ships:
-                    return self._visible_ship_id(min(other_ships, key=lambda s: str(self._visible_ship_id(s))))
+                eligible = eligible_combat_targets(
+                    other_ships,
+                    current_state.get("opponent_model"),
+                    float(self.config.get("combat_target_threat_threshold", 25.0)),
+                )
+                if eligible:
+                    return self._visible_ship_id(min(eligible, key=lambda s: str(self._visible_ship_id(s))))
                 return None
 
         if field_name == "ship_id" and command_name == "move.intercept":
@@ -2576,20 +3580,29 @@ class Planner:
 
     def _calculate_potential_profit(self, commodity_code, buy_price, current_state):
         """
-        Calculates the maximum potential profit for a given commodity bought at 'buy_price'.
-        Considers all known ports.
+        Calculates the best known positive return per navigation hop for a
+        commodity bought at the current port. Unknown paths receive a
+        conservative configurable hop estimate.
         """
         if buy_price is None or buy_price <= 0:
             return -float('inf') # Cannot make profit if buy price is zero or unknown
 
-        max_potential_sell_price = 0
+        best_rate = -float('inf')
+        best_route = None
         all_port_info = current_state.get("port_info_by_sector", {})
         price_cache = current_state.get("price_cache", {})
+        current_sector = current_state.get("player_location_sector")
+        dangerous = {str(value) for value in (current_state.get("sector_danger") or {})}
+        try:
+            unknown_hops = max(1, int(self.config.get("unknown_route_hop_cost", 6)))
+        except (TypeError, ValueError):
+            unknown_hops = 6
 
         for sector_id_str, port_data in all_port_info.items():
             port_id = str(port_data.get("port_id"))
             if (str(sector_id_str) == str(current_state.get("player_location_sector"))
-                    or port_id in {str(p) for p in current_state.get("port_trade_blacklist", [])}):
+                    or port_id in {str(p) for p in current_state.get("port_trade_blacklist", [])}
+                    or str(sector_id_str) in dangerous):
                 continue
             if port_id not in price_cache:
                 continue
@@ -2597,16 +3610,21 @@ class Planner:
             port_sell_prices = price_cache[port_id].get("sell", {})
             sell_price = port_sell_prices.get(commodity_code)
 
-            if (sell_price is not None and sell_price > max_potential_sell_price
-                    and self._quote_is_fresh(current_state, port_id, commodity_code)):
-                max_potential_sell_price = sell_price
+            if (sell_price is None or sell_price <= buy_price
+                    or not self._quote_is_fresh(current_state, port_id, commodity_code)):
+                continue
+            path = self.state_manager.find_path(current_sector, sector_id_str)
+            hops = len(path) - 1 if isinstance(path, list) and path else unknown_hops
+            rate = (float(sell_price) - float(buy_price)) / max(1, hops)
+            if rate > best_rate:
+                best_rate = rate
+                best_route = (sector_id_str, hops, float(sell_price))
         
         # Without a known buyer, a purchase is speculation rather than an
         # arbitrage decision. Leave discovery to exploration and quote actions.
-        if max_potential_sell_price == 0:
+        if best_route is None:
             return -float('inf')
-
-        return max_potential_sell_price - buy_price
+        return best_rate
 
 
     def _get_cheapest_commodity_to_buy(self, current_state):
@@ -2655,6 +3673,13 @@ class Planner:
                 # We will still calculate potential profit, but this note is important.
 
             potential_profit = self._calculate_potential_profit(commodity_code, buy_price, current_state)
+            try:
+                max_units = min(self._get_free_holds(current_state), int(
+                    float(((current_state.get("player_info") or {}).get("player") or {}).get("credits", 0) or 0)
+                    / float(buy_price)))
+            except (TypeError, ValueError, ZeroDivisionError):
+                max_units = 0
+            potential_profit *= max(0, max_units)
 
             # A recent upward sell-price trend is a small tie-breaker; it never
             # turns an unprofitable or stale quote into a purchase decision.

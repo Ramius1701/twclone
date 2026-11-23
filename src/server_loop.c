@@ -576,9 +576,9 @@ static const command_entry_t k_command_registry[] = {
    schema_planet_fighters_transfer, 0, false, NULL},
   {"planet.land", cmd_planet_land, "Land on a planet", schema_planet_land, 0, false, NULL},
   {"planet.colonists.get", cmd_planet_colonists_get, "Get colonist info for planet",
-   schema_placeholder, 0, false, NULL},
+   schema_planet_colonists_get, 0, false, NULL},
   {"planet.colonists.set", cmd_planet_colonists_set, "Transfer colonists to/from ship",
-   schema_placeholder, 0, false, NULL},
+   schema_planet_colonists_set, 0, false, NULL},
   {"planet.colonists.allocate", cmd_planet_colonists_allocate,
    "Assign planet colonists to resource production", schema_planet_colonists_allocate,
    0, false, NULL},
@@ -1746,8 +1746,12 @@ server_loop (volatile sig_atomic_t *running)
 	}
 
       /* Load certificate and key */
-      if (SSL_CTX_use_certificate_file (g_ssl_ctx, g_cfg.tls_cert_path,
-					 SSL_FILETYPE_PEM) <= 0)
+      /* The configured PEM may contain the leaf plus intermediate chain
+       * (for example, Let's Encrypt fullchain.pem). The non-chain API loads
+       * only the leaf and makes otherwise valid public certificates fail
+       * client verification. */
+      if (SSL_CTX_use_certificate_chain_file (g_ssl_ctx,
+						 g_cfg.tls_cert_path) <= 0)
 	{
 	  LOGE ("Failed to load TLS certificate: %s\n", g_cfg.tls_cert_path);
 	  SSL_CTX_free (g_ssl_ctx);

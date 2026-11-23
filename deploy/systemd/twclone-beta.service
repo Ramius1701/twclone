@@ -1,0 +1,17 @@
+[Unit]
+Description=TWClone V3 Beta Compose stack
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/twclone-beta/current
+EnvironmentFile=/etc/twclone-beta/.env.beta
+ExecStart=/usr/local/sbin/twclone-beta-start
+ExecStop=/usr/bin/docker compose -p twclone-beta -f compose.beta.yaml --env-file /etc/twclone-beta/.env.beta stop game db
+TimeoutStartSec=0
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target

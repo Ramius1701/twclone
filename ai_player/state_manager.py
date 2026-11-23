@@ -44,6 +44,7 @@ class StateManager:
             "recent_sectors": [],       # NEW: To avoid ping-ponging
             "pending_commands": {},     # NEW: To track sent commands for error correlation
             "uncertain_mutations": {},  # Durable ambiguity markers for every mutating command
+            "post_mutation_readbacks": [],  # Gate new writes until expense receipts are reconciled
             "port_trade_blacklist": [], # NEW: List of ports that failed on trade
             "warp_blacklist": [],       # NEW: List of sectors that are unreachable via warp
             "sector_danger": {},        # Persisted hazard/interdiction risk by sector
@@ -79,6 +80,15 @@ class StateManager:
                 "commands_timed_out": 0,
                 "trade_profit_credits": 0,
                 "trade_sales": 0,
+                "trade_cycles_completed": 0,
+                "trade_cycle_profit_credits": 0.0,
+                "trade_navigation_turns": 0,
+                "trade_unprofitable_cycles": 0,
+                "trade_failed_routes": 0,
+                "trade_cargo_utilization_percent": 0.0,
+                "turns_observed_consumed": 0,
+                "new_sectors_discovered": 0,
+                "combat_outcomes_recorded": 0,
                 "planned_route_hops": 0,
                 "completed_warps": 0,
                 "reconnects": 0,
@@ -138,6 +148,62 @@ class StateManager:
         except Exception as e:
             logger.error(f"Error loading state: {e}. Starting fresh.")
             # Don't save here, just use default state
+        self._normalize_legacy_ship_readbacks()
+
+    def _normalize_legacy_ship_readbacks(self):
+        """Migrate old readback labels to the server's canonical reply types."""
+        changed = False
+        for marker in (self.state.get("uncertain_mutations") or {}).values():
+            if not isinstance(marker, dict):
+                continue
+            requests = marker.get("readback_requests")
+            if isinstance(requests, list):
+                for request in requests:
+                    if (isinstance(request, list) and len(request) >= 2
+                            and request[0] == "ship.info"):
+                        request[0] = "ship.status"
+                        if request[1] == "ship.info":
+                            request[1] = "ship.status"
+                        changed = True
+                    if (isinstance(request, list) and len(request) >= 2
+                            and request[0] == "player.my_info"):
+                        request[0] = "player.info"
+                        changed = True
+            types = marker.get("readback_types")
+            if isinstance(types, list) and ("ship.info" in types or "player.my_info" in types):
+                marker["readback_types"] = [
+                    {"ship.info": "ship.status", "player.my_info": "player.info"}.get(value, value)
+                    for value in types
+                ]
+                changed = True
+            seen = marker.get("readbacks_seen")
+            if isinstance(seen, list) and ("ship.info" in seen or "player.my_info" in seen):
+                marker["readbacks_seen"] = [
+                    {"ship.info": "ship.status", "player.my_info": "player.info"}.get(value, value)
+                    for value in seen
+                ]
+                changed = True
+            contract = marker.get("contract")
+            if isinstance(contract, dict) and isinstance(contract.get("response_types"), list):
+                normalized = [{"ship.info": "ship.status", "player.my_info": "player.info"}.get(value, value)
+                              for value in contract["response_types"]]
+                if normalized != contract["response_types"]:
+                    contract["response_types"] = normalized
+                    changed = True
+        for request in self.state.get("post_mutation_readbacks", []):
+            if isinstance(request, dict):
+                old_type = request.get("response_type")
+                if old_type == "player.my_info":
+                    request["response_type"] = "player.info"
+                    changed = True
+                if old_type == "ship.info":
+                    request["response_type"] = "ship.status"
+                    if request.get("command") == "ship.info":
+                        request["command"] = "ship.status"
+                    changed = True
+        if changed:
+            logger.info("Normalized legacy ship.info mutation readbacks to ship.status.")
+            self.save_state()
 
     def save_state(self):
         """Saves the current state to the state file."""
@@ -204,14 +270,110 @@ class StateManager:
         if key not in self.state:
             self.state[key] = default_value
 
-    def mark_uncertain_mutation(self, request_id, command, data=None, contract=None):
+    def mark_uncertain_mutation(self, request_id, command, data=None, contract=None,
+                                idempotency_key=None, readback_types=None,
+                                readback_requests=None,
+                                manual_review_after_readback=False):
         """Persist an in-flight mutation so a restart cannot silently replay it."""
         mutations = self.state.setdefault("uncertain_mutations", {})
         mutations[str(request_id)] = {
             "request_id": str(request_id), "command": command,
             "data": data or {}, "contract": contract or {},
+            "idempotency_key": idempotency_key,
+            "readback_types": list(readback_types or []),
+            "readback_requests": list(readback_requests or []),
+            "manual_review_after_readback": bool(manual_review_after_readback),
+            "readbacks_seen": [], "timed_out": False,
         }
         self.save_state()
+
+    def mark_mutation_timed_out(self, request_id):
+        """Keep a timed-out non-idempotent mutation quarantined until read back."""
+        marker = self.state.setdefault("uncertain_mutations", {}).get(str(request_id))
+        if marker is not None:
+            marker["timed_out"] = True
+            marker["readbacks_seen"] = []
+            self.save_state()
+
+    def recover_uncertain_mutations_after_restart(self):
+        """A sent write without a surviving reply must be read back after restart."""
+        changed = False
+        for marker in self.state.setdefault("uncertain_mutations", {}).values():
+            if not marker.get("timed_out") or marker.get("readbacks_complete"):
+                marker["timed_out"] = True
+                marker["readbacks_seen"] = []
+                changed = True
+        if changed:
+            self.save_state()
+
+    def uncertain_mutation_readbacks(self):
+        """Return the next authoritative reads required by timed-out writes."""
+        result = []
+        for marker in self.state.setdefault("uncertain_mutations", {}).values():
+            if not marker.get("timed_out") or marker.get("readbacks_complete"):
+                continue
+            seen = set(marker.get("readbacks_seen", []))
+            for response_type, command, data in marker.get("readback_requests", []):
+                if response_type not in seen:
+                    result.append({"request_id": marker["request_id"],
+                                   "response_type": response_type,
+                                   "command": command, "data": data})
+                    break
+        return result
+
+    def record_uncertain_mutation_readback(self, response_type, command=None, data=None,
+                                          response_data=None):
+        """Record readbacks only for matching public request/data snapshots.
+
+        Identical account or ship snapshots can reconcile several old writes
+        at once. Sector, planet, and corporation snapshots remain scoped to
+        their requested entity so one read cannot clear an unrelated write.
+        """
+        mutations = self.state.setdefault("uncertain_mutations", {})
+        changed = False
+
+        def same_data(left, right):
+            return json.dumps(left or {}, sort_keys=True, separators=(",", ":")) == json.dumps(
+                right or {}, sort_keys=True, separators=(",", ":")
+            )
+
+        for request_id, marker in list(mutations.items()):
+            if not marker.get("timed_out"):
+                continue
+            requests = marker.get("readback_requests", [])
+            matching = next((item for item in requests
+                             if isinstance(item, (list, tuple)) and len(item) >= 3
+                             and item[0] == response_type
+                             and (command is None or item[1] == command)
+                             and (data is None or same_data(item[2], data))), None)
+            if matching is None:
+                continue
+            if isinstance(response_data, dict):
+                target_key = {"sector.info": "sector_id", "planet.info": "planet_id"}.get(command)
+                if target_key and matching[2].get(target_key) is not None:
+                    try:
+                        if int(response_data.get(target_key)) != int(matching[2][target_key]):
+                            continue
+                    except (TypeError, ValueError):
+                        continue
+            required = [item[0] for item in requests]
+            seen = marker.setdefault("readbacks_seen", [])
+            if response_type not in seen:
+                seen.append(response_type)
+                changed = True
+            if all(item in seen for item in required):
+                if marker.get("manual_review_after_readback"):
+                    marker["readbacks_complete"] = True
+                    marker["manual_resolution_required"] = True
+                else:
+                    mutations.pop(request_id, None)
+                changed = True
+        if changed:
+            self.save_state()
+
+    def unresolved_manual_mutations(self):
+        return [dict(marker) for marker in self.state.setdefault("uncertain_mutations", {}).values()
+                if marker.get("manual_resolution_required")]
 
     def resolve_uncertain_mutation(self, request_id):
         mutations = self.state.setdefault("uncertain_mutations", {})
@@ -353,15 +515,43 @@ class StateManager:
             enriched_data['adjacent'] = enriched_data['adjacent_sectors']
             logger.info(f"Normalized adjacent_sectors for sector {sector_id}. Keys: {enriched_data.keys()}")
 
-        self.state['sector_data'][str(sector_id)] = enriched_data
+        # A no-link refusal can arrive after a lost movement acknowledgement,
+        # when the server has already advanced the player. Do not let the
+        # resulting stale-location blacklist override a fresh authoritative
+        # sector scan that confirms the outbound link exists.
+        adjacent = enriched_data.get('adjacent')
+        if isinstance(adjacent, list) and 'warp_blacklist' in self.state:
+            confirmed_links = {
+                str(item.get('to_sector', item.get('to_sector_id')) if isinstance(item, dict) else item)
+                for item in adjacent
+                if (item.get('to_sector', item.get('to_sector_id')) if isinstance(item, dict) else item)
+                is not None
+            }
+            stale_blacklist = [value for value in self.state.get('warp_blacklist', [])
+                               if str(value) in confirmed_links]
+            if stale_blacklist:
+                self.state['warp_blacklist'] = [
+                    value for value in self.state.get('warp_blacklist', [])
+                    if str(value) not in confirmed_links
+                ]
+                logger.info("Removed stale warp blacklist entries confirmed by sector %s: %s",
+                            sector_id, stale_blacklist)
+
+        sector_key = str(sector_id)
+        was_known = (sector_key in self.state['sector_data']
+                     or bool((self.state.get("universe_map") or {}).get(sector_key, {}).get("is_explored")))
+        self.state['sector_data'][sector_key] = enriched_data
         if 'universe_map' not in self.state:
             self.state['universe_map'] = {}
         
-        if str(sector_id) not in self.state['universe_map']:
-            self.state['universe_map'][str(sector_id)] = {}
+        if sector_key not in self.state['universe_map']:
+            self.state['universe_map'][sector_key] = {}
         
         self.state['universe_map'][str(sector_id)]['is_explored'] = True
         self.state['universe_map'][str(sector_id)]['has_port'] = enriched_data.get('has_port', False)
+        if not was_known:
+            metrics = self.state.setdefault("ai_metrics", {})
+            metrics["new_sectors_discovered"] = int(metrics.get("new_sectors_discovered", 0) or 0) + 1
 
         self.save_state()
 
@@ -508,6 +698,8 @@ class StateManager:
             key: value for key, value in outcome.items() if key in allowed
         }})
         del history[:-50]
+        metrics = self.state.setdefault("ai_metrics", {})
+        metrics["combat_outcomes_recorded"] = int(metrics.get("combat_outcomes_recorded", 0) or 0) + 1
         self.save_state()
 
     def record_fleet_snapshot(self, ships):
@@ -558,13 +750,26 @@ class StateManager:
             return
         trace = self.state.setdefault("decision_trace", [])
         item = {"timestamp": time.time(), **{
-            key: decision[key] for key in ("goal", "command", "reason", "risk", "source")
+            key: decision[key] for key in (
+                "goal", "command", "reason", "risk", "source", "role",
+                "objective", "llm_raw_plan", "accepted_plan", "observation",
+            )
             if key in decision
         }}
         if outcome is not None:
             item["outcome"] = outcome
         trace.append(item)
         del trace[:-100]
+        self.save_state()
+
+    def annotate_last_decision(self, **fields):
+        """Attach adapter and authoritative response evidence to the latest plan."""
+        trace = self.state.setdefault("decision_trace", [])
+        if not trace or not isinstance(trace[-1], dict):
+            return
+        allowed = {"command", "response_type", "response_status", "error_code",
+                   "server_reason", "progress_category", "outcome"}
+        trace[-1].update({key: value for key, value in fields.items() if key in allowed})
         self.save_state()
 
     def record_learning_outcome(self, action, context, reward, success):
@@ -613,6 +818,35 @@ class StateManager:
             gross_values.append(max(Decimal("0"), gross or Decimal("0")))
         gross_total = sum(gross_values, Decimal("0"))
 
+        # Start a durable trade-cycle record from the actual purchase receipt.
+        # Navigation is counted from server-confirmed warps, not planned paths.
+        cycle = self.state.get("trade_cycle")
+        if not isinstance(cycle, dict):
+            player = ((self.state.get("player_info") or {}).get("player") or {})
+            try:
+                turns_at_start = int(player.get("turns_remaining", 0) or 0)
+            except (TypeError, ValueError):
+                turns_at_start = 0
+            purchased_units = sum(int(item.get("units", item.get("quantity", 0)) or 0)
+                                  for item in items_bought if isinstance(item, dict))
+            capacity = int((self.state.get("ship_info") or {}).get("holds", 0) or 0)
+            self.state["trade_cycle"] = {
+                "buy_sector": self.state.get("player_location_sector"),
+                "buy_port_id": port_id,
+                "started_at": time.time(),
+                "turns_at_start": turns_at_start,
+                "warps_at_start": int((self.state.get("ai_metrics") or {}).get("completed_warps", 0) or 0),
+                "holds": capacity,
+                "units_purchased": purchased_units,
+                "realized_profit": 0.0,
+                "failed_or_unprofitable": False,
+            }
+        else:
+            cycle["units_purchased"] = int(cycle.get("units_purchased", 0) or 0) + sum(
+                int(item.get("units", item.get("quantity", 0)) or 0)
+                for item in items_bought if isinstance(item, dict)
+            )
+
         for item_index, item in enumerate(items_bought):
             commodity = canon_commodity(item.get("commodity"))
             # Note: trade.buy_receipt_v1 uses "units" not "quantity"!
@@ -658,6 +892,8 @@ class StateManager:
                 "commodity": commodity,
                 "type": "buy"
             }
+
+        self.save_state()
         self.state["cargo_metadata"] = [
             dict(item) for item in self.state["ship_info"].get("cargo", [])
             if isinstance(item, dict)
@@ -770,13 +1006,52 @@ class StateManager:
                 if str((port or {}).get("port_id")) == str(origin_port):
                     buy_sector = sector_id
                     break
-            if buy_sector is not None and self.state.get("player_location_sector") is not None:
+            if (buy_sector is not None and self.state.get("player_location_sector") is not None
+                    and total_profit > 0):
                 self.record_trade_route({
                     "buy_sector": buy_sector,
                     "sell_sector": self.state.get("player_location_sector"),
                     "commodity": commodity_sold,
                     "profit": total_profit,
                 })
+
+        cycle = self.state.get("trade_cycle")
+        if isinstance(cycle, dict):
+            cycle["realized_profit"] = float(cycle.get("realized_profit", 0) or 0) + float(total_profit)
+            cargo_left = any(
+                isinstance(item, dict) and float(item.get("quantity", 0) or 0) > 0
+                for item in self.state["ship_info"].get("cargo", [])
+            )
+            if not cargo_left:
+                current_warps = int((self.state.get("ai_metrics") or {}).get("completed_warps", 0) or 0)
+                try:
+                    warps_at_start = int(cycle.get("warps_at_start", current_warps))
+                except (TypeError, ValueError):
+                    warps_at_start = current_warps
+                navigation_turns = max(0, current_warps - warps_at_start)
+                holds = max(0, int(cycle.get("holds", 0) or 0))
+                purchased = max(0, int(cycle.get("units_purchased", 0) or 0))
+                utilization = min(100.0, 100.0 * purchased / holds) if holds else 0.0
+                profit = float(cycle["realized_profit"])
+                metrics = self.state.setdefault("ai_metrics", {})
+                metrics["trade_cycles_completed"] = metrics.get("trade_cycles_completed", 0) + 1
+                metrics["trade_cycle_profit_credits"] = metrics.get("trade_cycle_profit_credits", 0.0) + profit
+                metrics["trade_navigation_turns"] = metrics.get("trade_navigation_turns", 0) + navigation_turns
+                metrics["trade_cargo_utilization_percent"] = metrics.get("trade_cargo_utilization_percent", 0.0) + utilization
+                if profit <= 0:
+                    metrics["trade_unprofitable_cycles"] = metrics.get("trade_unprofitable_cycles", 0) + 1
+                history = self.state.setdefault("trade_cycle_history", [])
+                history.append({
+                    "buy_sector": cycle.get("buy_sector"),
+                    "sell_sector": self.state.get("player_location_sector"),
+                    "profit": profit,
+                    "navigation_turns": navigation_turns,
+                    "profit_per_navigation_turn": profit / max(1, navigation_turns),
+                    "cargo_utilization_percent": utilization,
+                    "completed_at": time.time(),
+                })
+                self.state["trade_cycle_history"] = history[-50:]
+                self.state["trade_cycle"] = None
 
         logger.info(f"Cargo updated after sell. Profit: {total_profit}. New cargo: {self.state['ship_info']['cargo']}")
         self.save_state()
@@ -792,6 +1067,24 @@ class StateManager:
             p_obj = player_data
 
         if p_obj:
+            turns_value = p_obj.get("turns_remaining")
+            if turns_value is not None:
+                try:
+                    observed_turns = max(0, int(turns_value))
+                    prior_turns = self.state.get("last_observed_turns_remaining")
+                    if prior_turns is not None:
+                        prior_turns = max(0, int(prior_turns))
+                        if observed_turns < prior_turns:
+                            metrics = self.state.setdefault("ai_metrics", {})
+                            metrics["turns_observed_consumed"] = (
+                                int(metrics.get("turns_observed_consumed", 0) or 0)
+                                + prior_turns - observed_turns
+                            )
+                    # Increases are grants or daily resets; rebase without
+                    # counting them as negative consumption.
+                    self.state["last_observed_turns_remaining"] = observed_turns
+                except (TypeError, ValueError):
+                    pass
             if self.state['player_info'] is None:
                 self.state['player_info'] = {}
             
@@ -919,6 +1212,14 @@ class StateManager:
             logger.info(f"Added '{command_name}' to schema blacklist.")
             self.save_state()
 
+    def remove_from_schema_blacklist(self, command_name):
+        """Forget a stale schema failure so a newly advertised command can retry."""
+        blacklist = self.state.setdefault("schema_blacklist", [])
+        if command_name in blacklist:
+            blacklist.remove(command_name)
+            logger.info("Removed stale schema failure for advertised command %s.", command_name)
+            self.save_state()
+
     # --- Pending Command and Blacklist Management ---
 
     def add_pending_command(self, request_id, command):
@@ -971,7 +1272,10 @@ class StateManager:
         self.state["strategy_plan"] = []
         self.state["needs_bootstrap"] = True
         if record_reconnect:
-            self.record_ai_metric("reconnects")
+            # This counts discarded session-scoped state, not TCP connects.
+            # Keep the legacy metric for saved state display, but stop adding
+            # ambiguous values to it going forward.
+            self.record_ai_metric("session_state_resets")
         self.save_state()
 
     def record_ai_metric(self, name, amount=1):
@@ -1102,6 +1406,12 @@ class StateManager:
     def record_trade_failure(self, port_id, command_name, error_code, error_message):
         """Records a trade command failure and updates blacklists as appropriate."""
         logger.warning(f"Trade command '{command_name}' failed at port {port_id} with code {error_code}: {error_message}")
+        metrics = self.state.setdefault("ai_metrics", {})
+        metrics["trade_failed_routes"] = metrics.get("trade_failed_routes", 0) + 1
+        cycle = self.state.get("trade_cycle")
+        if isinstance(cycle, dict):
+            cycle["failed_or_unprofitable"] = True
+        self.save_state()
         
         # Add to port_trade_blacklist for specific errors
         if error_code == 1701: # Port is not buying this commodity right now.
